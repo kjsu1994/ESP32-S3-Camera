@@ -7,10 +7,18 @@ import java.net.HttpURLConnection
 import java.net.URL
 import org.json.JSONObject
 
+internal enum class VideoResolution(val key: String, val label: String) {
+    QVGA("qvga", "320 × 240"),
+    VGA("vga", "640 × 480"),
+    SVGA("svga", "800 × 600")
+}
+
+internal data class BoardTelemetry(val chipTempC: Double?, val powerMw: Int?)
+
 internal data class BoardOptions(
     val lowBandwidth: Boolean,
     val rotate180: Boolean,
-    val dimOled: Boolean
+    val resolution: VideoResolution
 )
 
 internal class BoardApi(private val network: Network) {
@@ -26,11 +34,24 @@ internal class BoardApi(private val network: Network) {
 
     fun getOptions(): BoardOptions = optionsRequest(null)
 
+    fun getTelemetry(): BoardTelemetry {
+        val connection = open("/telemetry", 2500)
+        try {
+            if (connection.responseCode != 200) throw IOException("Board telemetry unavailable")
+            val json = connection.readBoardJson()
+            val temp = if (json.isNull("chip_temp_c")) null else json.getDouble("chip_temp_c").takeIf { it.isFinite() }
+            val power = if (json.isNull("power_mw")) null else json.getInt("power_mw")
+            return BoardTelemetry(temp, power)
+        } finally {
+            connection.disconnect()
+        }
+    }
+
     fun setOptions(options: BoardOptions): BoardOptions {
         val json = JSONObject()
             .put("low_bandwidth", options.lowBandwidth)
             .put("rotate_180", options.rotate180)
-            .put("dim_oled", options.dimOled)
+            .put("resolution", options.resolution.key)
         return optionsRequest(json.toString().toByteArray())
     }
 
@@ -51,7 +72,7 @@ internal class BoardApi(private val network: Network) {
             if (connection.responseCode != 200) throw IOException("Board settings unavailable")
             val json = connection.readBoardJson()
             return BoardOptions(json.getBoolean("low_bandwidth"), json.getBoolean("rotate_180"),
-                json.getBoolean("dim_oled"))
+                VideoResolution.entries.firstOrNull { it.key == json.optString("resolution") } ?: VideoResolution.QVGA)
         } finally {
             connection.disconnect()
         }

@@ -2,7 +2,6 @@
 #include <Preferences.h>
 #include <initializer_list>
 #include "cJSON.h"
-#include <U8x8lib.h>
 #include <WiFi.h>
 #include <Wire.h>
 #include "driver/gpio.h"
@@ -10,6 +9,7 @@
 #include "esp_rom_gpio.h"
 #include "soc/gpio_sig_map.h"
 #include "esp_http_server.h"
+#include "lwip/sockets.h"
 #include "board_pins.h"
 
 #if __has_include("config.local.h")
@@ -18,14 +18,40 @@
 #include "config.example.h"
 #endif
 
+#ifndef POWER_SDA_GPIO
+#define POWER_SDA_GPIO -1
+#endif
+#ifndef POWER_SCL_GPIO
+#define POWER_SCL_GPIO -1
+#endif
+#ifndef POWER_SHUNT_MILLIOHMS
+#define POWER_SHUNT_MILLIOHMS 100
+#endif
+
 namespace {
 constexpr char apName[] = "WorkbenchCam";
-constexpr uint32_t sessionMs = 60000;
+constexpr uint32_t sessionMs = 180000;
 constexpr uint32_t cooldownMs = 60000;
 constexpr uint8_t lowBandwidth = 1 << 0;
 constexpr uint8_t rotate180 = 1 << 1;
-constexpr uint8_t dimOled = 1 << 2;
-constexpr int xclkHz = 10000000;
+// Retain the v0.1.0 settings round-trip for installed clients.
+constexpr uint8_t legacyDimOled = 1 << 2;
+constexpr uint8_t resolutionMask = 3 << 3;
+constexpr uint8_t ina219Address = 0x40;
+static_assert(POWER_SHUNT_MILLIOHMS >= 1 && POWER_SHUNT_MILLIOHMS <= 1000,
+              "Set the INA219 shunt resistance in milliohms");
+
+enum class Resolution : uint8_t { Vga, Qvga, Svga };
+constexpr const char* resolutionKeys[] = {"vga", "qvga", "svga"};
+constexpr framesize_t frameSizes[] = {FRAMESIZE_VGA, FRAMESIZE_QVGA, FRAMESIZE_SVGA};
+
+uint8_t resolutionIndex(uint8_t options) {
+    const uint8_t index = (options & resolutionMask) >> 3;
+    return index < sizeof(resolutionKeys) / sizeof(*resolutionKeys) ? index : 0;
+}
+constexpr int xclkHz = 20000000;
+constexpr size_t maxJpegBytes = 256 * 1024;
+constexpr size_t partHeaderCapacity = 96;
 
 enum class State { Idle, Streaming, Cooldown };
 enum class Reason { None, Limit, Camera, Disconnected, Stopped };
@@ -43,9 +69,13 @@ bool stopRequested = false;
 uint8_t boardOptions = 0;
 Preferences preferences;
 bool preferencesReady = false;
-bool apReady = false;
-bool oledReady = false;
-U8X8_SSD1306_128X64_NONAME_SW_I2C oled(OLED_SCL_GPIO, OLED_SDA_GPIO);
+bool powerBusReady = false;
+
+#if CONFIG_SCCB_HARDWARE_I2C_PORT1
+TwoWire& powerBus = Wire;
+#else
+TwoWire& powerBus = Wire1;
+#endif
 
 bool reached(uint32_t now, uint32_t target) {
     return static_cast<int32_t>(now - target) >= 0;
@@ -142,8 +172,9 @@ bool startCamera(uint8_t options) {
     config.pin_reset = board::reset;
     config.xclk_freq_hz = xclkHz;
     config.pixel_format = PIXFORMAT_JPEG;
-    config.frame_size = FRAMESIZE_QVGA;
-    config.jpeg_quality = 18;
+    const uint8_t resolution = resolutionIndex(options);
+    config.frame_size = frameSizes[resolution];
+    config.jpeg_quality = resolution == static_cast<uint8_t>(Resolution::Svga) ? 16 : 14;
     config.fb_count = 1;
     config.fb_location = CAMERA_FB_IN_PSRAM;
     config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
@@ -198,9 +229,10 @@ const char* jsonBool(bool value) {
 
 esp_err_t sendOptions(httpd_req_t* request) {
     const uint8_t options = getOptions();
-    char body[90];
-    snprintf(body, sizeof(body), "{\"low_bandwidth\":%s,\"rotate_180\":%s,\"dim_oled\":%s}",
-             jsonBool(options & lowBandwidth), jsonBool(options & rotate180), jsonBool(options & dimOled));
+    char body[112];
+    snprintf(body, sizeof(body), "{\"low_bandwidth\":%s,\"rotate_180\":%s,\"dim_oled\":%s,\"resolution\":\"%s\"}",
+             jsonBool(options & lowBandwidth), jsonBool(options & rotate180), jsonBool(options & legacyDimOled),
+             resolutionKeys[resolutionIndex(options)]);
     httpd_resp_set_type(request, "application/json");
     httpd_resp_set_hdr(request, "Cache-Control", "no-store");
     return httpd_resp_sendstr(request, body);
@@ -236,15 +268,29 @@ esp_err_t updateOptions(httpd_req_t* request) {
     const cJSON* low = cJSON_GetObjectItemCaseSensitive(settings, "low_bandwidth");
     const cJSON* rotate = cJSON_GetObjectItemCaseSensitive(settings, "rotate_180");
     const cJSON* dim = cJSON_GetObjectItemCaseSensitive(settings, "dim_oled");
-    const bool valid = cJSON_IsObject(settings) && cJSON_IsBool(low) && cJSON_IsBool(rotate) && cJSON_IsBool(dim);
+    const cJSON* resolution = cJSON_GetObjectItemCaseSensitive(settings, "resolution");
+    const uint8_t current = getOptions();
+    int index = resolutionIndex(current);
+    if (resolution) {
+        index = -1;
+        if (cJSON_IsString(resolution)) {
+            for (uint8_t i = 0; i < sizeof(resolutionKeys) / sizeof(*resolutionKeys); ++i) {
+                if (strcmp(resolution->valuestring, resolutionKeys[i]) == 0) index = i;
+            }
+        }
+    }
+    const bool valid = cJSON_IsObject(settings) && cJSON_IsBool(low) && cJSON_IsBool(rotate) &&
+                       (!dim || cJSON_IsBool(dim)) && index >= 0;
     const uint8_t next = (cJSON_IsTrue(low) ? lowBandwidth : 0) |
-                         (cJSON_IsTrue(rotate) ? rotate180 : 0) | (cJSON_IsTrue(dim) ? dimOled : 0);
+                         (cJSON_IsTrue(rotate) ? rotate180 : 0) |
+                         (dim ? (cJSON_IsTrue(dim) ? legacyDimOled : 0) : (current & legacyDimOled)) |
+                         (index >= 0 ? index << 3 : 0);
     cJSON_Delete(settings);
     if (!valid) {
-        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Expected three boolean settings");
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid board settings");
     }
 
-    if (next != getOptions()) {
+    if (next != current) {
         if (!preferencesReady || preferences.putUChar("options", next) != sizeof(next)) {
             return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Settings could not be saved");
         }
@@ -266,6 +312,16 @@ esp_err_t requestStop(httpd_req_t* request) {
     return httpd_resp_send(request, nullptr, 0);
 }
 
+bool writeStream(httpd_req_t* request, const char* bytes, size_t length) {
+    while (length != 0) {
+        const int sent = httpd_send(request, bytes, length);
+        if (sent <= 0) return false;
+        bytes += sent;
+        length -= sent;
+    }
+    return true;
+}
+
 esp_err_t stream(httpd_req_t* request) {
     const Status current = getStatus();
     if (current.state == State::Cooldown) {
@@ -276,28 +332,44 @@ esp_err_t stream(httpd_req_t* request) {
         return httpd_resp_sendstr(request, "Camera is cooling down");
     }
 
+    char* packet = static_cast<char*>(ps_malloc(maxJpegBytes + partHeaderCapacity + 2));
+    if (!packet) {
+        httpd_resp_set_status(request, "503 Service Unavailable");
+        return httpd_resp_sendstr(request, "Video buffer unavailable");
+    }
+
     const uint32_t sessionStarted = millis();
     const uint32_t stopAt = sessionStarted + sessionMs;
-    uint32_t sentFrames = 0;
     setStatus(State::Streaming, Reason::None, sessionMs);
     const uint8_t options = getOptions();
-    const uint32_t frameIntervalMs = (options & lowBandwidth) ? 334 : 200;
+    const bool highResolution = resolutionIndex(options) == static_cast<uint8_t>(Resolution::Svga);
+    const uint32_t frameIntervalMs = (options & lowBandwidth) ? 167 : highResolution ? 100 : 84;
     if (!startCamera(options)) {
+        free(packet);
         setStatus(State::Cooldown, Reason::Camera, cooldownMs);
         httpd_resp_set_status(request, "503 Service Unavailable");
         return httpd_resp_sendstr(request, "Camera initialization failed");
     }
 
-    httpd_resp_set_type(request, "multipart/x-mixed-replace; boundary=frame");
-    httpd_resp_set_hdr(request, "Cache-Control", "no-store");
-    char limit[8];
-    snprintf(limit, sizeof(limit), "%lu", static_cast<unsigned long>(sessionMs / 1000));
-    httpd_resp_set_hdr(request, "X-Stream-Limit-Seconds", limit);
-    Reason ending = Reason::Limit;
-    esp_err_t result = ESP_OK;
-    while (!reached(millis(), stopAt) && !shouldStop()) {
+    const int disableNagle = 1;
+    setsockopt(httpd_req_to_sockfd(request), IPPROTO_TCP, TCP_NODELAY, &disableNagle, sizeof(disableNagle));
+    char response[220];
+    const int responseLength = snprintf(response, sizeof(response),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
+        "Cache-Control: no-store\r\nConnection: close\r\nX-Stream-Limit-Seconds: %lu\r\n\r\n",
+        static_cast<unsigned long>(sessionMs / 1000));
+    bool sent = writeStream(request, response, responseLength);
+    Reason ending = sent ? Reason::Limit : Reason::Disconnected;
+    uint32_t sentFrames = 0;
+    uint64_t captureUs = 0;
+    uint64_t sendUs = 0;
+
+    while (sent && !reached(millis(), stopAt) && !shouldStop()) {
         const uint32_t started = millis();
+        const uint32_t captureStarted = micros();
         camera_fb_t* frame = esp_camera_fb_get();
+        const uint32_t captureElapsed = micros() - captureStarted;
         if (!frame) {
             ending = Reason::Camera;
             break;
@@ -306,49 +378,57 @@ esp_err_t stream(httpd_req_t* request) {
             esp_camera_fb_return(frame);
             break;
         }
-        char header[100];
-        const int length = snprintf(header, sizeof(header),
+        const size_t jpegLength = frame->len;
+        if (jpegLength > maxJpegBytes) {
+            esp_camera_fb_return(frame);
+            ending = Reason::Camera;
+            break;
+        }
+        const int headerLength = snprintf(packet, partHeaderCapacity,
             "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
-            static_cast<unsigned>(frame->len));
-        result = httpd_resp_send_chunk(request, header, length);
-        if (result == ESP_OK) {
-            result = httpd_resp_send_chunk(request, reinterpret_cast<const char*>(frame->buf), frame->len);
-        }
+            static_cast<unsigned>(jpegLength));
+        memcpy(packet + headerLength, frame->buf, jpegLength);
+        // Let the camera fill its single driver buffer while TCP transmits the copied frame.
         esp_camera_fb_return(frame);
-        if (result == ESP_OK) {
-            result = httpd_resp_send_chunk(request, "\r\n", 2);
-        }
-        if (result != ESP_OK || WiFi.softAPgetStationNum() == 0) {
+        const size_t end = headerLength + jpegLength;
+        packet[end] = '\r';
+        packet[end + 1] = '\n';
+
+        const uint32_t sendStarted = micros();
+        sent = writeStream(request, packet, end + 2);
+        if (!sent || WiFi.softAPgetStationNum() == 0) {
             ending = Reason::Disconnected;
             break;
         }
         ++sentFrames;
+        captureUs += captureElapsed;
+        sendUs += micros() - sendStarted;
         const uint32_t elapsed = millis() - started;
-        if (elapsed < frameIntervalMs) {
-            delay(frameIntervalMs - elapsed);
-        }
+        if (elapsed < frameIntervalMs) delay(frameIntervalMs - elapsed);
     }
 
     if (shouldStop()) ending = Reason::Stopped;
     stopCamera();
+    free(packet);
     setStatus(State::Cooldown, ending, cooldownMs);
     Serial.printf("[CAM] Stream ended: %s frames=%lu duration_ms=%lu\n",
                   reasonName(ending), static_cast<unsigned long>(sentFrames),
                   static_cast<unsigned long>(millis() - sessionStarted));
-    if (result == ESP_OK) {
-        result = httpd_resp_sendstr_chunk(request, "--frame--\r\n");
-        if (result == ESP_OK) {
-            result = httpd_resp_send_chunk(request, nullptr, 0);
-        }
+    if (sentFrames) {
+        Serial.printf("[CAM] Avg capture=%lu ms, TCP send=%lu ms\n",
+                      static_cast<unsigned long>(captureUs / sentFrames / 1000),
+                      static_cast<unsigned long>(sendUs / sentFrames / 1000));
     }
-    return result;
+    if (sent) writeStream(request, "--frame--\r\n", sizeof("--frame--\r\n") - 1);
+    // The raw response body has no Content-Length and ends when this socket closes.
+    return ESP_FAIL;
 }
 
 httpd_handle_t startServer(uint16_t port, uint16_t controlPort, std::initializer_list<httpd_uri_t> routes) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = port;
     config.ctrl_port = controlPort;
-    config.send_wait_timeout = 2;
+    config.send_wait_timeout = 4;
     config.recv_wait_timeout = 2;
     config.stack_size = 8192;
     httpd_handle_t server = nullptr;
@@ -365,7 +445,7 @@ httpd_handle_t startServer(uint16_t port, uint16_t controlPort, std::initializer
     return server;
 }
 
-bool isOledPin(int pin) {
+bool isPeripheralPin(int pin) {
     if (!GPIO_IS_VALID_OUTPUT_GPIO(pin) || (pin >= 26 && pin <= 37)) {
         return false;
     }
@@ -380,72 +460,45 @@ bool isOledPin(int pin) {
     return true;
 }
 
-void startOled() {
-    if (OLED_SDA_GPIO < 0 || OLED_SCL_GPIO < 0) {
-        Serial.println("[OLED] Pins not configured");
+void startPowerMonitor() {
+    if (POWER_SDA_GPIO < 0 || POWER_SCL_GPIO < 0) return;
+    if (POWER_SDA_GPIO == POWER_SCL_GPIO || !isPeripheralPin(POWER_SDA_GPIO) ||
+        !isPeripheralPin(POWER_SCL_GPIO)) {
+        Serial.println("[POWER] Pins conflict with board functions");
         return;
     }
-    if (OLED_SDA_GPIO == OLED_SCL_GPIO || !isOledPin(OLED_SDA_GPIO) || !isOledPin(OLED_SCL_GPIO)) {
-        Serial.println("[OLED] Pins conflict with board functions");
-        return;
-    }
-    if (!Wire.begin(OLED_SDA_GPIO, OLED_SCL_GPIO, 100000U)) {
-        Serial.println("[OLED] I2C setup failed");
-        return;
-    }
-    uint8_t address = 0;
-    for (uint8_t candidate = 0x3C; candidate <= 0x3D; ++candidate) {
-        Wire.beginTransmission(candidate);
-        if (Wire.endTransmission() == 0) {
-            address = candidate;
-            break;
-        }
-    }
-    Wire.end();
-    if (!address) {
-        Serial.println("[OLED] No reply at 0x3C or 0x3D");
-        return;
-    }
-    oled.setI2CAddress(address << 1);
-    oled.begin();
-    oled.setFont(u8x8_font_chroma48medium8_r);
-    oled.clearDisplay();
-    oled.drawString(0, 0, apName);
-    oledReady = true;
-    Serial.printf("[OLED] Address 0x%02x\n", address);
+    powerBusReady = powerBus.begin(POWER_SDA_GPIO, POWER_SCL_GPIO, 100000U);
 }
 
-void updateOled() {
-    if (!oledReady) {
-        return;
-    }
-    if (!apReady) {
-        oled.drawString(0, 3, "CHECK WI-FI");
-        return;
-    }
-    const Status current = getStatus();
-    char row[17];
-    const bool cameraError = current.reason == Reason::Camera && current.state != State::Streaming;
-    const char* label = cameraError ? "CAM ERROR" : current.state == State::Streaming ? "LIVE"
-        : current.state == State::Cooldown ? "COOLING" : "READY";
-    if (current.remainingSeconds > 0) {
-        snprintf(row, sizeof(row), "%s %lus", label, static_cast<unsigned long>(current.remainingSeconds));
-    } else {
-        snprintf(row, sizeof(row), "%s", label);
-    }
-    static char lastRow[17];
-    static bool wasBright = true;
-    const bool bright = current.state == State::Streaming && !(getOptions() & dimOled);
-    if (bright != wasBright) {
-        oled.setContrast(bright ? 127 : 32);
-        wasBright = bright;
-    }
-    if (strcmp(lastRow, row) != 0) {
-        strcpy(lastRow, row);
-        oled.clearLine(3);
-        oled.drawString(0, 3, row);
-    }
+bool readMeter(uint8_t reg, uint16_t& value) {
+    powerBus.beginTransmission(ina219Address);
+    powerBus.write(reg);
+    if (powerBus.endTransmission(false) != 0 ||
+        powerBus.requestFrom(ina219Address, static_cast<uint8_t>(2)) != 2) return false;
+    const uint16_t high = powerBus.read();
+    value = (high << 8) | powerBus.read();
+    return true;
 }
+
+esp_err_t sendTelemetry(httpd_req_t* request) {
+    char temperature[16] = "null";
+    const float reading = temperatureRead();
+    if (reading > -40 && reading < 125) snprintf(temperature, sizeof(temperature), "%.1f", reading);
+    char power[48] = "null";
+    uint16_t shunt, bus;
+    if (powerBusReady && readMeter(0x02, bus) && (bus & 0x01) == 0 && readMeter(0x01, shunt)) {
+        const int mv = (bus >> 3) * 4;
+        const int microamps = static_cast<int16_t>(shunt) * 10000 / POWER_SHUNT_MILLIOHMS;
+        const int mw = static_cast<int>(static_cast<int64_t>(mv) * microamps / 1000000);
+        snprintf(power, sizeof(power), "%d", mw);
+    }
+    char body[90];
+    snprintf(body, sizeof(body), "{\"chip_temp_c\":%s,\"power_mw\":%s}", temperature, power);
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_set_hdr(request, "Cache-Control", "no-store");
+    return httpd_resp_sendstr(request, body);
+}
+
 }
 
 void setup() {
@@ -456,22 +509,25 @@ void setup() {
     Serial.printf("[BOOT] PSRAM=%u bytes\n", ESP.getPsramSize());
     preferencesReady = preferences.begin("workbenchcam", false);
     if (preferencesReady) boardOptions = preferences.getUChar("options", 0);
-    startOled();
+    startPowerMonitor();
     constexpr size_t passwordLength = sizeof(CAMERA_AP_PASSWORD) - 1;
     if (passwordLength < 8 || passwordLength > 63) {
         Serial.println("[Wi-Fi] Set a unique 8–63 character password in config.local.h");
         return;
     }
     const IPAddress address(192, 168, 4, 1);
+    WiFi.onEvent([](WiFiEvent_t) { Serial.println("[Wi-Fi] Station disconnected"); },
+                 ARDUINO_EVENT_WIFI_AP_STADISCONNECTED);
     WiFi.mode(WIFI_AP);
     if (!WiFi.softAPConfig(address, address, IPAddress(255, 255, 255, 0)) ||
         !WiFi.softAP(apName, CAMERA_AP_PASSWORD, 1, false, 1)) {
         Serial.println("[Wi-Fi] SoftAP failed");
         return;
     }
-    if (!WiFi.setTxPower(WIFI_POWER_15dBm)) Serial.println("[Wi-Fi] TX power unchanged");
+    if (!WiFi.setTxPower(WIFI_POWER_17dBm)) Serial.println("[Wi-Fi] TX power unchanged");
     const auto statusServer = startServer(80, 32768, {
         {"/status", HTTP_GET, sendStatus, nullptr},
+        {"/telemetry", HTTP_GET, sendTelemetry, nullptr},
         {"/settings", HTTP_GET, sendOptions, nullptr},
         {"/settings", HTTP_POST, updateOptions, nullptr},
         {"/stop", HTTP_POST, requestStop, nullptr},
@@ -484,12 +540,9 @@ void setup() {
         Serial.println("[Wi-Fi] HTTP server setup failed");
         return;
     }
-    apReady = true;
     Serial.printf("[Wi-Fi] %s at %s\n", apName, address.toString().c_str());
-    if (oledReady) oled.drawString(0, 1, "192.168.4.1");
 }
 
 void loop() {
-    updateOled();
     delay(1000);
 }

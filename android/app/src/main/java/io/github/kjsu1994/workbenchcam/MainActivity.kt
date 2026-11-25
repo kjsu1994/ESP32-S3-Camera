@@ -23,6 +23,10 @@ import android.view.WindowManager
 import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.RadioButton
+import android.widget.RadioGroup
+import android.widget.RadioGroup.LayoutParams
+import java.util.Locale
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
@@ -40,14 +44,28 @@ class MainActivity : Activity() {
     private var waitingForNetwork = false
     private var visible = false
     private var previewOnReturn = false
+    private var reconnectAttempted = false
+    private var telemetryEnabled = false
+    private var telemetryPending = false
+    private var nextTelemetryAt = 0L
+    private var telemetryText: String? = null
     private var cooldownEndsAt = 0L
     private var message = "보드 Wi-Fi에 연결하세요"
     private var countdown = ""
     private val handler = Handler(Looper.getMainLooper())
+    private val pauseInBackground = Runnable {
+        if (!visible && preview != null) {
+            stopPreview()
+            setStatus("백그라운드에서 영상을 중지했습니다", countdown)
+        }
+    }
 
     private val refresh = object : Runnable {
         override fun run() {
             val now = SystemClock.elapsedRealtime()
+            if (telemetryEnabled && !telemetryPending && now >= nextTelemetryAt) {
+                network?.let { refreshTelemetry(it, now) }
+            }
             val current = preview
             current?.latest?.getAndSet(null)?.let { frame ->
                 val first = displayed == null
@@ -68,7 +86,7 @@ class MainActivity : Activity() {
                     setStatus(message, asClock(remaining))
                 }
             }
-            handler.postDelayed(this, if (preview != null) 100 else 500)
+            handler.postDelayed(this, if (preview != null) 50 else 500)
         }
     }
 
@@ -78,6 +96,7 @@ class MainActivity : Activity() {
         secrets = ConnectionSecret(this)
         password = secrets.read().orEmpty()
         rememberPassword = password.isNotEmpty()
+        telemetryEnabled = getPreferences(MODE_PRIVATE).getBoolean("board_telemetry", false)
         createScreen(resources.configuration)
     }
 
@@ -92,12 +111,14 @@ class MainActivity : Activity() {
         screen.root.requestApplyInsets()
         screen.showFrame(displayed?.bitmap)
         screen.showStatus(message, countdown)
+        renderTelemetry()
         updateControls()
     }
 
     override fun onStart() {
         super.onStart()
         visible = true
+        handler.removeCallbacks(pauseInBackground)
         if (previewOnReturn) {
             previewOnReturn = false
             network?.let(::startPreview)
@@ -108,16 +129,22 @@ class MainActivity : Activity() {
     override fun onStop() {
         visible = false
         handler.removeCallbacks(refresh)
-        if (!isChangingConfigurations && (network != null || isFinishing)) releaseNetwork()
+        if (isFinishing) {
+            releaseNetwork()
+        } else {
+            handler.postDelayed(pauseInBackground, 2000)
+        }
         super.onStop()
     }
 
     override fun onDestroy() {
+        handler.removeCallbacks(pauseInBackground)
         releaseNetwork()
         super.onDestroy()
     }
 
     private fun requestStart() {
+        reconnectAttempted = false
         network?.let {
             startPreview(it)
             return
@@ -149,15 +176,18 @@ class MainActivity : Activity() {
     }
 
     private fun showSettingsMenu() {
-        val connected = network
-        if (connected == null) {
-            showSettings(false)
-            return
+        val choices = mutableListOf<Pair<String, () -> Unit>>()
+        network?.let { connected -> choices += "보드 설정" to { showBoardSettings(connected) } }
+        choices += "Wi-Fi 설정" to { showSettings(false) }
+        choices += (if (telemetryEnabled) "온도·전력 숨기기" else "온도·전력 표시") to {
+            telemetryEnabled = !telemetryEnabled
+            getPreferences(MODE_PRIVATE).edit().putBoolean("board_telemetry", telemetryEnabled).apply()
+            telemetryText = null
+            nextTelemetryAt = 0
+            renderTelemetry()
         }
         AlertDialog.Builder(this).setTitle("설정")
-            .setItems(arrayOf("보드 설정", "Wi-Fi 설정")) { _, option ->
-                if (option == 0) showBoardSettings(connected) else showSettings(false)
-            }
+            .setItems(choices.map { it.first }.toTypedArray()) { _, option -> choices[option].second() }
             .show()
     }
 
@@ -185,13 +215,29 @@ class MainActivity : Activity() {
                     hint.text = "보드 설정을 불러올 수 없습니다"
                     return@runOnUiThread
                 }
-                val low = addOption(content, "전송 절전 · 최대 3fps", current.lowBandwidth)
+                val low = addOption(content, "전송 절전 · 최대 6fps", current.lowBandwidth)
                 val rotate = addOption(content, "영상 180° 회전", current.rotate180)
-                val dim = addOption(content, "OLED 밝기 항상 낮게", current.dimOled)
-                hint.text = "전송 속도와 회전은 다음 시청부터 적용됩니다"
+                content.addView(TextView(this).apply {
+                    text = "영상 해상도"
+                    setPadding(0, dp(12), 0, 0)
+                })
+                val sizes = RadioGroup(this)
+                val sizeIds = VideoResolution.entries.associateWith { size ->
+                    val option = RadioButton(this).apply {
+                        id = View.generateViewId()
+                        text = size.label
+                        minimumHeight = dp(48)
+                    }
+                    sizes.addView(option, LayoutParams(-1, -2))
+                    option.id
+                }
+                sizes.check(sizeIds.getValue(current.resolution))
+                content.addView(sizes)
+                hint.text = "해상도, 전송 속도와 회전은 다음 시청부터 적용됩니다"
                 save.isEnabled = true
                 save.setOnClickListener {
-                    val requested = BoardOptions(low.isChecked, rotate.isChecked, dim.isChecked)
+                    val size = sizeIds.entries.first { it.value == sizes.checkedRadioButtonId }.key
+                    val requested = BoardOptions(low.isChecked, rotate.isChecked, size)
                     save.isEnabled = false
                     Thread({
                         val saved = runCatching { settings.setOptions(requested) }.getOrNull() == requested
@@ -285,13 +331,15 @@ class MainActivity : Activity() {
         dialog.show()
     }
 
-    private fun requestBoardNetwork() {
+    private fun requestBoardNetwork(reconnecting: Boolean = false) {
         if (waitingForNetwork || network != null) return
         val listener = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(available: Network) = runOnUiThread {
                 if (callback !== this || isDestroyed) return@runOnUiThread
                 waitingForNetwork = false
                 network = available
+                nextTelemetryAt = 0
+                renderTelemetry()
                 if (visible) startPreview(available) else previewOnReturn = true
             }
 
@@ -303,8 +351,17 @@ class MainActivity : Activity() {
 
             override fun onLost(lost: Network) = runOnUiThread {
                 if (callback !== this || network != lost) return@runOnUiThread
+                val beforeLimit = preview?.let {
+                    it.endsAt == 0L || SystemClock.elapsedRealtime() + 2000 < it.endsAt
+                } == true
+                val retry = visible && beforeLimit && !reconnectAttempted
                 releaseNetwork()
-                setStatus("보드 Wi-Fi 연결이 끊어졌습니다")
+                if (retry) {
+                    reconnectAttempted = true
+                    requestBoardNetwork(reconnecting = true)
+                } else {
+                    setStatus("보드 Wi-Fi 연결이 끊어졌습니다")
+                }
             }
         }
         try {
@@ -319,7 +376,8 @@ class MainActivity : Activity() {
                 .build()
             callback = listener
             waitingForNetwork = true
-            setStatus("Android의 Wi-Fi 연결 요청을 승인하세요")
+            setStatus(if (reconnecting) "보드 Wi-Fi에 다시 연결하는 중입니다"
+                else "Android의 Wi-Fi 연결 요청을 승인하세요")
             updateControls()
             connectivity.requestNetwork(request, listener, 30_000)
         } catch (_: SecurityException) {
@@ -347,7 +405,8 @@ class MainActivity : Activity() {
                     "camera" -> "카메라 오류"
                     "cooldown" -> "카메라 냉각 중"
                     "stopped" -> "시청을 중지했습니다"
-                    else -> "영상 연결이 끊어졌습니다"
+                    "stream_ended" -> "영상이 종료됐습니다"
+                    else -> "영상 수신이 중단됐습니다"
                 }
                 setCooldown(reason, result.cooldownSeconds)
             }
@@ -380,11 +439,39 @@ class MainActivity : Activity() {
             }
         }
         network = null
+        telemetryText = null
+        nextTelemetryAt = 0
+        renderTelemetry()
         waitingForNetwork = false
         previewOnReturn = false
         cooldownEndsAt = 0L
         setStatus("보드 Wi-Fi에 연결하세요")
         updateControls()
+    }
+
+    private fun refreshTelemetry(connected: Network, now: Long) {
+        telemetryPending = true
+        nextTelemetryAt = now + 5000
+        Thread({
+            val sample = runCatching { BoardApi(connected).getTelemetry() }.getOrNull()
+            runOnUiThread {
+                telemetryPending = false
+                if (isDestroyed || !telemetryEnabled || network != connected) return@runOnUiThread
+                telemetryText = if (sample == null) {
+                    "보드 상태를 읽을 수 없습니다"
+                } else {
+                    val temperature = sample.chipTempC?.let { String.format(Locale.getDefault(), "%.1f °C", it) } ?: "측정 불가"
+                    val power = sample.powerMw?.let { "$it mW" } ?: "센서 미연결"
+                    "칩 내부 온도 $temperature\n소비전력 $power"
+                }
+                renderTelemetry()
+            }
+        }, "board-telemetry").start()
+    }
+
+    private fun renderTelemetry() {
+        screen.showTelemetry(if (!telemetryEnabled) null else telemetryText ?:
+            if (network == null) "보드에 연결하면 온도와 전력을 읽습니다" else "보드 상태 읽는 중")
     }
 
     private fun savePhoto() {
@@ -418,6 +505,8 @@ class MainActivity : Activity() {
     }
 
     private fun updateControls() {
+        if (preview != null) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         screen.showControls(network != null, !waitingForNetwork && preview == null && cooldownEndsAt == 0L,
             preview != null, displayed != null)
     }

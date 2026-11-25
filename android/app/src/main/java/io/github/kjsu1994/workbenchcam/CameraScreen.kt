@@ -39,6 +39,11 @@ internal class CameraScreen(
     private val title = text("WorkbenchCam", 23f, ink).apply { typeface = Typeface.DEFAULT_BOLD }
     private val status = text("", 15f, ink).apply { accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE }
     private val timer = text("", 15f, accent).apply { typeface = Typeface.MONOSPACE }
+    private val telemetry = text("", 14f, muted).apply {
+        visibility = View.GONE
+        setPadding(dp(14), dp(8), dp(14), dp(8))
+        background = surface(panel)
+    }
     private val image = ImageView(context).apply {
         scaleType = ImageView.ScaleType.FIT_CENTER
         contentDescription = "작업대 카메라 영상"
@@ -51,7 +56,7 @@ internal class CameraScreen(
     private val startButton = button("연결 및 보기", true, start)
     private val stopButton = button("정지", false, stop)
     private val photoButton = button("사진 저장", false, save)
-    private val settingsButton = button("설정", false, settings).apply { contentDescription = "Wi-Fi 연결 설정" }
+    private val settingsButton = button("설정", false, settings).apply { contentDescription = "앱과 보드 설정" }
 
     init {
         root.setBackgroundColor(background)
@@ -107,6 +112,7 @@ internal class CameraScreen(
             val layout = row()
             val side = column().apply {
                 addView(summary, LinearLayout.LayoutParams(-1, -2))
+                addAfter(telemetry, 8)
                 addAfter(startButton, 16)
                 addAfter(actions, 8)
             }
@@ -123,6 +129,7 @@ internal class CameraScreen(
             val stack = column().apply {
                 addView(header)
                 addAfter(summary, 12)
+                addAfter(telemetry, 8)
                 addAfter(video, 12)
                 addAfter(startButton, 14)
                 addAfter(actions, 8)
@@ -143,6 +150,11 @@ internal class CameraScreen(
         if (timer.text != countdown) timer.text = countdown
         timer.visibility = if (countdown.isEmpty()) View.GONE else View.VISIBLE
         timer.contentDescription = if (countdown.isEmpty()) null else "남은 시간 $countdown"
+    }
+
+    fun showTelemetry(value: String?) {
+        telemetry.visibility = if (value == null) View.GONE else View.VISIBLE
+        if (value != null && telemetry.text != value) telemetry.text = value
     }
 
     fun showControls(connected: Boolean, canStart: Boolean, playing: Boolean, hasFrame: Boolean) {

@@ -22,6 +22,7 @@ internal class Preview(network: Network) {
     fun start(onEnd: (Result) -> Unit) {
         Thread({
             var result: Result? = null
+            var cleanEnd = false
             try {
                 val startedAt = SystemClock.elapsedRealtime()
                 val stream = open(":81/stream")
@@ -39,7 +40,11 @@ internal class Preview(network: Network) {
                         stream.inputStream.use { input ->
                             val reader = MjpegReader(input)
                             while (!stopped) {
-                                val jpeg = reader.nextFrame() ?: break
+                                val jpeg = reader.nextFrame()
+                                if (jpeg == null) {
+                                    cleanEnd = true
+                                    break
+                                }
                                 val bitmap = decode(jpeg) ?: continue
                                 latest.set(Frame(jpeg, bitmap))
                             }
@@ -51,7 +56,12 @@ internal class Preview(network: Network) {
             } catch (_: IOException) {
                 // The status request below distinguishes a camera stop from a lost connection.
             } finally {
-                if (!stopped) onEnd(result ?: readStatus())
+                if (!stopped) {
+                    val status = result ?: readStatus()
+                    val nearLimit = endsAt > 0L && SystemClock.elapsedRealtime() + 2000 >= endsAt
+                    onEnd(Result(streamEndReason(status?.reason, cleanEnd, nearLimit),
+                        status?.cooldownSeconds ?: if (nearLimit) 60 else 0))
+                }
             }
         }, "camera-preview").start()
     }
@@ -84,7 +94,7 @@ internal class Preview(network: Network) {
         }
     }
 
-    private fun readStatus(): Result {
+    private fun readStatus(): Result? {
         return try {
             val status = open("/status")
             try {
@@ -98,14 +108,20 @@ internal class Preview(network: Network) {
                 close(status)
             }
         } catch (_: Exception) {
-            Result("disconnected", 0)
+            null
         }
     }
 
     private fun decode(jpeg: ByteArray): Bitmap? {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, bounds)
-        if (bounds.outWidth !in 1..640 || bounds.outHeight !in 1..480) return null
+        if (bounds.outWidth !in 1..800 || bounds.outHeight !in 1..600) return null
         return BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)
     }
+}
+
+internal fun streamEndReason(reported: String?, cleanEnd: Boolean, nearLimit: Boolean): String {
+    if (reported in setOf("limit", "camera", "cooldown", "stopped", "disconnected")) return requireNotNull(reported)
+    if (nearLimit) return "limit"
+    return if (cleanEnd) "stream_ended" else "transport"
 }
