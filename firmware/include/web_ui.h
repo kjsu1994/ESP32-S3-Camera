@@ -193,7 +193,7 @@ async function loadFiles(){
 }
 function refreshAll(){loadStatus();loadFiles();}
 refreshAll();
-setInterval(loadStatus,5000);
+setInterval(()=>{if(!liveOn)loadStatus();},5000);
 </script>
 </body>
 </html>

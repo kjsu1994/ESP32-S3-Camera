@@ -181,7 +181,10 @@ bool startCamera(uint8_t options) {
     config.pixel_format = PIXFORMAT_JPEG;
     const uint8_t resolution = resolutionIndex(options);
     config.frame_size = frameSizes[resolution];
-    config.jpeg_quality = resolution == static_cast<uint8_t>(Resolution::Hd) ? 16 : 14;
+    // In STA (router) mode, trim JPEG size slightly so multi-hop router RTT stays well below frame interval.
+    config.jpeg_quality = (resolution == static_cast<uint8_t>(Resolution::Hd))
+                              ? (staModeActive ? 20 : 16)
+                              : (staModeActive ? 16 : 14);
     config.fb_count = 2;
     config.fb_location = CAMERA_FB_IN_PSRAM;
     config.grab_mode = CAMERA_GRAB_LATEST;
@@ -381,6 +384,7 @@ esp_err_t stream(httpd_req_t* request) {
     uint64_t winCapUs = 0;
     uint64_t winSendUs = 0;
     uint32_t winMaxSendUs = 0;
+    uint64_t winBytes = 0;
 
     while (sent && !shouldStop()) {
         const uint32_t started = millis();
@@ -434,12 +438,14 @@ esp_err_t stream(httpd_req_t* request) {
         ++winFrames;
         winCapUs += captureElapsed;
         winSendUs += sendElapsed;
+        winBytes += jpegLength;
         if (sendElapsed > winMaxSendUs) winMaxSendUs = sendElapsed;
         const uint32_t winNow = millis();
         if (winNow - winStartMs >= 5000 && winFrames > 0) {
             const float winFps = winFrames * 1000.0f / (winNow - winStartMs);
-            Serial.printf("[CAM] Live: fps=%.1f cap=%lums send=%lums max_send=%lums mode=%s ch=%d rssi=%d opts=0x%02x\n",
+            Serial.printf("[CAM] Live: fps=%.1f kb=%lu cap=%lums send=%lums max_send=%lums mode=%s ch=%d rssi=%d opts=0x%02x\n",
                           winFps,
+                          static_cast<unsigned long>(winBytes / winFrames / 1024),
                           static_cast<unsigned long>(winCapUs / winFrames / 1000),
                           static_cast<unsigned long>(winSendUs / winFrames / 1000),
                           static_cast<unsigned long>(winMaxSendUs / 1000),
@@ -452,6 +458,7 @@ esp_err_t stream(httpd_req_t* request) {
             winCapUs = 0;
             winSendUs = 0;
             winMaxSendUs = 0;
+            winBytes = 0;
         }
         if (frameIntervalMs > 0) {
             const uint32_t elapsed = millis() - started;
@@ -1070,7 +1077,7 @@ void setup() {
             esp_wifi_set_ps(WIFI_PS_NONE);
             WiFi.setSleep(false);
             const int rssi = WiFi.RSSI();
-            WiFi.setTxPower(rssi < -62 ? WIFI_POWER_19_5dBm : WIFI_POWER_17dBm);
+            WiFi.setTxPower(WIFI_POWER_19_5dBm);
             wifi_ps_type_t psType = WIFI_PS_NONE;
             esp_wifi_get_ps(&psType);
             Serial.printf("[Wi-Fi] STA connected: %s at %s (ch=%d rssi=%d ps=%d)\n",
