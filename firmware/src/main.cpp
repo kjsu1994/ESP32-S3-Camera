@@ -80,6 +80,7 @@ bool staEnabled = false;
 String staSsid;
 String staPass;
 int activeWifiChannel = 6;
+String cachedWifiScanJson = "{\"networks\":[]}";
 volatile bool ledEnabled = true;
 volatile uint32_t rebootAtMs = 0;
 sdrec::Manager sdManager;
@@ -787,12 +788,7 @@ esp_err_t sendWifiStatus(httpd_req_t* request) {
     return res;
 }
 
-esp_err_t scanWifiNetworks(httpd_req_t* request) {
-    const wifi_mode_t prevMode = WiFi.getMode();
-    if (prevMode == WIFI_AP) {
-        WiFi.mode(WIFI_AP_STA);
-    }
-    const int found = WiFi.scanNetworks(false, false);
+size_t cacheWifiScanResults(int found) {
     struct ApInfo {
         String ssid;
         int32_t rssi;
@@ -811,7 +807,6 @@ esp_err_t scanWifiNetworks(httpd_req_t* request) {
             bestBySsid[ssid] = {ssid, rssi, ch, isOpen};
         }
     }
-    WiFi.scanDelete();
     std::vector<ApInfo> sorted;
     sorted.reserve(bestBySsid.size());
     for (const auto& kv : bestBySsid) sorted.push_back(kv.second);
@@ -832,12 +827,27 @@ esp_err_t scanWifiNetworks(httpd_req_t* request) {
     }
     char* json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
-    if (!json) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+    if (json) {
+        cachedWifiScanJson = String(json);
+        cJSON_free(json);
+    }
+    return sorted.size();
+}
+
+esp_err_t scanWifiNetworks(httpd_req_t* request) {
+    // In SoftAP mode, switching WIFI_AP -> WIFI_AP_STA + off-channel scanning drops/stalls
+    // the phone's HTTP socket, so serve the clean pre-SoftAP boot scan cache instantly.
+    // In STA mode, WiFi is already WIFI_STA so a fast active scan (120ms/ch) works safely.
+    if (staModeActive) {
+        const int found = WiFi.scanNetworks(false, false, false, 120);
+        if (found >= 0) {
+            cacheWifiScanResults(found);
+            WiFi.scanDelete();
+        }
+    }
     httpd_resp_set_type(request, "application/json");
     httpd_resp_set_hdr(request, "Cache-Control", "no-store");
-    const esp_err_t res = httpd_resp_sendstr(request, json);
-    cJSON_free(json);
-    return res;
+    return httpd_resp_sendstr(request, cachedWifiScanJson.c_str());
 }
 
 esp_err_t updateWifiConfig(httpd_req_t* request) {
@@ -940,6 +950,10 @@ int selectQuietChannel() {
     for (int i = 0; i < apCount; ++i) {
         const int ch = WiFi.channel(i);
         if (ch >= 1 && ch <= 13) ++chCount[ch];
+    }
+    if (apCount >= 0) {
+        const size_t cached = cacheWifiScanResults(apCount);
+        Serial.printf("[Wi-Fi] Cached %u nearby 2.4GHz APs\n", static_cast<unsigned>(cached));
     }
     WiFi.scanDelete();
     int bestChannel = 6;
