@@ -257,7 +257,7 @@ internal class SettingsScreen(
             setPadding(UiStyle.dp(context, 4), UiStyle.dp(context, 18), 0, UiStyle.dp(context, 8))
         })
         val infoCard = UiStyle.card(context)
-        infoCard.addView(UiStyle.label(context, "WorkbenchCam v0.2.0", 14.5f, UiStyle.INK, bold = true))
+        infoCard.addView(UiStyle.label(context, "WorkbenchCam v0.2.1", 14.5f, UiStyle.INK, bold = true))
         infoCard.addView(UiStyle.label(
             context,
             "ESP32-S3 · OV5640 작업대 카메라 & 단독 SD 블랙박스/타임랩스 컨트롤러",

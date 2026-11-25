@@ -75,9 +75,9 @@ inline void buildAviHeader(uint8_t header[kAviHeaderSize], uint16_t width, uint1
     writeLe32(header + 4, riffSize);
     memcpy(header + 8, "AVI ", 4);
 
-    // LIST hdrl (12..23) -> size = 204 (from 20..223)
+    // LIST hdrl (12..211) -> payload size = 192 (4 "hdrl" + 64 avih + 8 strl hdr + 116 strl payload)
     memcpy(header + 12, "LIST", 4);
-    writeLe32(header + 16, 204);
+    writeLe32(header + 16, 192);
     memcpy(header + 20, "hdrl", 4);
 
     // avih chunk (24..87, payload 56 bytes)
@@ -94,9 +94,9 @@ inline void buildAviHeader(uint8_t header[kAviHeaderSize], uint16_t width, uint1
     writeLe32(header + 64, width);             // dwWidth
     writeLe32(header + 68, height);            // dwHeight
 
-    // LIST strl (88..223) -> size = 128 (from 96..223)
+    // LIST strl (88..211) -> payload size = 116 (4 "strl" + 64 strh + 48 strf)
     memcpy(header + 88, "LIST", 4);
-    writeLe32(header + 92, 128);
+    writeLe32(header + 92, 116);
     memcpy(header + 96, "strl", 4);
 
     // strh chunk (100..163, payload 56 bytes)
@@ -255,14 +255,22 @@ public:
 
     SdStatus getStatus() {
         SdStatus s{};
-        s.mounted = mounted_;
-        if (mounted_ && xSemaphoreTakeRecursive(sdMutex_, pdMS_TO_TICKS(200)) == pdTRUE) {
-            const uint64_t total = SD_MMC.totalBytes();
-            const uint64_t used = SD_MMC.usedBytes();
-            s.totalMb = static_cast<uint32_t>(total / (1024ULL * 1024ULL));
-            s.usedMb = static_cast<uint32_t>(used / (1024ULL * 1024ULL));
-            s.freeMb = total > used ? static_cast<uint32_t>((total - used) / (1024ULL * 1024ULL)) : 0;
+        if (xSemaphoreTakeRecursive(sdMutex_, pdMS_TO_TICKS(300)) == pdTRUE) {
+            uint64_t total = mounted_ ? SD_MMC.totalBytes() : 0;
+            if (total == 0 && activeMode_ == RecordMode::Off) {
+                tryRemountLocked();
+                total = mounted_ ? SD_MMC.totalBytes() : 0;
+            }
+            s.mounted = mounted_;
+            if (mounted_ && total > 0) {
+                const uint64_t used = SD_MMC.usedBytes();
+                s.totalMb = static_cast<uint32_t>(total / (1024ULL * 1024ULL));
+                s.usedMb = static_cast<uint32_t>(used / (1024ULL * 1024ULL));
+                s.freeMb = total > used ? static_cast<uint32_t>((total - used) / (1024ULL * 1024ULL)) : 0;
+            }
             xSemaphoreGiveRecursive(sdMutex_);
+        } else {
+            s.mounted = mounted_;
         }
         xSemaphoreTake(stateMutex_, portMAX_DELAY);
         s.mode = desiredMode_;
@@ -363,6 +371,19 @@ public:
     }
 
 private:
+    bool tryRemountLocked() {
+        const uint32_t now = millis();
+        if (now - lastRemountMs_ < 3000) return mounted_;
+        lastRemountMs_ = now;
+        SD_MMC.end();
+        mounted_ = false;
+        if (mountCard()) {
+            ensureDirs();
+            return true;
+        }
+        return false;
+    }
+
     bool mountCard() {
         if (!SD_MMC.setPins(board::sdClk, board::sdCmd, board::sdD0)) return false;
         if (SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_HIGHSPEED, 6) ||
@@ -770,6 +791,7 @@ private:
     uint32_t activeFrames_ = 0;
     uint32_t segmentStartedMs_ = 0;
     uint32_t lastCaptureMs_ = 0;
+    uint32_t lastRemountMs_ = 0;
 };
 
 } // namespace sdrec

@@ -751,7 +751,7 @@ int selectQuietChannel() {
     WiFi.scanDelete();
     int bestChannel = 6;
     int bestScore = 10000;
-    for (const int candidate : {1, 6, 11}) {
+    for (const int candidate : {6, 11, 1}) {
         int score = 0;
         for (int c = 1; c <= 13; ++c) {
             const int distance = abs(c - candidate);

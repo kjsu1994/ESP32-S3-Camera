@@ -46,51 +46,44 @@ internal class AviMjpegReader(input: InputStream) {
         val avi = readFourCcOrNull() ?: throw EOFException("Truncated AVI header")
         if (avi != "AVI ") throw IOException("Not an AVI container")
 
-        while (true) {
-            val id = readFourCcOrNull() ?: throw EOFException("Missing movi list")
-            val size = readLeInt()
-            if (size < 0) throw IOException("Invalid header chunk size")
-            if (id == "LIST") {
-                if (size < 4) throw IOException("Truncated LIST chunk")
-                val listType = readFourCcOrNull() ?: throw EOFException("Truncated LIST type")
-                if (listType == "movi") {
+        // Scan header safely (up to 4KB) so both spec-compliant AVI and padded/partial headers work.
+        val window = ByteArray(4)
+        var scanned = 0
+        var filled = 0
+        while (scanned < 4096) {
+            val b = source.read()
+            if (b == -1) throw EOFException("Missing movi list")
+            scanned += 1
+            if (filled < 4) {
+                window[filled++] = b.toByte()
+            } else {
+                window[0] = window[1]
+                window[1] = window[2]
+                window[2] = window[3]
+                window[3] = b.toByte()
+            }
+            if (filled == 4) {
+                if (window[0] == 'a'.code.toByte() && window[1] == 'v'.code.toByte() &&
+                    window[2] == 'i'.code.toByte() && window[3] == 'h'.code.toByte()
+                ) {
+                    val avihSize = readLeInt()
+                    scanned += 4
+                    if (avihSize >= 4) {
+                        val usPerFrame = readLeInt()
+                        scanned += 4
+                        if (usPerFrame in 10_000..1_000_000) {
+                            fpsHint = (1_000_000 / usPerFrame).coerceIn(1, 30)
+                        }
+                    }
+                    filled = 0
+                } else if (window[0] == 'm'.code.toByte() && window[1] == 'o'.code.toByte() &&
+                    window[2] == 'v'.code.toByte() && window[3] == 'i'.code.toByte()
+                ) {
                     return
-                } else if (listType == "hdrl") {
-                    parseHdrl(size - 4)
-                } else {
-                    skipFully((size - 4).toLong() + (size and 1))
                 }
-            } else {
-                skipFully(size.toLong() + (size and 1))
             }
         }
-    }
-
-    private fun parseHdrl(remainingBytes: Int) {
-        var left = remainingBytes
-        while (left >= 8) {
-            val id = readFourCcOrNull() ?: return
-            val size = readLeInt()
-            left -= 8
-            if (size < 0 || size > left) {
-                skipFully(left.coerceAtLeast(0).toLong())
-                return
-            }
-            if (id == "avih" && size >= 4) {
-                val usPerFrame = readLeInt()
-                if (usPerFrame in 10_000..1_000_000) {
-                    fpsHint = (1_000_000 / usPerFrame).coerceIn(1, 30)
-                }
-                val rest = size - 4 + (size and 1)
-                skipFully(rest.toLong())
-                left -= size + (size and 1)
-            } else {
-                val padded = size + (size and 1)
-                skipFully(padded.toLong())
-                left -= padded
-            }
-        }
-        if (left > 0) skipFully(left.toLong())
+        throw IOException("Missing movi list")
     }
 
     private fun readFourCcOrNull(): String? {
