@@ -1,9 +1,50 @@
-<?xml version="1.0" encoding="utf-8"?>
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
-    android:width="48dp" android:height="48dp"
-    android:viewportWidth="48" android:viewportHeight="48">
-    <path android:fillColor="#1D2822"
-        android:pathData="M10,0h28a10,10 0,0 1,10 10v28a10,10 0,0 1,-10 10h-28a10,10 0,0 1,-10 -10v-28a10,10 0,0 1,10 -10z"/>
-    <path android:strokeColor="#9AE9BA" android:strokeWidth="2.6" android:strokeLineJoin="round"
-        android:pathData="M12,17h5l2,-3h10l2,3h5v17h-24z M29,25a5,5 0,1 0,-10 0a5,5 0,1 0,10 0z"/>
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Deep obsidian rounded background -->
+    <path
+        android:fillColor="#0B1411"
+        android:pathData="M24,6h60c9.94,0 18,8.06 18,18v60c0,9.94 -8.06,18 -18,18H24c-9.94,0 -18,-8.06 -18,-18V24c0,-9.94 8.06,-18 18,-18z" />
+    <!-- Subtle machined bezel -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#243830"
+        android:strokeWidth="2.5"
+        android:pathData="M26,10h56c8.84,0 16,7.16 16,16v56c0,8.84 -7.16,16 -16,16H26c-8.84,0 -16,-7.16 -16,-16V26c0,-8.84 7.16,-16 16,-16z" />
+    <!-- Dock / workbench base bar -->
+    <path
+        android:fillColor="#1A332A"
+        android:pathData="M34,84h40c2.2,0 4,1.8 4,4v2H30v-2c0,-2.2 1.8,-4 4,-4z" />
+    <!-- Outer optical housing -->
+    <path
+        android:fillColor="#112921"
+        android:strokeColor="#34D399"
+        android:strokeWidth="4.2"
+        android:pathData="M54,26a28,28 0 1,0 0,56a28,28 0 1,0 0,-56z" />
+    <!-- Inner dark glass chamber -->
+    <path
+        android:fillColor="#06120E"
+        android:strokeColor="#235443"
+        android:strokeWidth="2"
+        android:pathData="M54,36a18,18 0 1,0 0,36a18,18 0 1,0 0,-36z" />
+    <!-- Precision emerald sensor pupil -->
+    <path
+        android:fillColor="#154D3A"
+        android:pathData="M54,44a10,10 0 1,0 0,20a10,10 0 1,0 0,-20z" />
+    <path
+        android:fillColor="#34D399"
+        android:pathData="M54,49a5,5 0 1,0 0,10a5,5 0 1,0 0,-10z" />
+    <!-- Optical glass specular highlight -->
+    <path
+        android:fillColor="#DDF6FFF9"
+        android:pathData="M45,42a3.6,3.6 0 1,0 0,7.2a3.6,3.6 0 1,0 0,-7.2z" />
+    <path
+        android:fillColor="#666EE7B7"
+        android:pathData="M62,60a2,2 0 1,0 0,4a2,2 0 1,0 0,-4z" />
+    <!-- Live status LED indicator dot -->
+    <path
+        android:fillColor="#34D399"
+        android:pathData="M82,22a4.8,4.8 0 1,0 0,9.6a4.8,4.8 0 1,0 0,-9.6z" />
 </vector>

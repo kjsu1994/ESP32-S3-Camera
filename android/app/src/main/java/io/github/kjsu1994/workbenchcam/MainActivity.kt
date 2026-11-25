@@ -42,8 +42,12 @@ class MainActivity : Activity() {
 
     private var password = ""
     private var rememberPassword = false
+    private var connectPreference = ConnectPreference.AUTO
+    private var manualLanIp = ""
+    private var lastLanIp = ""
+
     private var callback: ConnectivityManager.NetworkCallback? = null
-    private var network: Network? = null
+    private var boardTarget: BoardTarget? = null
     private var preview: Preview? = null
     private var stoppingPreview = false
     private var displayed: Preview.Frame? = null
@@ -62,7 +66,7 @@ class MainActivity : Activity() {
     private var nextTelemetryAt = 0L
     private var telemetryText: String? = null
     private var cooldownEndsAt = 0L
-    private var message = "연결 대기"
+    private var message = "미연결"
     private var countdown = ""
 
     private var activeTab = AppTab.LIVE
@@ -73,6 +77,7 @@ class MainActivity : Activity() {
     private var backCallback: OnBackInvokedCallback? = null
 
     private var sdStatus: SdStatus? = null
+    private var wifiStatus: WifiStatus? = null
     private var sdStatusPending = false
     private var nextSdPollAt = 0L
     private var selectedLibraryCategory = "all"
@@ -88,7 +93,7 @@ class MainActivity : Activity() {
     }
     private val retryPreview = Runnable {
         if (visible && preview == null && !stoppingPreview) {
-            network?.let(::startPreview)
+            boardTarget?.let(::startPreview)
         }
     }
     private val renderFrame = Runnable {
@@ -117,7 +122,7 @@ class MainActivity : Activity() {
     private val refresh = object : Runnable {
         override fun run() {
             val now = SystemClock.elapsedRealtime()
-            val connected = network
+            val connected = boardTarget
             if (connected != null) {
                 if (telemetryEnabled && !telemetryPending && now >= nextTelemetryAt) {
                     refreshTelemetry(connected, now)
@@ -153,7 +158,7 @@ class MainActivity : Activity() {
         connectivity = requireNotNull(getSystemService(ConnectivityManager::class.java))
         wifiLock = applicationContext.getSystemService(WifiManager::class.java)?.createWifiLock(
             WifiManager.WIFI_MODE_FULL_LOW_LATENCY,
-            "WorkbenchCam:stream"
+            "DockyCam:stream"
         )?.apply { setReferenceCounted(false) }
         secrets = ConnectionSecret(this)
         password = secrets.read().orEmpty()
@@ -162,6 +167,9 @@ class MainActivity : Activity() {
         telemetryEnabled = prefs.getBoolean("board_telemetry", false)
         gridEnabled = prefs.getBoolean("video_grid", false)
         autoConnectEnabled = prefs.getBoolean("auto_connect", false)
+        connectPreference = ConnectPreference.fromKey(prefs.getString("connect_pref", "auto"))
+        manualLanIp = prefs.getString("manual_lan_ip", "").orEmpty()
+        lastLanIp = prefs.getString("last_lan_ip", "").orEmpty()
         createScreen(resources.configuration)
     }
 
@@ -273,7 +281,7 @@ class MainActivity : Activity() {
     private fun onTabChanged(tab: AppTab) {
         activeTab = tab
         updateBackCallbackRegistration()
-        val connected = network ?: return
+        val connected = boardTarget ?: return
         when (tab) {
             AppTab.RECORD -> {
                 nextSdPollAt = 0L
@@ -297,10 +305,16 @@ class MainActivity : Activity() {
             initialPassword = password,
             initialRemember = rememberPassword,
             initialAutoConnect = autoConnectEnabled,
+            initialConnectPref = connectPreference,
+            initialManualIp = manualLanIp,
             initialGrid = gridEnabled,
             initialTelemetry = telemetryEnabled,
             onBack = ::closeSettingsPage,
             onSaveWifi = ::saveWifiCredentials,
+            onConnectPrefChanged = { pref ->
+                connectPreference = pref
+                getPreferences(MODE_PRIVATE).edit().putString("connect_pref", pref.key).apply()
+            },
             onDisconnectWifi = {
                 releaseNetwork()
                 settingsScreen?.setConnected(false)
@@ -323,15 +337,21 @@ class MainActivity : Activity() {
                 renderTelemetry()
             },
             onSaveBoardOptions = ::applyBoardOptionsFromSettings,
+            onScanHomeWifi = ::scanNearbyWifiFromBoard,
+            onSaveHomeWifi = ::saveHomeWifiToBoard,
+            onToggleBoardLed = ::updateBoardLedMode,
+            onRebootBoard = ::confirmRebootBoard,
             onClearSdCategory = ::confirmClearSdCategory
         )
         settingsScreen = page
-        val connected = network
+        val connected = boardTarget
         page.setConnected(connected != null)
         page.showSdStatus(sdStatus)
+        page.showWifiStatus(wifiStatus)
         screen.showSettingsOverlay(page.root)
         if (connected != null) {
             loadBoardOptionsForSettings(connected, page)
+            refreshWifiStatus(connected)
             refreshSdStatus(connected, SystemClock.elapsedRealtime() + 2500L)
         }
     }
@@ -344,42 +364,139 @@ class MainActivity : Activity() {
         updateBackCallbackRegistration()
     }
 
-    private fun saveWifiCredentials(value: String, remember: Boolean) {
-        if (remember) {
-            if (runCatching { secrets.save(value) }.isFailure) {
-                settingsScreen?.showPasswordError("비밀번호를 저장할 수 없습니다. 저장 옵션을 끄고 시도해 주세요.")
-                return
+    private fun saveWifiCredentials(value: String, remember: Boolean, manualIp: String) {
+        if (value.isNotEmpty()) {
+            if (remember) {
+                if (runCatching { secrets.save(value) }.isFailure) {
+                    settingsScreen?.showPasswordError("비밀번호를 저장할 수 없습니다. 저장 옵션을 끄고 시도해 주세요.")
+                    return
+                }
+            } else {
+                secrets.forget()
             }
-        } else {
-            secrets.forget()
         }
-        val changed = password != value
+        val changed = password != value || manualLanIp != manualIp
         password = value
-        rememberPassword = remember
-        if (changed && (network != null || waitingForNetwork)) {
+        rememberPassword = remember && value.isNotEmpty()
+        manualLanIp = manualIp
+        getPreferences(MODE_PRIVATE).edit().putString("manual_lan_ip", manualLanIp).apply()
+        if (changed && (boardTarget != null || waitingForNetwork)) {
             releaseNetwork()
             settingsScreen?.setConnected(false)
         }
-        Toast.makeText(this, "Wi-Fi 설정을 저장했습니다", Toast.LENGTH_SHORT).show()
-        if (network == null && activeTab == AppTab.LIVE) {
+        Toast.makeText(this, "연결 설정을 저장했습니다", Toast.LENGTH_SHORT).show()
+        if (boardTarget == null && activeTab == AppTab.LIVE) {
             closeSettingsPage()
             requestStart()
         }
     }
 
-    private fun loadBoardOptionsForSettings(connected: Network, page: SettingsScreen) {
+    private fun loadBoardOptionsForSettings(connected: BoardTarget, page: SettingsScreen) {
         Thread({
             val options = runCatching { BoardApi(connected).getOptions() }.getOrNull()
             runOnUiThread {
-                if (isDestroyed || settingsScreen !== page || network != connected) return@runOnUiThread
+                if (isDestroyed || settingsScreen !== page || boardTarget != connected) return@runOnUiThread
                 cachedBoardOptions = options
                 page.showBoardOptions(options)
             }
         }, "board-settings-load").start()
     }
 
+    private fun refreshWifiStatus(connected: BoardTarget) {
+        Thread({
+            val st = runCatching { BoardApi(connected).getWifiStatus() }.getOrNull()
+            runOnUiThread {
+                if (isDestroyed || boardTarget != connected) return@runOnUiThread
+                if (st != null) {
+                    wifiStatus = st
+                    if (st.mode == "sta" && isAllowedLocalHost(st.ip)) {
+                        lastLanIp = st.ip
+                        getPreferences(MODE_PRIVATE).edit().putString("last_lan_ip", lastLanIp).apply()
+                    }
+                    settingsScreen?.showWifiStatus(st)
+                }
+            }
+        }, "board-wifi-status").start()
+    }
+
+    private fun scanNearbyWifiFromBoard() {
+        val connected = boardTarget ?: return
+        val page = settingsScreen ?: return
+        Thread({
+            val list = runCatching { BoardApi(connected).scanWifi() }.getOrNull()
+            runOnUiThread {
+                if (isDestroyed || settingsScreen !== page) return@runOnUiThread
+                page.showScannedNetworks(list)
+            }
+        }, "board-wifi-scan").start()
+    }
+
+    private fun saveHomeWifiToBoard(staEnabled: Boolean, ssid: String, pass: String?) {
+        val connected = boardTarget ?: return
+        Thread({
+            val ok = runCatching {
+                BoardApi(connected).setWifiConfig(staEnabled, ssid, pass, reboot = true)
+            }.getOrDefault(false)
+            runOnUiThread {
+                if (isDestroyed) return@runOnUiThread
+                if (ok) {
+                    val msg = if (staEnabled) {
+                        "'$ssid' 공유기 설정을 저장하고 보드를 재부팅합니다. 약 10초 뒤 집 Wi-Fi에서 다시 연결하세요!"
+                    } else {
+                        "직결 AP 모드로 전환하며 보드를 재부팅합니다."
+                    }
+                    Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+                    releaseNetwork()
+                    closeSettingsPage()
+                } else {
+                    Toast.makeText(this, "공유기 설정을 저장하지 못했습니다", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }, "board-wifi-save").start()
+    }
+
+    private fun updateBoardLedMode(enabled: Boolean) {
+        val connected = boardTarget ?: return
+        Thread({
+            val ok = runCatching { BoardApi(connected).setLedEnabled(enabled) }.isSuccess
+            runOnUiThread {
+                if (!isDestroyed) {
+                    Toast.makeText(
+                        this,
+                        if (ok) (if (enabled) "상태 LED를 켰습니다" else "스텔스 모드(LED 끄기) 적용")
+                        else "LED 설정 변경에 실패했습니다",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
+        }, "board-led").start()
+    }
+
+    private fun confirmRebootBoard() {
+        val connected = boardTarget ?: return
+        AlertDialog.Builder(this)
+            .setTitle("보드 원격 재부팅")
+            .setMessage("ESP32-S3 보드를 지금 재부팅할까요?")
+            .setNegativeButton("취소", null)
+            .setPositiveButton("재부팅") { _, _ ->
+                Thread({
+                    val ok = runCatching { BoardApi(connected).reboot() }.isSuccess
+                    runOnUiThread {
+                        if (!isDestroyed) {
+                            Toast.makeText(this, if (ok) "보드를 재부팅하는 중입니다..." else "재부팅 요청 실패", Toast.LENGTH_SHORT).show()
+                            if (ok) {
+                                releaseNetwork()
+                                closeSettingsPage()
+                            }
+                        }
+                    }
+                }, "board-reboot").start()
+            }
+            .show()
+    }
+
     private fun applyBoardOptionsFromSettings(requested: BoardOptions) {
-        val connected = network ?: return
+        val connected = boardTarget ?: return
         val page = settingsScreen ?: return
         val changed = cachedBoardOptions != null && cachedBoardOptions != requested
         page.setBoardSaving(true)
@@ -390,7 +507,7 @@ class MainActivity : Activity() {
                 page.setBoardSaving(false)
                 if (saved) {
                     cachedBoardOptions = requested
-                    if (changed && preview != null && network == connected) {
+                    if (changed && preview != null && boardTarget == connected) {
                         Toast.makeText(this, "보드 설정을 저장하고 영상에 적용합니다", Toast.LENGTH_SHORT).show()
                         restartPreviewForSettings(connected)
                     } else {
@@ -489,9 +606,9 @@ class MainActivity : Activity() {
         handler.removeCallbacks(pauseInBackground)
         if (previewOnReturn) {
             previewOnReturn = false
-            network?.let(::startPreview)
-        } else if (autoConnectEnabled && !autoConnectAttempted && password.isNotEmpty() &&
-            network == null && !waitingForNetwork && preview == null
+            boardTarget?.let(::startPreview)
+        } else if (autoConnectEnabled && !autoConnectAttempted &&
+            boardTarget == null && !waitingForNetwork && preview == null
         ) {
             autoConnectAttempted = true
             requestStart()
@@ -528,13 +645,53 @@ class MainActivity : Activity() {
         reconnectAttempted = false
         streamRetries = 0
         handler.removeCallbacks(retryPreview)
-        network?.let {
+        boardTarget?.let {
             startPreview(it)
             return
         }
+        if (waitingForNetwork) return
+
+        // 1. Try Home Wi-Fi LAN (mDNS / last STA IP) first unless user selected AP_ONLY.
+        if (connectPreference != ConnectPreference.AP_ONLY) {
+            val activeWifi = LanDiscovery.findActiveWifiNetwork(connectivity)
+            if (activeWifi != null) {
+                waitingForNetwork = true
+                setStatus("집 Wi-Fi 탐색 중")
+                updateControls()
+                Thread({
+                    val found = LanDiscovery.discoverOnLan(this, activeWifi, lastLanIp, manualLanIp)
+                    runOnUiThread {
+                        if (isDestroyed || !waitingForNetwork) return@runOnUiThread
+                        waitingForNetwork = false
+                        if (found != null) {
+                            onBoardConnected(found)
+                        } else if (connectPreference == ConnectPreference.LAN_ONLY) {
+                            setStatus("공유기에서 보드 미발견")
+                            updateControls()
+                            Toast.makeText(
+                                this,
+                                "집 Wi-Fi에서 DockyCam을 찾지 못했습니다. 직결 AP 모드로 바꾸거나 보드 전원을 확인하세요",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        } else {
+                            startSoftApConnect()
+                        }
+                    }
+                }, "lan-discovery").start()
+                return
+            } else if (connectPreference == ConnectPreference.LAN_ONLY) {
+                setStatus("Wi-Fi 연결 필요")
+                Toast.makeText(this, "휴대폰을 집 Wi-Fi에 먼저 연결해 주세요", Toast.LENGTH_SHORT).show()
+                return
+            }
+        }
+        startSoftApConnect()
+    }
+
+    private fun startSoftApConnect() {
         if (password.isEmpty()) {
             openSettingsPage()
-            Toast.makeText(this, "먼저 Wi-Fi 비밀번호를 입력해 주세요", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "먼저 직결 AP 비밀번호를 입력해 주세요", Toast.LENGTH_SHORT).show()
             return
         }
         val permissions = if (Build.VERSION.SDK_INT >= 33) {
@@ -543,7 +700,7 @@ class MainActivity : Activity() {
             arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION)
         }
         if (checkSelfPermission(permissions.first()) == PackageManager.PERMISSION_GRANTED) {
-            requestBoardNetwork()
+            requestBoardApNetwork()
         } else {
             requestPermissions(permissions, 10)
         }
@@ -553,38 +710,43 @@ class MainActivity : Activity() {
         super.onRequestPermissionsResult(requestCode, permissions, results)
         if (requestCode != 10) return
         if (results.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
-            requestBoardNetwork()
+            requestBoardApNetwork()
         } else {
             setStatus("권한 필요")
             Toast.makeText(this, "Wi-Fi 연결 권한을 허용한 뒤 다시 시도하세요", Toast.LENGTH_SHORT).show()
         }
     }
 
-    private fun requestBoardNetwork(reconnecting: Boolean = false) {
-        if (waitingForNetwork || network != null) return
+    private fun onBoardConnected(target: BoardTarget) {
+        boardTarget = target
+        nextTelemetryAt = 0L
+        nextSdPollAt = 0L
+        renderTelemetry()
+        syncBoardClock(target)
+        refreshWifiStatus(target)
+        refreshSdStatus(target, SystemClock.elapsedRealtime() + 2500L)
+        if (settingsOpen) {
+            settingsScreen?.let { page ->
+                page.setConnected(true)
+                loadBoardOptionsForSettings(target, page)
+            }
+        }
+        if (activeTab == AppTab.LIVE) {
+            if (visible) startPreview(target) else previewOnReturn = true
+        } else {
+            setStatus(if (target.viaLan) "공유기 연결됨" else "AP 연결됨")
+            updateControls()
+            if (activeTab == AppTab.LIBRARY) refreshSdFiles()
+        }
+    }
+
+    private fun requestBoardApNetwork(reconnecting: Boolean = false) {
+        if (waitingForNetwork || boardTarget != null) return
         val listener = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(available: Network) = runOnUiThread {
                 if (callback !== this || isDestroyed) return@runOnUiThread
                 waitingForNetwork = false
-                network = available
-                nextTelemetryAt = 0L
-                nextSdPollAt = 0L
-                renderTelemetry()
-                syncBoardClock(available)
-                refreshSdStatus(available, SystemClock.elapsedRealtime() + 2500L)
-                if (settingsOpen) {
-                    settingsScreen?.let { page ->
-                        page.setConnected(true)
-                        loadBoardOptionsForSettings(available, page)
-                    }
-                }
-                if (activeTab == AppTab.LIVE) {
-                    if (visible) startPreview(available) else previewOnReturn = true
-                } else {
-                    setStatus("연결됨")
-                    updateControls()
-                    if (activeTab == AppTab.LIBRARY) refreshSdFiles()
-                }
+                onBoardConnected(BoardTarget(available, "192.168.4.1", viaLan = false))
             }
 
             override fun onUnavailable() = runOnUiThread {
@@ -595,7 +757,7 @@ class MainActivity : Activity() {
             }
 
             override fun onLost(lost: Network) = runOnUiThread {
-                if (callback !== this || network != lost) return@runOnUiThread
+                if (callback !== this || boardTarget?.network != lost) return@runOnUiThread
                 val beforeLimit = preview?.let {
                     it.endsAt == 0L || SystemClock.elapsedRealtime() + 2000 < it.endsAt
                 } == true
@@ -603,7 +765,7 @@ class MainActivity : Activity() {
                 releaseNetwork()
                 if (retry) {
                     reconnectAttempted = true
-                    requestBoardNetwork(reconnecting = true)
+                    requestBoardApNetwork(reconnecting = true)
                 } else {
                     setStatus("연결 끊김")
                 }
@@ -611,7 +773,7 @@ class MainActivity : Activity() {
         }
         try {
             val wifi = WifiNetworkSpecifier.Builder()
-                .setSsid("WorkbenchCam")
+                .setSsid("DockyCam")
                 .setWpa2Passphrase(password)
                 .build()
             val request = NetworkRequest.Builder()
@@ -621,7 +783,7 @@ class MainActivity : Activity() {
                 .build()
             callback = listener
             waitingForNetwork = true
-            setStatus(if (reconnecting) "재연결 중" else "연결 요청 중")
+            setStatus(if (reconnecting) "재연결 중" else "AP 연결 요청")
             updateControls()
             connectivity.requestNetwork(request, listener, 30_000)
         } catch (_: SecurityException) {
@@ -633,20 +795,20 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun syncBoardClock(connected: Network) {
+    private fun syncBoardClock(connected: BoardTarget) {
         Thread({
             runCatching { BoardApi(connected).syncTime(System.currentTimeMillis() / 1000L) }
         }, "board-time-sync").start()
     }
 
-    private fun refreshSdStatus(connected: Network, nextAt: Long) {
+    private fun refreshSdStatus(connected: BoardTarget, nextAt: Long) {
         sdStatusPending = true
         nextSdPollAt = nextAt
         Thread({
             val result = runCatching { BoardApi(connected).getSdStatus() }.getOrNull()
             runOnUiThread {
                 sdStatusPending = false
-                if (isDestroyed || network != connected) return@runOnUiThread
+                if (isDestroyed || boardTarget != connected) return@runOnUiThread
                 if (result != null) {
                     sdStatus = result
                     screen.showSdStatus(result)
@@ -655,7 +817,8 @@ class MainActivity : Activity() {
                         val label = when {
                             result.mode == SdRecordMode.BLACKBOX && result.active -> "블랙박스 녹화"
                             result.mode == SdRecordMode.TIMELAPSE && result.active -> "타임랩스 촬영"
-                            else -> "연결됨"
+                            connected.viaLan -> "공유기 연결됨"
+                            else -> "AP 연결됨"
                         }
                         setStatus(label)
                     }
@@ -665,16 +828,14 @@ class MainActivity : Activity() {
     }
 
     private fun startBlackboxRecording(segmentS: Int, autoStart: Boolean) {
-        val connected = network ?: return
-        // If live preview is currently running, stop preview so autonomous blackbox starts immediately.
-        val wasStreaming = preview != null
-        if (wasStreaming) stopPreview()
+        val connected = boardTarget ?: return
+        if (preview != null) stopPreview()
         Thread({
             val updated = runCatching {
                 BoardApi(connected).setSdRecord(SdRecordMode.BLACKBOX, segmentSeconds = segmentS, autoStart = autoStart)
             }.getOrNull()
             runOnUiThread {
-                if (isDestroyed || network != connected) return@runOnUiThread
+                if (isDestroyed || boardTarget != connected) return@runOnUiThread
                 if (updated != null) {
                     sdStatus = updated
                     screen.showSdStatus(updated)
@@ -692,14 +853,14 @@ class MainActivity : Activity() {
     }
 
     private fun startTimelapseRecording(intervalS: Int) {
-        val connected = network ?: return
+        val connected = boardTarget ?: return
         if (preview != null) stopPreview()
         Thread({
             val updated = runCatching {
                 BoardApi(connected).setSdRecord(SdRecordMode.TIMELAPSE, intervalSeconds = intervalS)
             }.getOrNull()
             runOnUiThread {
-                if (isDestroyed || network != connected) return@runOnUiThread
+                if (isDestroyed || boardTarget != connected) return@runOnUiThread
                 if (updated != null) {
                     sdStatus = updated
                     screen.showSdStatus(updated)
@@ -713,11 +874,11 @@ class MainActivity : Activity() {
     }
 
     private fun stopSdRecording() {
-        val connected = network ?: return
+        val connected = boardTarget ?: return
         Thread({
             val updated = runCatching { BoardApi(connected).setSdRecord(SdRecordMode.OFF) }.getOrNull()
             runOnUiThread {
-                if (isDestroyed || network != connected) return@runOnUiThread
+                if (isDestroyed || boardTarget != connected) return@runOnUiThread
                 if (updated != null) {
                     sdStatus = updated
                     screen.showSdStatus(updated)
@@ -731,14 +892,14 @@ class MainActivity : Activity() {
     }
 
     private fun updateBlackboxAutoStart(enabled: Boolean) {
-        val connected = network ?: return
+        val connected = boardTarget ?: return
         val currentMode = sdStatus?.mode ?: SdRecordMode.OFF
         Thread({
             val updated = runCatching {
                 BoardApi(connected).setSdRecord(currentMode, autoStart = enabled)
             }.getOrNull()
             runOnUiThread {
-                if (isDestroyed || network != connected) return@runOnUiThread
+                if (isDestroyed || boardTarget != connected) return@runOnUiThread
                 if (updated != null) {
                     sdStatus = updated
                     screen.showSdStatus(updated)
@@ -753,7 +914,7 @@ class MainActivity : Activity() {
     }
 
     private fun triggerBoardSnapshot() {
-        val connected = network ?: return
+        val connected = boardTarget ?: return
         Thread({
             val ok = runCatching { BoardApi(connected).triggerSdSnapshot() }.isSuccess
             runOnUiThread {
@@ -769,25 +930,25 @@ class MainActivity : Activity() {
     }
 
     private fun refreshSdFiles() {
-        val connected = network ?: return
+        val connected = boardTarget ?: return
         val cat = selectedLibraryCategory
         screen.showSdFiles(null, loading = true)
         Thread({
             val list = runCatching { BoardApi(connected).listSdFiles(cat) }.getOrNull()
             runOnUiThread {
-                if (isDestroyed || network != connected) return@runOnUiThread
+                if (isDestroyed || boardTarget != connected) return@runOnUiThread
                 screen.showSdFiles(list, loading = false)
             }
         }, "sd-files-list").start()
     }
 
     private fun playSdFile(item: SdFileItem) {
-        val connected = network ?: return
+        val connected = boardTarget ?: return
         SdPlayerDialog(this, connected, item, ::downloadSdFile).show()
     }
 
     private fun downloadSdFile(item: SdFileItem) {
-        val connected = network ?: return
+        val connected = boardTarget ?: return
         Toast.makeText(this, "${item.name} 내려받는 중...", Toast.LENGTH_SHORT).show()
         Thread({
             val isImage = item.name.endsWith(".jpg", ignoreCase = true)
@@ -799,14 +960,14 @@ class MainActivity : Activity() {
                         MediaStore.Images.Media.EXTERNAL_CONTENT_URI to ContentValues().apply {
                             put(MediaStore.Images.Media.DISPLAY_NAME, item.name)
                             put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-                            put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/WorkbenchCam")
+                            put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/DockyCam")
                             put(MediaStore.Images.Media.IS_PENDING, 1)
                         }
                     } else {
                         MediaStore.Downloads.EXTERNAL_CONTENT_URI to ContentValues().apply {
                             put(MediaStore.Downloads.DISPLAY_NAME, item.name)
                             put(MediaStore.Downloads.MIME_TYPE, "video/x-msvideo")
-                            put(MediaStore.Downloads.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/WorkbenchCam")
+                            put(MediaStore.Downloads.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/DockyCam")
                             put(MediaStore.Downloads.IS_PENDING, 1)
                         }
                     }
@@ -830,7 +991,7 @@ class MainActivity : Activity() {
             }
             runOnUiThread {
                 if (!isDestroyed) {
-                    val dest = if (isImage) "Pictures/WorkbenchCam" else "Downloads/WorkbenchCam"
+                    val dest = if (isImage) "Pictures/DockyCam" else "Downloads/DockyCam"
                     Toast.makeText(
                         this,
                         if (saved) "저장 완료 ($dest)" else "파일을 내려받지 못했습니다",
@@ -842,7 +1003,7 @@ class MainActivity : Activity() {
     }
 
     private fun confirmDeleteSdFile(item: SdFileItem) {
-        val connected = network ?: return
+        val connected = boardTarget ?: return
         AlertDialog.Builder(this)
             .setTitle("파일 삭제")
             .setMessage("${UiStyle.formatSdTitle(item.name)}\n(${item.name}) 파일을 SD카드에서 삭제할까요?")
@@ -864,7 +1025,7 @@ class MainActivity : Activity() {
     }
 
     private fun confirmClearSdCategory(category: String) {
-        val connected = network ?: return
+        val connected = boardTarget ?: return
         val label = UiStyle.categoryMeta(category).first
         AlertDialog.Builder(this)
             .setTitle("$label 전체 삭제")
@@ -888,7 +1049,7 @@ class MainActivity : Activity() {
             .show()
     }
 
-    private fun startPreview(available: Network) {
+    private fun startPreview(available: BoardTarget) {
         handler.removeCallbacks(retryPreview)
         handler.removeCallbacks(renderFrame)
         framePending.set(false)
@@ -912,7 +1073,7 @@ class MainActivity : Activity() {
                     handler.removeCallbacks(renderFrame)
                     framePending.set(false)
                     val retryable = result.reason in setOf("transport", "disconnected", "stream_ended", "camera")
-                    if (visible && network == available && !stoppingPreview && retryable && streamRetries < 3) {
+                    if (visible && boardTarget == available && !stoppingPreview && retryable && streamRetries < 3) {
                         streamRetries += 1
                         setStatus("재연결 중 ($streamRetries/3)")
                         updateControls()
@@ -933,7 +1094,7 @@ class MainActivity : Activity() {
         )
     }
 
-    private fun restartPreviewForSettings(connected: Network) {
+    private fun restartPreviewForSettings(connected: BoardTarget) {
         handler.removeCallbacks(retryPreview)
         handler.removeCallbacks(renderFrame)
         framePending.set(false)
@@ -950,9 +1111,9 @@ class MainActivity : Activity() {
         session.stop(requestStop = true) {
             runOnUiThread {
                 stoppingPreview = false
-                if (!isDestroyed && visible && network == connected && preview == null) {
+                if (!isDestroyed && visible && boardTarget == connected && preview == null) {
                     handler.postDelayed({
-                        if (!isDestroyed && visible && network == connected && preview == null && !stoppingPreview) {
+                        if (!isDestroyed && visible && boardTarget == connected && preview == null && !stoppingPreview) {
                             startPreview(connected)
                         }
                     }, 350)
@@ -977,7 +1138,7 @@ class MainActivity : Activity() {
                 stoppingPreview = false
                 if (!isDestroyed) {
                     updateControls()
-                    network?.let { refreshSdStatus(it, SystemClock.elapsedRealtime() + 2000L) }
+                    boardTarget?.let { refreshSdStatus(it, SystemClock.elapsedRealtime() + 2000L) }
                 }
             }
         }
@@ -1006,8 +1167,9 @@ class MainActivity : Activity() {
             } catch (_: IllegalArgumentException) {
             }
         }
-        network = null
+        boardTarget = null
         sdStatus = null
+        wifiStatus = null
         cachedBoardOptions = null
         telemetryText = null
         nextTelemetryAt = 0L
@@ -1022,14 +1184,14 @@ class MainActivity : Activity() {
         updateControls()
     }
 
-    private fun refreshTelemetry(connected: Network, now: Long) {
+    private fun refreshTelemetry(connected: BoardTarget, now: Long) {
         telemetryPending = true
         nextTelemetryAt = now + 5000
         Thread({
             val sample = runCatching { BoardApi(connected).getTelemetry() }.getOrNull()
             runOnUiThread {
                 telemetryPending = false
-                if (isDestroyed || !telemetryEnabled || network != connected) return@runOnUiThread
+                if (isDestroyed || !telemetryEnabled || boardTarget != connected) return@runOnUiThread
                 telemetryText = if (sample == null) {
                     "보드 상태를 읽을 수 없습니다"
                 } else {
@@ -1045,7 +1207,7 @@ class MainActivity : Activity() {
     private fun renderTelemetry() {
         screen.showTelemetry(
             if (!telemetryEnabled) null
-            else telemetryText ?: if (network == null) "보드 연결 시 온도와 전력을 표시합니다" else "보드 상태 읽는 중..."
+            else telemetryText ?: if (boardTarget == null) "보드 연결 시 온도와 전력을 표시합니다" else "보드 상태 읽는 중..."
         )
     }
 
@@ -1054,16 +1216,16 @@ class MainActivity : Activity() {
         Thread({
             val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
             val values = ContentValues().apply {
-                put(MediaStore.Images.Media.DISPLAY_NAME, "WorkbenchCam_$stamp.jpg")
+                put(MediaStore.Images.Media.DISPLAY_NAME, "DockyCam_$stamp.jpg")
                 put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-                put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/WorkbenchCam")
+                put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/DockyCam")
                 put(MediaStore.Images.Media.IS_PENDING, 1)
             }
             val saved = try {
                 val uri = checkNotNull(contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values))
                 try {
                     checkNotNull(contentResolver.openOutputStream(uri)).use { it.write(jpeg) }
-                    val ready = ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }
+                    val ready = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
                     check(contentResolver.update(uri, ready, null, null) == 1)
                 } catch (failure: Exception) {
                     contentResolver.delete(uri, null, null)
@@ -1076,7 +1238,7 @@ class MainActivity : Activity() {
             runOnUiThread {
                 if (!isDestroyed) Toast.makeText(
                     this,
-                    if (saved) "갤러리(Pictures/WorkbenchCam)에 저장했습니다" else "사진을 저장하지 못했습니다",
+                    if (saved) "갤러리(Pictures/DockyCam)에 저장했습니다" else "사진을 저장하지 못했습니다",
                     Toast.LENGTH_SHORT
                 ).show()
             }
@@ -1088,7 +1250,7 @@ class MainActivity : Activity() {
         preview != null -> UiStyle.ACCENT
         sdStatus?.mode == SdRecordMode.BLACKBOX && sdStatus?.active == true -> UiStyle.DANGER
         sdStatus?.mode == SdRecordMode.TIMELAPSE && sdStatus?.active == true -> UiStyle.AMBER
-        network != null -> UiStyle.ACCENT
+        boardTarget != null -> UiStyle.ACCENT
         waitingForNetwork -> UiStyle.AMBER
         else -> UiStyle.MUTED
     }
@@ -1107,7 +1269,7 @@ class MainActivity : Activity() {
             }
         }
         screen.showControls(
-            network != null,
+            boardTarget != null,
             !waitingForNetwork && !stoppingPreview && preview == null && cooldownEndsAt == 0L,
             preview != null,
             displayed != null,

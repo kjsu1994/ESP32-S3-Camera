@@ -255,7 +255,11 @@ internal class CameraScreen(
         mainShell = shell
 
         // --- Top App Bar ---
-        val brandTitle = UiStyle.label(context, "WorkbenchCam", 20f, UiStyle.INK, bold = true)
+        val brandIcon = ImageView(context).apply {
+            setImageResource(R.drawable.ic_workbenchcam)
+            scaleType = ImageView.ScaleType.FIT_CENTER
+        }
+        val brandTitle = UiStyle.label(context, "DockyCam", 20f, UiStyle.INK, bold = true)
         val settingsIcon = UiStyle.iconCircleButton(
             context, R.drawable.ic_settings, "설정", UiStyle.SURFACE, UiStyle.INK, 40, openSettings
         )
@@ -263,6 +267,9 @@ internal class CameraScreen(
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(UiStyle.dp(context, 16), UiStyle.dp(context, 10), UiStyle.dp(context, 16), UiStyle.dp(context, 10))
+            addView(brandIcon, LinearLayout.LayoutParams(UiStyle.dp(context, 28), UiStyle.dp(context, 28)).apply {
+                marginEnd = UiStyle.dp(context, 9)
+            })
             addView(brandTitle, LinearLayout.LayoutParams(0, -2, 1f))
             addView(statusPill, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = UiStyle.dp(context, 10) })
             addView(settingsIcon)

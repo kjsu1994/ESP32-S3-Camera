@@ -2,14 +2,13 @@ package io.github.kjsu1994.workbenchcam
 
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.net.Network
 import android.os.SystemClock
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.util.concurrent.atomic.AtomicReference
 
-internal class Preview(network: Network) {
-    private val board = BoardApi(network)
+internal class Preview(target: BoardTarget) {
+    private val board = BoardApi(target)
     data class Frame(val jpeg: ByteArray, val bitmap: Bitmap)
     data class Result(val reason: String, val cooldownSeconds: Int)
 

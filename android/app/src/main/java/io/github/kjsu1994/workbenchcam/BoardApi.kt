@@ -25,12 +25,47 @@ internal enum class SdRecordMode(val key: String, val label: String) {
     }
 }
 
+internal enum class ConnectPreference(val key: String, val label: String) {
+    AUTO("auto", "자동 (공유기 우선)"),
+    LAN_ONLY("lan", "집 공유기"),
+    AP_ONLY("ap", "직결 AP");
+
+    companion object {
+        fun fromKey(key: String?): ConnectPreference = entries.firstOrNull { it.key == key } ?: AUTO
+    }
+}
+
+internal data class BoardTarget(
+    val network: Network?,
+    val host: String,
+    val viaLan: Boolean
+)
+
 internal data class BoardTelemetry(val chipTempC: Double?, val powerMw: Int?)
 
 internal data class BoardOptions(
     val lowBandwidth: Boolean,
     val rotate180: Boolean,
     val resolution: VideoResolution
+)
+
+internal data class WifiStatus(
+    val mode: String,
+    val ssid: String,
+    val ip: String,
+    val host: String,
+    val rssi: Int,
+    val channel: Int,
+    val staEnabled: Boolean,
+    val staSsid: String,
+    val ledEnabled: Boolean
+)
+
+internal data class ScannedWifi(
+    val ssid: String,
+    val rssi: Int,
+    val channel: Int,
+    val open: Boolean
 )
 
 internal data class SdStatus(
@@ -56,10 +91,24 @@ internal data class SdFileItem(
     val sizeBytes: Long
 )
 
-internal class BoardApi(private val network: Network) {
-    fun open(path: String, readTimeoutMs: Int = 6000): HttpURLConnection {
-        val connection = network.openConnection(URL("http://192.168.4.1" + path)) as HttpURLConnection
-        connection.connectTimeout = 3000
+internal fun isAllowedLocalHost(host: String): Boolean {
+    val clean = host.trim().lowercase()
+    if (clean == "dockycam.local" || clean == "workbenchcam.local") return true
+    val parts = clean.split('.')
+    if (parts.size != 4) return false
+    val octets = parts.map { it.toIntOrNull() ?: return false }
+    if (octets.any { it !in 0..255 }) return false
+    return octets[0] == 10 ||
+        (octets[0] == 192 && octets[1] == 168) ||
+        (octets[0] == 172 && octets[1] in 16..31)
+}
+
+internal class BoardApi(private val target: BoardTarget) {
+    fun open(path: String, readTimeoutMs: Int = 6000, connectTimeoutMs: Int = 3000): HttpURLConnection {
+        if (!isAllowedLocalHost(target.host)) throw IOException("Disallowed non-local host: ${target.host}")
+        val url = URL("http://${target.host}$path")
+        val connection = (target.network?.openConnection(url) ?: url.openConnection()) as HttpURLConnection
+        connection.connectTimeout = connectTimeoutMs
         connection.readTimeout = readTimeoutMs
         connection.instanceFollowRedirects = false
         connection.useCaches = false
@@ -106,6 +155,84 @@ internal class BoardApi(private val network: Network) {
             val body = JSONObject().put("epoch", epochSeconds).toString().toByteArray()
             connection.post(body)
             if (connection.responseCode !in 200..204) throw IOException("Time sync failed")
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    fun getWifiStatus(timeoutMs: Int = 2500): WifiStatus {
+        val connection = open("/wifi/status", timeoutMs, timeoutMs.coerceAtMost(2000))
+        try {
+            if (connection.responseCode != 200) throw IOException("Wi-Fi status unavailable")
+            val json = connection.readBoardJson(1024)
+            return WifiStatus(
+                mode = json.optString("mode", "ap"),
+                ssid = json.optString("ssid", "DockyCam"),
+                ip = json.optString("ip", target.host),
+                host = json.optString("host", "dockycam.local"),
+                rssi = json.optInt("rssi", 0),
+                channel = json.optInt("channel", 6),
+                staEnabled = json.optBoolean("sta_enabled", false),
+                staSsid = json.optString("sta_ssid", ""),
+                ledEnabled = json.optBoolean("led_enabled", true)
+            )
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    fun scanWifi(): List<ScannedWifi> {
+        val connection = open("/wifi/scan", 10000)
+        try {
+            if (connection.responseCode != 200) throw IOException("Wi-Fi scan unavailable")
+            val json = connection.readBoardJson(16384)
+            val arr = json.optJSONArray("networks") ?: return emptyList()
+            return List(arr.length()) { idx ->
+                val obj = arr.getJSONObject(idx)
+                ScannedWifi(
+                    ssid = obj.optString("ssid"),
+                    rssi = obj.optInt("rssi", -99),
+                    channel = obj.optInt("ch", 0),
+                    open = obj.optBoolean("open", false)
+                )
+            }
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    fun setWifiConfig(staEnabled: Boolean, staSsid: String?, staPass: String?, reboot: Boolean = true): Boolean {
+        val connection = open("/wifi/config", 4000)
+        try {
+            val json = JSONObject()
+                .put("sta_enabled", staEnabled)
+                .put("reboot", reboot)
+            if (staSsid != null) json.put("sta_ssid", staSsid)
+            if (staPass != null) json.put("sta_pass", staPass)
+            connection.post(json.toString().toByteArray())
+            return connection.responseCode == 200
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    fun setLedEnabled(enabled: Boolean): Boolean {
+        val connection = open("/led", 2500)
+        try {
+            val json = JSONObject().put("enabled", enabled)
+            connection.post(json.toString().toByteArray())
+            if (connection.responseCode != 200) throw IOException("LED update failed")
+            return connection.readBoardJson(256).optBoolean("led_enabled", enabled)
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    fun reboot() {
+        val connection = open("/reboot", 2000)
+        try {
+            connection.post(byteArrayOf())
+            if (connection.responseCode !in 200..204) throw IOException("Reboot failed")
         } finally {
             connection.disconnect()
         }

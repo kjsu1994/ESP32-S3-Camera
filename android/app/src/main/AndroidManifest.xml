@@ -10,7 +10,7 @@
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" android:usesPermissionFlags="neverForLocation" />
 
-    <application android:label="WorkbenchCam"
+    <application android:label="DockyCam"
         android:allowBackup="false"
         android:icon="@drawable/ic_workbenchcam"
         android:networkSecurityConfig="@xml/network_security_config"

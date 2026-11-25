@@ -3,12 +3,10 @@ package io.github.kjsu1994.workbenchcam
 import android.app.Activity
 import android.app.Dialog
 import android.graphics.BitmapFactory
-import android.net.Network
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.view.Gravity
-import android.view.View
 import android.view.Window
 import android.view.WindowManager
 import android.widget.FrameLayout
@@ -18,7 +16,7 @@ import java.net.HttpURLConnection
 
 internal class SdPlayerDialog(
     private val activity: Activity,
-    private val network: Network,
+    private val target: BoardTarget,
     private val item: SdFileItem,
     private val onDownload: (SdFileItem) -> Unit
 ) {
@@ -151,7 +149,7 @@ internal class SdPlayerDialog(
 
     private fun loadSnapshot(videoView: ZoomableVideoView, statusText: TextView) {
         Thread({
-            val api = BoardApi(network)
+            val api = BoardApi(target)
             val bitmap = runCatching {
                 val conn = api.openSdFile(item.category, item.name, 10000)
                 activeConnection = conn
@@ -178,7 +176,7 @@ internal class SdPlayerDialog(
 
     private fun startVideoPlayback(videoView: ZoomableVideoView, statusText: TextView) {
         Thread({
-            val api = BoardApi(network)
+            val api = BoardApi(target)
             var frameCount = 0
             try {
                 val conn = api.openSdFile(item.category, item.name, 10000)

@@ -14,5 +14,6 @@ constexpr int sdClk = 39;
 constexpr int sdCmd = 38;
 constexpr int sdD0 = 40;
 constexpr int bootButton = 0;
+constexpr int statusRgbLed = 48;
 constexpr int ov5640Pid = 0x5640;
 }

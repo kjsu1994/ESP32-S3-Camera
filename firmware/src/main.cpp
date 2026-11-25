@@ -1,7 +1,9 @@
 #include <Arduino.h>
+#include <ESPmDNS.h>
 #include <Preferences.h>
 #include <SD_MMC.h>
 #include <initializer_list>
+#include <map>
 #include "cJSON.h"
 #include <WiFi.h>
 #include <Wire.h>
@@ -15,6 +17,7 @@
 #include "lwip/tcp.h"
 #include "board_pins.h"
 #include "sd_recorder.h"
+#include "web_ui.h"
 
 #if __has_include("config.local.h")
 #include "config.local.h"
@@ -33,7 +36,7 @@
 #endif
 
 namespace {
-constexpr char apName[] = "WorkbenchCam";
+constexpr char apName[] = "DockyCam";
 constexpr uint8_t lowBandwidth = 1 << 0;
 constexpr uint8_t rotate180 = 1 << 1;
 // Retain the v0.1.0 settings round-trip for installed clients.
@@ -68,9 +71,25 @@ Reason reason = Reason::None;
 bool stopRequested = false;
 uint8_t boardOptions = 0;
 Preferences preferences;
+Preferences netPrefs;
 bool preferencesReady = false;
+bool netPrefsReady = false;
 bool powerBusReady = false;
+bool staModeActive = false;
+bool staEnabled = false;
+String staSsid;
+String staPass;
+int activeWifiChannel = 6;
+volatile bool ledEnabled = true;
+volatile uint32_t rebootAtMs = 0;
 sdrec::Manager sdManager;
+
+void setLedRgb(uint8_t r, uint8_t g, uint8_t b) {
+    static int lastR = -1, lastG = -1, lastB = -1;
+    if (r == lastR && g == lastG && b == lastB) return;
+    lastR = r; lastG = g; lastB = b;
+    neopixelWrite(board::statusRgbLed, r, g, b);
+}
 
 #if CONFIG_SCCB_HARDWARE_I2C_PORT1
 TwoWire& powerBus = Wire;
@@ -398,7 +417,8 @@ esp_err_t stream(httpd_req_t* request) {
         const uint32_t sendStarted = micros();
         sent = writeStream(request, packet, end + 2);
         const uint32_t sendElapsed = micros() - sendStarted;
-        if (!sent || WiFi.softAPgetStationNum() == 0) {
+        const bool linkLost = staModeActive ? (WiFi.status() != WL_CONNECTED) : (WiFi.softAPgetStationNum() == 0);
+        if (!sent || linkLost) {
             ending = Reason::Disconnected;
             break;
         }
@@ -439,7 +459,7 @@ httpd_handle_t startServer(uint16_t port, uint16_t controlPort, std::initializer
     config.recv_wait_timeout = 2;
     config.stack_size = 8192;
     config.core_id = 1;
-    config.max_uri_handlers = 16;
+    config.max_uri_handlers = 24;
     config.lru_purge_enable = true;
     config.max_open_sockets = 6;
     httpd_handle_t server = nullptr;
@@ -656,7 +676,7 @@ esp_err_t sendSdFile(httpd_req_t* request) {
         !sdrec::Manager::isValidCategory(cat) || !sdrec::Manager::isValidName(name)) {
         return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid file parameter");
     }
-    std::string path = std::string("/workbenchcam/") + cat + "/" + name;
+    std::string path = std::string("/dockycam/") + cat + "/" + name;
     if (!sdManager.lockSd(3000)) {
         return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "SD busy");
     }
@@ -739,6 +759,179 @@ esp_err_t deleteSdFile(httpd_req_t* request) {
     return httpd_resp_send(request, nullptr, 0);
 }
 
+esp_err_t sendWebUi(httpd_req_t* request) {
+    httpd_resp_set_type(request, "text/html; charset=utf-8");
+    httpd_resp_set_hdr(request, "Cache-Control", "no-store");
+    return httpd_resp_send(request, webui::kIndexHtml, HTTPD_RESP_USE_STRLEN);
+}
+
+esp_err_t sendWifiStatus(httpd_req_t* request) {
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "mode", staModeActive ? "sta" : "ap");
+    cJSON_AddStringToObject(root, "ssid", staModeActive ? staSsid.c_str() : apName);
+    const String ipStr = staModeActive ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
+    cJSON_AddStringToObject(root, "ip", ipStr.c_str());
+    cJSON_AddStringToObject(root, "host", "dockycam.local");
+    cJSON_AddNumberToObject(root, "rssi", staModeActive ? WiFi.RSSI() : 0);
+    cJSON_AddNumberToObject(root, "channel", staModeActive ? WiFi.channel() : activeWifiChannel);
+    cJSON_AddBoolToObject(root, "sta_enabled", staEnabled);
+    cJSON_AddStringToObject(root, "sta_ssid", staSsid.c_str());
+    cJSON_AddBoolToObject(root, "led_enabled", ledEnabled);
+    char* json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!json) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_set_hdr(request, "Cache-Control", "no-store");
+    const esp_err_t res = httpd_resp_sendstr(request, json);
+    cJSON_free(json);
+    return res;
+}
+
+esp_err_t scanWifiNetworks(httpd_req_t* request) {
+    const wifi_mode_t prevMode = WiFi.getMode();
+    if (prevMode == WIFI_AP) {
+        WiFi.mode(WIFI_AP_STA);
+    }
+    const int found = WiFi.scanNetworks(false, false);
+    struct ApInfo {
+        String ssid;
+        int32_t rssi;
+        int32_t channel;
+        bool isOpen;
+    };
+    std::map<String, ApInfo> bestBySsid;
+    for (int i = 0; i < found; ++i) {
+        String ssid = WiFi.SSID(i);
+        if (ssid.isEmpty() || ssid == apName) continue;
+        const int32_t rssi = WiFi.RSSI(i);
+        const int32_t ch = WiFi.channel(i);
+        const bool isOpen = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
+        auto it = bestBySsid.find(ssid);
+        if (it == bestBySsid.end() || rssi > it->second.rssi) {
+            bestBySsid[ssid] = {ssid, rssi, ch, isOpen};
+        }
+    }
+    WiFi.scanDelete();
+    std::vector<ApInfo> sorted;
+    sorted.reserve(bestBySsid.size());
+    for (const auto& kv : bestBySsid) sorted.push_back(kv.second);
+    std::sort(sorted.begin(), sorted.end(), [](const ApInfo& a, const ApInfo& b) {
+        return a.rssi > b.rssi;
+    });
+    if (sorted.size() > 16) sorted.resize(16);
+
+    cJSON* root = cJSON_CreateObject();
+    cJSON* arr = cJSON_AddArrayToObject(root, "networks");
+    for (const auto& ap : sorted) {
+        cJSON* item = cJSON_CreateObject();
+        cJSON_AddStringToObject(item, "ssid", ap.ssid.c_str());
+        cJSON_AddNumberToObject(item, "rssi", ap.rssi);
+        cJSON_AddNumberToObject(item, "ch", ap.channel);
+        cJSON_AddBoolToObject(item, "open", ap.isOpen);
+        cJSON_AddItemToArray(arr, item);
+    }
+    char* json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!json) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_set_hdr(request, "Cache-Control", "no-store");
+    const esp_err_t res = httpd_resp_sendstr(request, json);
+    cJSON_free(json);
+    return res;
+}
+
+esp_err_t updateWifiConfig(httpd_req_t* request) {
+    char body[256];
+    if (!readJsonBody(request, body, sizeof(body))) {
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid wifi config");
+    }
+    cJSON* root = cJSON_ParseWithOpts(body, nullptr, true);
+    const cJSON* enItem = cJSON_GetObjectItemCaseSensitive(root, "sta_enabled");
+    const cJSON* ssidItem = cJSON_GetObjectItemCaseSensitive(root, "sta_ssid");
+    const cJSON* passItem = cJSON_GetObjectItemCaseSensitive(root, "sta_pass");
+    const cJSON* rebootItem = cJSON_GetObjectItemCaseSensitive(root, "reboot");
+
+    const bool valid = cJSON_IsObject(root) && cJSON_IsBool(enItem);
+    const bool nextEnabled = valid && cJSON_IsTrue(enItem);
+    String nextSsid = (cJSON_IsString(ssidItem) && ssidItem->valuestring) ? String(ssidItem->valuestring) : staSsid;
+    const bool hasPass = cJSON_IsString(passItem) && passItem->valuestring;
+    String nextPass = hasPass ? String(passItem->valuestring) : staPass;
+    const bool doReboot = !rebootItem || cJSON_IsTrue(rebootItem);
+    cJSON_Delete(root);
+
+    if (!valid || (nextEnabled && (nextSsid.isEmpty() || nextSsid.length() > 32 || nextPass.length() > 63))) {
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid SSID or password");
+    }
+    staEnabled = nextEnabled;
+    if (nextEnabled || !nextSsid.isEmpty()) staSsid = nextSsid;
+    if (hasPass) staPass = nextPass;
+    if (netPrefsReady) {
+        netPrefs.putBool("sta_en", staEnabled);
+        netPrefs.putString("sta_ssid", staSsid);
+        netPrefs.putString("sta_pass", staPass);
+    }
+    if (doReboot) rebootAtMs = millis() + 450;
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_set_hdr(request, "Cache-Control", "no-store");
+    return httpd_resp_sendstr(request, doReboot ? "{\"saved\":true,\"rebooting\":true}" : "{\"saved\":true,\"rebooting\":false}");
+}
+
+esp_err_t updateLedMode(httpd_req_t* request) {
+    char body[64];
+    if (!readJsonBody(request, body, sizeof(body))) {
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid LED request");
+    }
+    cJSON* root = cJSON_ParseWithOpts(body, nullptr, true);
+    const cJSON* enItem = cJSON_GetObjectItemCaseSensitive(root, "enabled");
+    const bool valid = cJSON_IsObject(root) && cJSON_IsBool(enItem);
+    const bool next = valid && cJSON_IsTrue(enItem);
+    cJSON_Delete(root);
+    if (!valid) return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Missing enabled");
+    ledEnabled = next;
+    if (netPrefsReady) netPrefs.putBool("led_en", next);
+    if (!next) setLedRgb(0, 0, 0);
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_set_hdr(request, "Cache-Control", "no-store");
+    return httpd_resp_sendstr(request, next ? "{\"led_enabled\":true}" : "{\"led_enabled\":false}");
+}
+
+esp_err_t triggerReboot(httpd_req_t* request) {
+    if (!isJsonRequest(request) || request->content_len != 0) {
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Expected empty application/json");
+    }
+    rebootAtMs = millis() + 350;
+    httpd_resp_set_status(request, "204 No Content");
+    return httpd_resp_send(request, nullptr, 0);
+}
+
+void updateStatusLed() {
+    if (!ledEnabled) {
+        setLedRgb(0, 0, 0);
+        return;
+    }
+    const bool blinkOn = ((millis() / 700) % 2) == 0;
+    const Status st = getStatus();
+    if (st.state == State::Streaming) {
+        setLedRgb(0, 8, 18); // Soft blue: live streaming
+        return;
+    }
+    const sdrec::SdStatus sd = sdManager.getStatus();
+    if (sd.lastError[0] != '\0') {
+        const bool fastBlink = ((millis() / 250) % 2) == 0;
+        setLedRgb(fastBlink ? 20 : 0, fastBlink ? 4 : 0, 0);
+        return;
+    }
+    if (sd.active && sd.mode == sdrec::RecordMode::Blackbox) {
+        setLedRgb(blinkOn ? 18 : 3, 0, 0); // Soft pulsing red: blackbox recording
+        return;
+    }
+    if (sd.active && sd.mode == sdrec::RecordMode::Timelapse) {
+        setLedRgb(blinkOn ? 16 : 3, blinkOn ? 10 : 2, 0); // Soft pulsing amber: timelapse
+        return;
+    }
+    setLedRgb(0, 10, 4); // Gentle emerald: idle & ready
+}
+
 int selectQuietChannel() {
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
@@ -777,6 +970,14 @@ void setup() {
     pinMode(board::bootButton, INPUT_PULLUP);
     preferencesReady = preferences.begin("workbenchcam", false);
     if (preferencesReady) boardOptions = preferences.getUChar("options", 0);
+    netPrefsReady = netPrefs.begin("wcam_net", false);
+    if (netPrefsReady) {
+        staEnabled = netPrefs.getBool("sta_en", false);
+        staSsid = netPrefs.getString("sta_ssid", "");
+        staPass = netPrefs.getString("sta_pass", "");
+        ledEnabled = netPrefs.getBool("led_en", true);
+    }
+    if (!ledEnabled) setLedRgb(0, 0, 0);
     sdManager.begin(startCamera, stopCamera, getOptions);
     startPowerMonitor();
     constexpr size_t passwordLength = sizeof(CAMERA_AP_PASSWORD) - 1;
@@ -784,26 +985,72 @@ void setup() {
         Serial.println("[Wi-Fi] Set a unique 8–63 character password in config.local.h");
         return;
     }
-    const IPAddress address(192, 168, 4, 1);
-    WiFi.onEvent([](WiFiEvent_t) { Serial.println("[Wi-Fi] Station disconnected"); },
-                 ARDUINO_EVENT_WIFI_AP_STADISCONNECTED);
-    const int channel = selectQuietChannel();
-    WiFi.mode(WIFI_AP);
-    WiFi.setSleep(false);
-    if (!WiFi.softAPConfig(address, address, IPAddress(255, 255, 255, 0)) ||
-        !WiFi.softAP(apName, CAMERA_AP_PASSWORD, channel, false, 2)) {
-        Serial.println("[Wi-Fi] SoftAP failed");
-        return;
+
+    staModeActive = false;
+    if (staEnabled && !staSsid.isEmpty()) {
+        Serial.printf("[Wi-Fi] Trying STA '%s' (12s timeout)...\n", staSsid.c_str());
+        WiFi.mode(WIFI_STA);
+        WiFi.setSleep(false);
+        WiFi.setHostname("dockycam");
+        WiFi.begin(staSsid.c_str(), staPass.c_str());
+        const uint32_t deadline = millis() + 12000;
+        while (WiFi.status() != WL_CONNECTED && millis() < deadline) {
+            if (ledEnabled) {
+                const bool b = ((millis() / 250) % 2) == 0;
+                setLedRgb(0, b ? 12 : 2, b ? 16 : 3);
+            }
+            delay(100);
+        }
+        if (WiFi.status() == WL_CONNECTED) {
+            staModeActive = true;
+            activeWifiChannel = WiFi.channel();
+            WiFi.setTxPower(WIFI_POWER_17dBm);
+            Serial.printf("[Wi-Fi] STA connected: %s at %s (ch=%d rssi=%d)\n",
+                          staSsid.c_str(), WiFi.localIP().toString().c_str(),
+                          activeWifiChannel, WiFi.RSSI());
+        } else {
+            Serial.println("[Wi-Fi] STA timeout -> falling back to SoftAP");
+            WiFi.disconnect(true);
+            delay(100);
+        }
     }
-    esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20);
-    if (!WiFi.setTxPower(WIFI_POWER_17dBm)) Serial.println("[Wi-Fi] TX power unchanged");
+
+    if (!staModeActive) {
+        const IPAddress address(192, 168, 4, 1);
+        WiFi.onEvent([](WiFiEvent_t) { Serial.println("[Wi-Fi] Station disconnected"); },
+                     ARDUINO_EVENT_WIFI_AP_STADISCONNECTED);
+        activeWifiChannel = selectQuietChannel();
+        WiFi.mode(WIFI_AP);
+        WiFi.setSleep(false);
+        if (!WiFi.softAPConfig(address, address, IPAddress(255, 255, 255, 0)) ||
+            !WiFi.softAP(apName, CAMERA_AP_PASSWORD, activeWifiChannel, false, 2)) {
+            Serial.println("[Wi-Fi] SoftAP failed");
+            return;
+        }
+        esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20);
+        if (!WiFi.setTxPower(WIFI_POWER_17dBm)) Serial.println("[Wi-Fi] TX power unchanged");
+        Serial.printf("[Wi-Fi] %s at %s (ch=%d)\n", apName, address.toString().c_str(), activeWifiChannel);
+    }
+
+    if (MDNS.begin("dockycam")) {
+        MDNS.addService("http", "tcp", 80);
+        MDNS.addServiceTxt("http", "tcp", "app", "dockycam");
+        Serial.println("[mDNS] http://dockycam.local/");
+    }
+
     const auto statusServer = startServer(80, 32768, {
+        {"/", HTTP_GET, sendWebUi, nullptr},
         {"/status", HTTP_GET, sendStatus, nullptr},
         {"/telemetry", HTTP_GET, sendTelemetry, nullptr},
         {"/settings", HTTP_GET, sendOptions, nullptr},
         {"/settings", HTTP_POST, updateOptions, nullptr},
         {"/stop", HTTP_POST, requestStop, nullptr},
         {"/time", HTTP_POST, syncBoardTime, nullptr},
+        {"/wifi/status", HTTP_GET, sendWifiStatus, nullptr},
+        {"/wifi/scan", HTTP_GET, scanWifiNetworks, nullptr},
+        {"/wifi/config", HTTP_POST, updateWifiConfig, nullptr},
+        {"/led", HTTP_POST, updateLedMode, nullptr},
+        {"/reboot", HTTP_POST, triggerReboot, nullptr},
         {"/sd/status", HTTP_GET, sendSdStatus, nullptr},
         {"/sd/record", HTTP_POST, updateSdRecord, nullptr},
         {"/sd/snapshot", HTTP_POST, triggerSdSnapshot, nullptr},
@@ -815,21 +1062,59 @@ void setup() {
     if (!statusServer || !streamServer) {
         if (statusServer) httpd_stop(statusServer);
         if (streamServer) httpd_stop(streamServer);
-        WiFi.softAPdisconnect(true);
+        if (!staModeActive) WiFi.softAPdisconnect(true);
         Serial.println("[Wi-Fi] HTTP server setup failed");
         return;
     }
-    Serial.printf("[Wi-Fi] %s at %s (ch=%d)\n", apName, address.toString().c_str(), channel);
+    updateStatusLed();
 }
 
 void loop() {
+    if (rebootAtMs != 0 && static_cast<int32_t>(millis() - rebootAtMs) >= 0) {
+        Serial.println("[BOOT] Rebooting by request...");
+        delay(50);
+        ESP.restart();
+    }
+
     static bool prevPressed = false;
-    static uint32_t lastTriggerMs = 0;
+    static uint32_t pressStartMs = 0;
+    static bool longPressHandled = false;
     const bool pressed = (digitalRead(board::bootButton) == LOW);
-    if (pressed && !prevPressed && (millis() - lastTriggerMs) > 600) {
-        lastTriggerMs = millis();
+    const uint32_t now = millis();
+    if (pressed && !prevPressed) {
+        pressStartMs = now;
+        longPressHandled = false;
+    } else if (pressed && !longPressHandled && (now - pressStartMs) >= 4500) {
+        // 5-second hold resets STA config and reboots cleanly into DockyCam AP mode.
+        longPressHandled = true;
+        Serial.println("[Wi-Fi] BOOT held 5s -> resetting to SoftAP mode");
+        if (netPrefsReady) netPrefs.putBool("sta_en", false);
+        for (int i = 0; i < 3; ++i) {
+            neopixelWrite(board::statusRgbLed, 18, 18, 18);
+            delay(120);
+            neopixelWrite(board::statusRgbLed, 0, 0, 0);
+            delay(120);
+        }
+        ESP.restart();
+    } else if (!pressed && prevPressed && !longPressHandled && (now - pressStartMs) >= 60) {
+        // Short press captures instant SD snapshot.
         sdManager.requestSnapshot();
     }
     prevPressed = pressed;
+
+    static uint32_t lastLedMs = 0;
+    if (now - lastLedMs >= 250) {
+        lastLedMs = now;
+        updateStatusLed();
+    }
+
+    static uint32_t lastStaCheckMs = 0;
+    if (staModeActive && (now - lastStaCheckMs) >= 10000) {
+        lastStaCheckMs = now;
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("[Wi-Fi] STA lost, attempting reconnect...");
+            WiFi.reconnect();
+        }
+    }
     delay(50);
 }

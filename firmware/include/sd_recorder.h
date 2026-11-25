@@ -311,7 +311,7 @@ public:
         if (xSemaphoreTakeRecursive(sdMutex_, pdMS_TO_TICKS(1000)) != pdTRUE) return out;
         for (const char* cat : cats) {
             if (filterCat && strcmp(filterCat, "all") != 0 && strcmp(filterCat, cat) != 0) continue;
-            std::string dirPath = std::string("/workbenchcam/") + cat;
+            std::string dirPath = std::string("/dockycam/") + cat;
             File dir = SD_MMC.open(dirPath.c_str());
             if (!dir || !dir.isDirectory()) {
                 if (dir) dir.close();
@@ -345,7 +345,7 @@ public:
         xSemaphoreGive(stateMutex_);
         if (isCurrent) return false; // Refuse deleting actively open file
 
-        std::string path = std::string("/workbenchcam/") + cat + "/" + name;
+        std::string path = std::string("/dockycam/") + cat + "/" + name;
         if (xSemaphoreTakeRecursive(sdMutex_, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
         const bool ok = SD_MMC.remove(path.c_str());
         xSemaphoreGiveRecursive(sdMutex_);
@@ -405,10 +405,10 @@ private:
     void ensureDirs() {
         if (!mounted_) return;
         const char* dirs[] = {
-            "/workbenchcam",
-            "/workbenchcam/blackbox",
-            "/workbenchcam/timelapse",
-            "/workbenchcam/snapshots"
+            "/dockycam",
+            "/dockycam/blackbox",
+            "/dockycam/timelapse",
+            "/dockycam/snapshots"
         };
         for (const char* d : dirs) {
             if (!SD_MMC.exists(d)) SD_MMC.mkdir(d);
@@ -441,7 +441,7 @@ private:
         if (freeBytes < detail::kMinFreeBytesForLoop) {
             // Collect blackbox files sorted oldest first
             std::vector<std::string> bbFiles;
-            File dir = SD_MMC.open("/workbenchcam/blackbox");
+            File dir = SD_MMC.open("/dockycam/blackbox");
             if (dir && dir.isDirectory()) {
                 while (File f = dir.openNextFile()) {
                     if (!f.isDirectory()) {
@@ -457,7 +457,7 @@ private:
             std::sort(bbFiles.begin(), bbFiles.end()); // Oldest first
             for (const auto& name : bbFiles) {
                 if (freeBytes >= detail::kMinFreeBytesForLoop) break;
-                std::string path = "/workbenchcam/blackbox/" + name;
+                std::string path = "/dockycam/blackbox/" + name;
                 SD_MMC.remove(path.c_str());
                 total = SD_MMC.totalBytes();
                 used = SD_MMC.usedBytes();
@@ -477,7 +477,7 @@ private:
         if (!mounted_ || !jpeg || len < 4) return false;
         if (xSemaphoreTakeRecursive(sdMutex_, pdMS_TO_TICKS(1500)) != pdTRUE) return false;
         const std::string name = nextFilename("SNAP", "jpg");
-        const std::string path = "/workbenchcam/snapshots/" + name;
+        const std::string path = "/dockycam/snapshots/" + name;
         File f = SD_MMC.open(path.c_str(), FILE_WRITE);
         bool ok = false;
         if (f) {
@@ -499,7 +499,7 @@ private:
     bool openAviSegment(const char* cat, const char* prefix, uint16_t width, uint16_t height, uint32_t fpsHint) {
         if (!ensureFreeSpaceForBlackbox()) return false;
         const std::string name = nextFilename(prefix, "avi");
-        const std::string path = std::string("/workbenchcam/") + cat + "/" + name;
+        const std::string path = std::string("/dockycam/") + cat + "/" + name;
 
         if (xSemaphoreTakeRecursive(sdMutex_, pdMS_TO_TICKS(1500)) != pdTRUE) return false;
         aviFile_ = SD_MMC.open(path.c_str(), FILE_WRITE);
