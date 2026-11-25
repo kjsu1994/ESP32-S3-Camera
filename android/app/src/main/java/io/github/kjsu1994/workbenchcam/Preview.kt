@@ -31,12 +31,14 @@ internal class Preview(network: Network) {
                         val retry = stream.getHeaderField("Retry-After")?.toIntOrNull() ?: 0
                         result = when (stream.responseCode) {
                             429 -> Result("cooldown", retry.coerceIn(0, 60))
-                            503 -> Result("camera", 60)
+                            503 -> Result("camera", 0)
                             else -> throw IOException("Unexpected stream response")
                         }
                     } else {
                         val duration = stream.getHeaderField("X-Stream-Limit-Seconds")?.toIntOrNull()
-                        endsAt = startedAt + 1000L * (duration ?: 60).coerceIn(1, 900)
+                        if (duration != null && duration > 0) {
+                            endsAt = startedAt + 1000L * duration.coerceAtMost(900)
+                        }
                         stream.inputStream.use { input ->
                             val reader = MjpegReader(input)
                             while (!stopped) {
@@ -66,15 +68,19 @@ internal class Preview(network: Network) {
         }, "camera-preview").start()
     }
 
-    fun stop(requestStop: Boolean = false) {
+    fun stop(requestStop: Boolean = false, onClosed: () -> Unit = {}) {
         val connection = synchronized(this) {
             stopped = true
             active
         }
         if (requestStop || connection != null) {
             Thread({
-                if (requestStop) runCatching { board.stop() }
-                connection?.disconnect()
+                try {
+                    if (requestStop) runCatching { board.stop() }
+                    connection?.disconnect()
+                } finally {
+                    onClosed()
+                }
             }, "camera-close").start()
         }
     }

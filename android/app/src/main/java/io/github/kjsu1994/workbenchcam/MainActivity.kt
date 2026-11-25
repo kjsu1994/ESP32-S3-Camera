@@ -40,6 +40,7 @@ class MainActivity : Activity() {
     private var callback: ConnectivityManager.NetworkCallback? = null
     private var network: Network? = null
     private var preview: Preview? = null
+    private var stoppingPreview = false
     private var displayed: Preview.Frame? = null
     private var waitingForNetwork = false
     private var visible = false
@@ -73,9 +74,9 @@ class MainActivity : Activity() {
                 screen.showFrame(frame.bitmap)
                 if (first) updateControls()
             }
-            if (current != null && displayed != null && current.endsAt != 0L) {
-                val remaining = remainingSeconds(current.endsAt, now)
-                setStatus("실시간 영상", asClock(remaining))
+            if (current != null && displayed != null) {
+                val timer = if (current.endsAt == 0L) "" else asClock(remainingSeconds(current.endsAt, now))
+                setStatus("실시간 영상", timer)
             } else if (cooldownEndsAt != 0L) {
                 val remaining = remainingSeconds(cooldownEndsAt, now)
                 if (remaining == 0L) {
@@ -416,8 +417,14 @@ class MainActivity : Activity() {
     private fun stopPreview() {
         val session = preview ?: return
         preview = null
-        session.stop(requestStop = true)
-        setCooldown("시청을 중지했습니다", 60)
+        stoppingPreview = true
+        session.stop(requestStop = true) {
+            runOnUiThread {
+                stoppingPreview = false
+                if (!isDestroyed) updateControls()
+            }
+        }
+        setCooldown("시청을 중지했습니다", 0)
     }
 
     private fun setCooldown(reason: String, seconds: Int) {
@@ -507,7 +514,7 @@ class MainActivity : Activity() {
     private fun updateControls() {
         if (preview != null) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        screen.showControls(network != null, !waitingForNetwork && preview == null && cooldownEndsAt == 0L,
+        screen.showControls(network != null, !waitingForNetwork && !stoppingPreview && preview == null && cooldownEndsAt == 0L,
             preview != null, displayed != null)
     }
 

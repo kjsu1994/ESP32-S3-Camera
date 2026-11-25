@@ -30,8 +30,6 @@
 
 namespace {
 constexpr char apName[] = "WorkbenchCam";
-constexpr uint32_t sessionMs = 180000;
-constexpr uint32_t cooldownMs = 60000;
 constexpr uint8_t lowBandwidth = 1 << 0;
 constexpr uint8_t rotate180 = 1 << 1;
 // Retain the v0.1.0 settings round-trip for installed clients.
@@ -53,18 +51,16 @@ constexpr int xclkHz = 20000000;
 constexpr size_t maxJpegBytes = 256 * 1024;
 constexpr size_t partHeaderCapacity = 96;
 
-enum class State { Idle, Streaming, Cooldown };
-enum class Reason { None, Limit, Camera, Disconnected, Stopped };
+enum class State { Idle, Streaming };
+enum class Reason { None, Camera, Disconnected, Stopped };
 struct Status {
     State state;
     Reason reason;
-    uint32_t remainingSeconds;
 };
 
 portMUX_TYPE statusLock = portMUX_INITIALIZER_UNLOCKED;
 State state = State::Idle;
 Reason reason = Reason::None;
-uint32_t deadline = 0;
 bool stopRequested = false;
 uint8_t boardOptions = 0;
 Preferences preferences;
@@ -77,29 +73,17 @@ TwoWire& powerBus = Wire;
 TwoWire& powerBus = Wire1;
 #endif
 
-bool reached(uint32_t now, uint32_t target) {
-    return static_cast<int32_t>(now - target) >= 0;
-}
-
-void setStatus(State nextState, Reason nextReason, uint32_t durationMs) {
-    const uint32_t end = millis() + durationMs;
+void setStatus(State nextState, Reason nextReason) {
     portENTER_CRITICAL(&statusLock);
     state = nextState;
     if (state == State::Streaming) stopRequested = false;
     reason = nextReason;
-    deadline = end;
     portEXIT_CRITICAL(&statusLock);
 }
 
 Status getStatus() {
-    const uint32_t now = millis();
     portENTER_CRITICAL(&statusLock);
-    if (state == State::Cooldown && reached(now, deadline)) {
-        state = State::Idle;
-    }
-    const uint32_t seconds = state == State::Idle || reached(now, deadline)
-        ? 0 : (deadline - now + 999) / 1000;
-    const Status result{state, reason, seconds};
+    const Status result{state, reason};
     portEXIT_CRITICAL(&statusLock);
     return result;
 }
@@ -108,7 +92,6 @@ const char* stateName(State value) {
     switch (value) {
         case State::Idle: return "idle";
         case State::Streaming: return "streaming";
-        case State::Cooldown: return "cooldown";
     }
     return "idle";
 }
@@ -116,7 +99,6 @@ const char* stateName(State value) {
 const char* reasonName(Reason value) {
     switch (value) {
         case Reason::None: return "none";
-        case Reason::Limit: return "limit";
         case Reason::Camera: return "camera";
         case Reason::Disconnected: return "disconnected";
         case Reason::Stopped: return "stopped";
@@ -216,8 +198,8 @@ void stopCamera() {
 esp_err_t sendStatus(httpd_req_t* request) {
     const Status current = getStatus();
     char body[112];
-    snprintf(body, sizeof(body), "{\"state\":\"%s\",\"remaining_s\":%lu,\"reason\":\"%s\"}",
-             stateName(current.state), static_cast<unsigned long>(current.remainingSeconds), reasonName(current.reason));
+    snprintf(body, sizeof(body), "{\"state\":\"%s\",\"remaining_s\":0,\"reason\":\"%s\"}",
+             stateName(current.state), reasonName(current.reason));
     httpd_resp_set_type(request, "application/json");
     httpd_resp_set_hdr(request, "Cache-Control", "no-store");
     return httpd_resp_sendstr(request, body);
@@ -323,15 +305,6 @@ bool writeStream(httpd_req_t* request, const char* bytes, size_t length) {
 }
 
 esp_err_t stream(httpd_req_t* request) {
-    const Status current = getStatus();
-    if (current.state == State::Cooldown) {
-        char retry[12];
-        snprintf(retry, sizeof(retry), "%lu", static_cast<unsigned long>(current.remainingSeconds));
-        httpd_resp_set_status(request, "429 Too Many Requests");
-        httpd_resp_set_hdr(request, "Retry-After", retry);
-        return httpd_resp_sendstr(request, "Camera is cooling down");
-    }
-
     char* packet = static_cast<char*>(ps_malloc(maxJpegBytes + partHeaderCapacity + 2));
     if (!packet) {
         httpd_resp_set_status(request, "503 Service Unavailable");
@@ -339,33 +312,30 @@ esp_err_t stream(httpd_req_t* request) {
     }
 
     const uint32_t sessionStarted = millis();
-    const uint32_t stopAt = sessionStarted + sessionMs;
-    setStatus(State::Streaming, Reason::None, sessionMs);
+    setStatus(State::Streaming, Reason::None);
     const uint8_t options = getOptions();
     const bool highResolution = resolutionIndex(options) == static_cast<uint8_t>(Resolution::Svga);
     const uint32_t frameIntervalMs = (options & lowBandwidth) ? 167 : highResolution ? 100 : 84;
     if (!startCamera(options)) {
         free(packet);
-        setStatus(State::Cooldown, Reason::Camera, cooldownMs);
+        setStatus(State::Idle, Reason::Camera);
         httpd_resp_set_status(request, "503 Service Unavailable");
         return httpd_resp_sendstr(request, "Camera initialization failed");
     }
 
     const int disableNagle = 1;
     setsockopt(httpd_req_to_sockfd(request), IPPROTO_TCP, TCP_NODELAY, &disableNagle, sizeof(disableNagle));
-    char response[220];
-    const int responseLength = snprintf(response, sizeof(response),
+    constexpr char response[] =
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
-        "Cache-Control: no-store\r\nConnection: close\r\nX-Stream-Limit-Seconds: %lu\r\n\r\n",
-        static_cast<unsigned long>(sessionMs / 1000));
-    bool sent = writeStream(request, response, responseLength);
-    Reason ending = sent ? Reason::Limit : Reason::Disconnected;
+        "Cache-Control: no-store\r\nConnection: close\r\n\r\n";
+    bool sent = writeStream(request, response, sizeof(response) - 1);
+    Reason ending = Reason::Disconnected;
     uint32_t sentFrames = 0;
     uint64_t captureUs = 0;
     uint64_t sendUs = 0;
 
-    while (sent && !reached(millis(), stopAt) && !shouldStop()) {
+    while (sent && !shouldStop()) {
         const uint32_t started = millis();
         const uint32_t captureStarted = micros();
         camera_fb_t* frame = esp_camera_fb_get();
@@ -374,7 +344,7 @@ esp_err_t stream(httpd_req_t* request) {
             ending = Reason::Camera;
             break;
         }
-        if (reached(millis(), stopAt) || shouldStop()) {
+        if (shouldStop()) {
             esp_camera_fb_return(frame);
             break;
         }
@@ -410,7 +380,7 @@ esp_err_t stream(httpd_req_t* request) {
     if (shouldStop()) ending = Reason::Stopped;
     stopCamera();
     free(packet);
-    setStatus(State::Cooldown, ending, cooldownMs);
+    setStatus(State::Idle, ending);
     Serial.printf("[CAM] Stream ended: %s frames=%lu duration_ms=%lu\n",
                   reasonName(ending), static_cast<unsigned long>(sentFrames),
                   static_cast<unsigned long>(millis() - sessionStarted));
