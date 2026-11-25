@@ -289,25 +289,63 @@ public:
 
     static bool isValidCategory(const char* cat) {
         return cat && (strcmp(cat, "blackbox") == 0 || strcmp(cat, "timelapse") == 0 ||
-                       strcmp(cat, "snapshots") == 0);
+                       strcmp(cat, "snapshots") == 0 || strcmp(cat, "shared") == 0);
     }
 
     static bool isValidName(const char* name) {
-        if (!name || !name[0] || strlen(name) > 48) return false;
+        if (!name || !name[0]) return false;
+        const size_t len = strlen(name);
+        if (len > 120) return false;
+        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return false;
         if (strstr(name, "..") != nullptr) return false;
-        for (const char* p = name; *p; ++p) {
-            const char c = *p;
-            const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-                            (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.';
-            if (!ok) return false;
+        for (size_t i = 0; i < len; ++i) {
+            const unsigned char c = static_cast<unsigned char>(name[i]);
+            if (c < 0x20 || c == 0x7f) return false;
+            if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' ||
+                c == '"' || c == '<' || c == '>' || c == '|') {
+                return false;
+            }
         }
         return true;
     }
 
-    std::vector<FileEntry> listFiles(const char* filterCat, size_t maxItems = 60) {
+    static std::string sanitizeSharedName(const char* raw) {
+        if (!raw || !raw[0]) return "file.bin";
+        // Strip any path prefix (both / and \)
+        const char* base = raw;
+        for (const char* p = raw; *p; ++p) {
+            if (*p == '/' || *p == '\\') base = p + 1;
+        }
+        std::string out;
+        out.reserve(104);
+        for (const char* p = base; *p && out.size() < 100; ++p) {
+            const unsigned char c = static_cast<unsigned char>(*p);
+            if (c < 0x20 || c == 0x7f) continue;
+            if (c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|') {
+                out.push_back('_');
+            } else {
+                out.push_back(static_cast<char>(c));
+            }
+        }
+        // Collapse any ".." segments and trim leading/trailing spaces & dots
+        size_t pos;
+        while ((pos = out.find("..")) != std::string::npos) {
+            out.replace(pos, 2, "_");
+        }
+        while (!out.empty() && (out.front() == ' ' || out.front() == '.')) out.erase(out.begin());
+        while (!out.empty() && (out.back() == ' ' || out.back() == '.')) out.pop_back();
+        // Avoid truncating in the middle of a multi-byte UTF-8 sequence
+        while (!out.empty() && (static_cast<unsigned char>(out.back()) & 0xC0) == 0x80) {
+            out.pop_back();
+        }
+        if (out.empty()) return "file.bin";
+        return out;
+    }
+
+    std::vector<FileEntry> listFiles(const char* filterCat, size_t maxItems = 80) {
         std::vector<FileEntry> out;
         if (!mounted_) return out;
-        const char* cats[3] = {"blackbox", "timelapse", "snapshots"};
+        const char* cats[4] = {"blackbox", "timelapse", "snapshots", "shared"};
         if (xSemaphoreTakeRecursive(sdMutex_, pdMS_TO_TICKS(1000)) != pdTRUE) return out;
         for (const char* cat : cats) {
             if (filterCat && strcmp(filterCat, "all") != 0 && strcmp(filterCat, cat) != 0) continue;
@@ -408,7 +446,8 @@ private:
             "/dockycam",
             "/dockycam/blackbox",
             "/dockycam/timelapse",
-            "/dockycam/snapshots"
+            "/dockycam/snapshots",
+            "/dockycam/shared"
         };
         for (const char* d : dirs) {
             if (!SD_MMC.exists(d)) SD_MMC.mkdir(d);

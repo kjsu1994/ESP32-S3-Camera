@@ -46,6 +46,8 @@ internal class CameraScreen(
     private val onSdSnapshot: () -> Unit,
     private val onCategorySelected: (String) -> Unit,
     private val onRefreshLibrary: () -> Unit,
+    private val onUploadSharedFile: () -> Unit,
+    private val onOpenNotes: () -> Unit,
     private val onPlayFile: (SdFileItem) -> Unit,
     private val onDownloadFile: (SdFileItem) -> Unit,
     private val onDeleteFile: (SdFileItem) -> Unit
@@ -142,6 +144,7 @@ internal class CameraScreen(
     // Library Tab views
     private var libNotConnectedCard: View? = null
     private var libContent: LinearLayout? = null
+    private var libUploadBanner: TextView? = null
     private var libSummaryText: TextView? = null
     private var libListContainer: LinearLayout? = null
     private var renderCategoryChips: ((String) -> Unit)? = null
@@ -647,7 +650,13 @@ internal class CameraScreen(
 
         val (catChips, catRenderer) = UiStyle.segmentedChips(
             context,
-            listOf("all" to "전체", "blackbox" to "블랙박스", "timelapse" to "타임랩스", "snapshots" to "스냅샷"),
+            listOf(
+                "all" to "전체",
+                "shared" to "공유함",
+                "blackbox" to "블랙박스",
+                "timelapse" to "타임랩스",
+                "snapshots" to "스냅샷"
+            ),
             selectedCategory
         ) {
             selectedCategory = it
@@ -664,6 +673,23 @@ internal class CameraScreen(
             addView(catChips, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = UiStyle.dp(context, 8) })
             addView(refreshBtn)
         })
+
+        val cloudRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            val uploadBtn = UiStyle.primaryButton(context, "공유함 파일 업로드", onUploadSharedFile)
+            val notesBtn = UiStyle.secondaryButton(context, "빠른 메모장", onOpenNotes)
+            addView(uploadBtn, LinearLayout.LayoutParams(0, -2, 1.25f).apply { marginEnd = UiStyle.dp(context, 8) })
+            addView(notesBtn, LinearLayout.LayoutParams(0, -2, 0.85f))
+        }
+        content.addView(cloudRow, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 10) })
+
+        val uploadBanner = UiStyle.label(context, "", 12.5f, UiStyle.CYAN, bold = true).apply {
+            visibility = View.GONE
+            background = UiStyle.rounded(context, UiStyle.CYAN_SOFT, 10, UiStyle.BORDER)
+            setPadding(UiStyle.dp(context, 12), UiStyle.dp(context, 8), UiStyle.dp(context, 12), UiStyle.dp(context, 8))
+        }
+        libUploadBanner = uploadBanner
+        content.addView(uploadBanner, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 8) })
 
         val summary = UiStyle.label(context, "파일 목록 불러오는 중...", 12.5f, UiStyle.MUTED).apply {
             setPadding(UiStyle.dp(context, 4), UiStyle.dp(context, 10), 0, UiStyle.dp(context, 8))
@@ -879,6 +905,16 @@ internal class CameraScreen(
         sdSnapshotBtn?.isEnabled = true
     }
 
+    fun showUploadProgress(message: String?) {
+        val banner = libUploadBanner ?: return
+        if (message.isNullOrEmpty()) {
+            banner.visibility = View.GONE
+        } else {
+            banner.text = message
+            banner.visibility = View.VISIBLE
+        }
+    }
+
     fun showSdFiles(files: List<SdFileItem>?, loading: Boolean = false) {
         val container = libListContainer ?: return
         container.removeAllViews()
@@ -936,9 +972,8 @@ internal class CameraScreen(
                     maxLines = 1
                 })
             }
-            val playBtn = UiStyle.iconCircleButton(
-                context, R.drawable.ic_play, "재생", UiStyle.ACCENT_SOFT, UiStyle.ACCENT, 38
-            ) { onPlayFile(item) }
+            val lower = item.name.lowercase(Locale.US)
+            val playable = lower.endsWith(".avi") || lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".png")
             val dlBtn = UiStyle.iconCircleButton(
                 context, R.drawable.ic_download, "다운로드", UiStyle.SURFACE_ALT, UiStyle.INK, 38
             ) { onDownloadFile(item) }
@@ -947,14 +982,19 @@ internal class CameraScreen(
             ) { onDeleteFile(item) }
 
             card.addView(metaCol, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = UiStyle.dp(context, 8) })
-            card.addView(playBtn, LinearLayout.LayoutParams(UiStyle.dp(context, 38), UiStyle.dp(context, 38)).apply {
-                marginEnd = UiStyle.dp(context, 6)
-            })
+            if (playable) {
+                val playBtn = UiStyle.iconCircleButton(
+                    context, R.drawable.ic_play, "재생", UiStyle.ACCENT_SOFT, UiStyle.ACCENT, 38
+                ) { onPlayFile(item) }
+                card.addView(playBtn, LinearLayout.LayoutParams(UiStyle.dp(context, 38), UiStyle.dp(context, 38)).apply {
+                    marginEnd = UiStyle.dp(context, 6)
+                })
+            }
             card.addView(dlBtn, LinearLayout.LayoutParams(UiStyle.dp(context, 38), UiStyle.dp(context, 38)).apply {
                 marginEnd = UiStyle.dp(context, 6)
             })
             card.addView(delBtn)
-            card.setOnClickListener { onPlayFile(item) }
+            card.setOnClickListener { if (playable) onPlayFile(item) else onDownloadFile(item) }
             container.addView(card, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = UiStyle.dp(context, 8) })
         }
     }

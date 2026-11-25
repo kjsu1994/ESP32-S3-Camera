@@ -5,6 +5,7 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.ContentValues
+import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.content.res.Configuration
@@ -12,6 +13,7 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.net.Uri
 import android.net.wifi.WifiManager
 import android.net.wifi.WifiNetworkSpecifier
 import android.os.Build
@@ -21,6 +23,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.provider.MediaStore
+import android.provider.OpenableColumns
 import android.view.View
 import android.view.WindowInsets
 import android.view.WindowInsetsController
@@ -255,6 +258,8 @@ class MainActivity : Activity() {
                 refreshSdFiles()
             },
             onRefreshLibrary = ::refreshSdFiles,
+            onUploadSharedFile = ::pickSharedFileForUpload,
+            onOpenNotes = ::openSharedNotesDialog,
             onPlayFile = ::playSdFile,
             onDownloadFile = ::downloadSdFile,
             onDeleteFile = ::confirmDeleteSdFile
@@ -942,31 +947,140 @@ class MainActivity : Activity() {
         }, "sd-files-list").start()
     }
 
+    @Suppress("DEPRECATION")
+    private fun pickSharedFileForUpload() {
+        if (boardTarget == null) {
+            Toast.makeText(this, "먼저 보드에 연결해 주세요", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+        }
+        runCatching { startActivityForResult(intent, REQ_PICK_UPLOAD_FILE) }
+            .onFailure { Toast.makeText(this, "파일 선택기를 열 수 없습니다", Toast.LENGTH_SHORT).show() }
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQ_PICK_UPLOAD_FILE && resultCode == RESULT_OK) {
+            data?.data?.let(::uploadUriToShared)
+        }
+    }
+
+    private fun resolvePickedMeta(uri: Uri): Pair<String, Long> {
+        var name = "file.bin"
+        var size = -1L
+        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)?.use { c ->
+            if (c.moveToFirst()) {
+                val ni = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                val si = c.getColumnIndex(OpenableColumns.SIZE)
+                if (ni >= 0 && !c.isNull(ni)) name = c.getString(ni)
+                if (si >= 0 && !c.isNull(si)) size = c.getLong(si)
+            }
+        }
+        if (size <= 0L) {
+            contentResolver.openAssetFileDescriptor(uri, "r")?.use { afd ->
+                if (afd.length > 0L) size = afd.length
+            }
+        }
+        return name to size
+    }
+
+    private fun uploadUriToShared(uri: Uri) {
+        val connected = boardTarget ?: return
+        // Stop live video so 100% Wi-Fi/SD bandwidth goes to file upload.
+        if (preview != null) stopPreview()
+        val (name, size) = resolvePickedMeta(uri)
+        if (size <= 0L) {
+            Toast.makeText(this, "파일 크기를 확인할 수 없습니다", Toast.LENGTH_SHORT).show()
+            return
+        }
+        screen.showUploadProgress("업로드 준비 중: $name (${UiStyle.formatSize(size)})")
+        Thread({
+            val started = SystemClock.elapsedRealtime()
+            val result = runCatching {
+                checkNotNull(contentResolver.openInputStream(uri)).use { input ->
+                    BoardApi(connected).uploadSharedFile(name, size, input) { sent, total ->
+                        val pct = if (total > 0L) ((sent * 100L) / total).toInt().coerceIn(0, 100) else 0
+                        val sec = ((SystemClock.elapsedRealtime() - started).coerceAtLeast(200L)) / 1000.0
+                        val speed = UiStyle.formatSize((sent / sec).toLong()) + "/s"
+                        runOnUiThread {
+                            if (!isDestroyed) {
+                                screen.showUploadProgress("업로드 중: $name · $pct% ($speed)")
+                            }
+                        }
+                    }
+                }
+            }
+            runOnUiThread {
+                if (isDestroyed) return@runOnUiThread
+                screen.showUploadProgress(null)
+                result.onSuccess { item ->
+                    Toast.makeText(this, "공유함에 업로드 완료: ${item.name}", Toast.LENGTH_SHORT).show()
+                    refreshSdFiles()
+                    refreshSdStatus(connected, SystemClock.elapsedRealtime() + 2500L)
+                }.onFailure { err ->
+                    Toast.makeText(this, "업로드 실패: ${err.message ?: "연결 확인"}", Toast.LENGTH_LONG).show()
+                }
+            }
+        }, "sd-cloud-upload").start()
+    }
+
+    private fun openSharedNotesDialog() {
+        val connected = boardTarget ?: run {
+            Toast.makeText(this, "먼저 보드에 연결해 주세요", Toast.LENGTH_SHORT).show()
+            return
+        }
+        SharedNotesDialog(this, connected).show()
+    }
+
     private fun playSdFile(item: SdFileItem) {
         val connected = boardTarget ?: return
+        val lower = item.name.lowercase(Locale.US)
+        val playable = lower.endsWith(".avi") || lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".png")
+        if (!playable) {
+            downloadSdFile(item)
+            return
+        }
         SdPlayerDialog(this, connected, item, ::downloadSdFile).show()
     }
 
     private fun downloadSdFile(item: SdFileItem) {
         val connected = boardTarget ?: return
+        // Pause live stream during download for maximum transfer speed.
+        if (preview != null) stopPreview()
         Toast.makeText(this, "${item.name} 내려받는 중...", Toast.LENGTH_SHORT).show()
         Thread({
-            val isImage = item.name.endsWith(".jpg", ignoreCase = true)
+            val lower = item.name.lowercase(Locale.US)
+            val isImage = lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".png") || lower.endsWith(".webp")
+            val mime = when {
+                lower.endsWith(".jpg") || lower.endsWith(".jpeg") -> "image/jpeg"
+                lower.endsWith(".png") -> "image/png"
+                lower.endsWith(".webp") -> "image/webp"
+                lower.endsWith(".avi") -> "video/x-msvideo"
+                lower.endsWith(".mp4") -> "video/mp4"
+                lower.endsWith(".pdf") -> "application/pdf"
+                lower.endsWith(".txt") || lower.endsWith(".md") -> "text/plain"
+                lower.endsWith(".zip") -> "application/zip"
+                else -> "application/octet-stream"
+            }
             val saved = try {
-                val conn = BoardApi(connected).openSdFile(item.category, item.name, 15000)
+                val conn = BoardApi(connected).openSdFile(item.category, item.name, 25000)
                 try {
                     if (conn.responseCode != 200) throw IllegalStateException("HTTP ${conn.responseCode}")
                     val (collection, values) = if (isImage) {
                         MediaStore.Images.Media.EXTERNAL_CONTENT_URI to ContentValues().apply {
                             put(MediaStore.Images.Media.DISPLAY_NAME, item.name)
-                            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                            put(MediaStore.Images.Media.MIME_TYPE, mime)
                             put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/DockyCam")
                             put(MediaStore.Images.Media.IS_PENDING, 1)
                         }
                     } else {
                         MediaStore.Downloads.EXTERNAL_CONTENT_URI to ContentValues().apply {
                             put(MediaStore.Downloads.DISPLAY_NAME, item.name)
-                            put(MediaStore.Downloads.MIME_TYPE, "video/x-msvideo")
+                            put(MediaStore.Downloads.MIME_TYPE, mime)
                             put(MediaStore.Downloads.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/DockyCam")
                             put(MediaStore.Downloads.IS_PENDING, 1)
                         }
@@ -1285,4 +1399,8 @@ class MainActivity : Activity() {
 
     private fun remainingSeconds(deadline: Long, now: Long) = ((deadline - now + 999) / 1000).coerceAtLeast(0L)
     private fun asClock(seconds: Long) = "${seconds / 60}:${(seconds % 60).toString().padStart(2, '0')}"
+
+    companion object {
+        private const val REQ_PICK_UPLOAD_FILE = 41
+    }
 }

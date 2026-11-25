@@ -2,6 +2,7 @@
 #include <ESPmDNS.h>
 #include <Preferences.h>
 #include <SD_MMC.h>
+#include <atomic>
 #include <initializer_list>
 #include <map>
 #include "cJSON.h"
@@ -83,6 +84,7 @@ int activeWifiChannel = 6;
 String cachedWifiScanJson = "{\"networks\":[]}";
 volatile bool ledEnabled = true;
 volatile uint32_t rebootAtMs = 0;
+std::atomic<int> activeTransfers{0};
 sdrec::Manager sdManager;
 
 void setLedRgb(uint8_t r, uint8_t g, uint8_t b) {
@@ -335,6 +337,10 @@ bool writeStream(httpd_req_t* request, const char* bytes, size_t length) {
 }
 
 esp_err_t stream(httpd_req_t* request) {
+    if (activeTransfers.load() > 0) {
+        httpd_resp_set_status(request, "503 Service Unavailable");
+        return httpd_resp_sendstr(request, "File transfer in progress");
+    }
     char* packet = static_cast<char*>(ps_malloc(maxJpegBytes + partHeaderCapacity + 2));
     if (!packet) {
         httpd_resp_set_status(request, "503 Service Unavailable");
@@ -490,8 +496,8 @@ httpd_handle_t startServer(uint16_t port, uint16_t controlPort, std::initializer
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = port;
     config.ctrl_port = controlPort;
-    config.send_wait_timeout = 6;
-    config.recv_wait_timeout = 2;
+    config.send_wait_timeout = (port == 80) ? 12 : 6;
+    config.recv_wait_timeout = (port == 80) ? 10 : 2;
     config.stack_size = 8192;
     config.core_id = 1;
     config.max_uri_handlers = 24;
@@ -701,16 +707,99 @@ esp_err_t sendSdFiles(httpd_req_t* request) {
     return res;
 }
 
+struct TransferGuard {
+    bool active = false;
+    TransferGuard() {
+        const int prev = activeTransfers.fetch_add(1);
+        active = true;
+        if (prev == 0) {
+            // Stop active live video stream so 100% of Wi-Fi & PSRAM goes to the file transfer.
+            if (getStatus().state == State::Streaming) {
+                portENTER_CRITICAL(&statusLock);
+                stopRequested = true;
+                portEXIT_CRITICAL(&statusLock);
+                const uint32_t waitEnd = millis() + 750;
+                while (getStatus().state == State::Streaming && millis() < waitEnd) {
+                    delay(15);
+                }
+            }
+            sdManager.pauseForLive();
+        }
+    }
+    ~TransferGuard() {
+        if (active && activeTransfers.fetch_sub(1) == 1) {
+            sdManager.resumeAfterLive();
+        }
+    }
+};
+
+int hexVal(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+void urlDecode(const char* in, char* out, size_t outSize) {
+    if (!outSize) return;
+    size_t w = 0;
+    for (size_t r = 0; in[r] && w + 1 < outSize; ++r) {
+        if (in[r] == '%' && in[r + 1] && in[r + 2]) {
+            const int hi = hexVal(in[r + 1]);
+            const int lo = hexVal(in[r + 2]);
+            if (hi >= 0 && lo >= 0) {
+                out[w++] = static_cast<char>((hi << 4) | lo);
+                r += 2;
+                continue;
+            }
+        } else if (in[r] == '+') {
+            out[w++] = ' ';
+            continue;
+        }
+        out[w++] = in[r];
+    }
+    out[w] = '\0';
+}
+
+const char* mimeForFilename(const char* name) {
+    const char* ext = strrchr(name, '.');
+    if (!ext) return "application/octet-stream";
+    if (strcasecmp(ext, ".jpg") == 0 || strcasecmp(ext, ".jpeg") == 0) return "image/jpeg";
+    if (strcasecmp(ext, ".png") == 0) return "image/png";
+    if (strcasecmp(ext, ".webp") == 0) return "image/webp";
+    if (strcasecmp(ext, ".gif") == 0) return "image/gif";
+    if (strcasecmp(ext, ".avi") == 0) return "video/x-msvideo";
+    if (strcasecmp(ext, ".mp4") == 0) return "video/mp4";
+    if (strcasecmp(ext, ".pdf") == 0) return "application/pdf";
+    if (strcasecmp(ext, ".txt") == 0 || strcasecmp(ext, ".md") == 0 || strcasecmp(ext, ".csv") == 0) {
+        return "text/plain; charset=utf-8";
+    }
+    if (strcasecmp(ext, ".json") == 0) return "application/json";
+    if (strcasecmp(ext, ".zip") == 0) return "application/zip";
+    return "application/octet-stream";
+}
+
 esp_err_t sendSdFile(httpd_req_t* request) {
-    char query[128] = "";
+    char query[320] = "";
     char cat[16] = "";
-    char name[64] = "";
+    char rawName[256] = "";
+    char name[128] = "";
     if (httpd_req_get_url_query_str(request, query, sizeof(query)) != ESP_OK ||
         httpd_query_key_value(query, "cat", cat, sizeof(cat)) != ESP_OK ||
-        httpd_query_key_value(query, "name", name, sizeof(name)) != ESP_OK ||
-        !sdrec::Manager::isValidCategory(cat) || !sdrec::Manager::isValidName(name)) {
+        httpd_query_key_value(query, "name", rawName, sizeof(rawName)) != ESP_OK) {
         return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid file parameter");
     }
+    urlDecode(rawName, name, sizeof(name));
+    if (!sdrec::Manager::isValidCategory(cat) || !sdrec::Manager::isValidName(name)) {
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid file parameter");
+    }
+    // Pause live stream & SD recording so file download runs at full Wi-Fi/SD speed.
+    TransferGuard xferGuard;
+
+    const int sock = httpd_req_to_sockfd(request);
+    const int nodelay = 1;
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+
     std::string path = std::string("/dockycam/") + cat + "/" + name;
     if (!sdManager.lockSd(3000)) {
         return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "SD busy");
@@ -722,15 +811,13 @@ esp_err_t sendSdFile(httpd_req_t* request) {
         return httpd_resp_send_err(request, HTTPD_404_NOT_FOUND, "File not found");
     }
     const size_t totalSize = file.size();
-    const char* ext = strrchr(name, '.');
-    const bool isJpg = ext && strcasecmp(ext, ".jpg") == 0;
-    httpd_resp_set_type(request, isJpg ? "image/jpeg" : "video/x-msvideo");
+    httpd_resp_set_type(request, mimeForFilename(name));
     httpd_resp_set_hdr(request, "Cache-Control", "no-store");
     char lenBuf[24];
     snprintf(lenBuf, sizeof(lenBuf), "%u", static_cast<unsigned>(totalSize));
     httpd_resp_set_hdr(request, "X-File-Size", lenBuf);
 
-    constexpr size_t kChunkSize = 8192;
+    constexpr size_t kChunkSize = 16384;
     char* buf = static_cast<char*>(ps_malloc(kChunkSize));
     if (!buf) {
         file.close();
@@ -762,8 +849,294 @@ esp_err_t sendSdFile(httpd_req_t* request) {
     return httpd_resp_send_chunk(request, nullptr, 0);
 }
 
+esp_err_t uploadSdFile(httpd_req_t* request) {
+    char query[320] = "";
+    char rawName[256] = "";
+    char decodedName[128] = "";
+    if (httpd_req_get_url_query_str(request, query, sizeof(query)) != ESP_OK ||
+        httpd_query_key_value(query, "name", rawName, sizeof(rawName)) != ESP_OK) {
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Missing filename");
+    }
+    urlDecode(rawName, decodedName, sizeof(decodedName));
+    const std::string safeName = sdrec::Manager::sanitizeSharedName(decodedName);
+    if (!sdrec::Manager::isValidName(safeName.c_str())) {
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid filename");
+    }
+    const size_t totalLen = request->content_len;
+    if (totalLen == 0) {
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Empty file");
+    }
+
+    // Pause live video & background recording so upload uses 100% Wi-Fi and SD speed.
+    TransferGuard xferGuard;
+
+    const int sock = httpd_req_to_sockfd(request);
+    const int nodelay = 1;
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+
+    constexpr size_t kChunkSize = 16384;
+    char* buf = static_cast<char*>(ps_malloc(kChunkSize));
+    if (!buf) {
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Buffer unavailable");
+    }
+
+    const std::string path = std::string("/dockycam/shared/") + safeName;
+    if (!sdManager.lockSd(3000)) {
+        free(buf);
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "SD busy");
+    }
+    const uint64_t totalBytes = SD_MMC.totalBytes();
+    const uint64_t usedBytes = SD_MMC.usedBytes();
+    const uint64_t freeBytes = totalBytes > usedBytes ? (totalBytes - usedBytes) : 0;
+    if (freeBytes < static_cast<uint64_t>(totalLen) + 2ULL * 1024ULL * 1024ULL) {
+        sdManager.unlockSd();
+        free(buf);
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "SD card full");
+    }
+    if (!SD_MMC.exists("/dockycam")) SD_MMC.mkdir("/dockycam");
+    if (!SD_MMC.exists("/dockycam/shared")) SD_MMC.mkdir("/dockycam/shared");
+    File file = SD_MMC.open(path.c_str(), FILE_WRITE);
+    if (!file) {
+        sdManager.unlockSd();
+        free(buf);
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Could not open file");
+    }
+    sdManager.unlockSd();
+
+    const uint32_t startedMs = millis();
+    size_t remaining = totalLen;
+    bool writeOk = true;
+    while (remaining > 0) {
+        const size_t want = remaining > kChunkSize ? kChunkSize : remaining;
+        const int got = httpd_req_recv(request, buf, want);
+        if (got <= 0) {
+            if (got == HTTPD_SOCK_ERR_TIMEOUT) continue;
+            writeOk = false;
+            break;
+        }
+        if (!sdManager.lockSd(3000)) {
+            writeOk = false;
+            break;
+        }
+        const size_t wrote = file.write(reinterpret_cast<const uint8_t*>(buf), static_cast<size_t>(got));
+        sdManager.unlockSd();
+        if (wrote != static_cast<size_t>(got)) {
+            writeOk = false;
+            break;
+        }
+        remaining -= static_cast<size_t>(got);
+    }
+
+    if (sdManager.lockSd(3000)) {
+        file.flush();
+        file.close();
+        if (!writeOk) {
+            SD_MMC.remove(path.c_str());
+        }
+        sdManager.unlockSd();
+    }
+    free(buf);
+
+    if (!writeOk) {
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Upload interrupted");
+    }
+    const uint32_t elapsedMs = millis() - startedMs;
+    Serial.printf("[SD] Uploaded shared/%s (%u bytes in %lu ms)\n",
+                  safeName.c_str(), static_cast<unsigned>(totalLen), static_cast<unsigned long>(elapsedMs));
+
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "ok", true);
+    cJSON_AddStringToObject(root, "cat", "shared");
+    cJSON_AddStringToObject(root, "name", safeName.c_str());
+    cJSON_AddNumberToObject(root, "size", static_cast<double>(totalLen));
+    cJSON_AddNumberToObject(root, "ms", static_cast<double>(elapsedMs));
+    char* json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!json) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_set_hdr(request, "Cache-Control", "no-store");
+    const esp_err_t res = httpd_resp_sendstr(request, json);
+    cJSON_free(json);
+    return res;
+}
+
+cJSON* loadNotesArrayLocked() {
+    constexpr char kNotesPath[] = "/dockycam/notes.json";
+    if (!SD_MMC.exists(kNotesPath)) return cJSON_CreateArray();
+    File f = SD_MMC.open(kNotesPath, FILE_READ);
+    if (!f) return cJSON_CreateArray();
+    const size_t sz = f.size();
+    if (sz == 0 || sz > 32768) {
+        f.close();
+        return cJSON_CreateArray();
+    }
+    char* raw = static_cast<char*>(ps_malloc(sz + 1));
+    if (!raw) {
+        f.close();
+        return cJSON_CreateArray();
+    }
+    const size_t got = f.readBytes(raw, sz);
+    f.close();
+    raw[got] = '\0';
+    cJSON* parsed = cJSON_Parse(raw);
+    free(raw);
+    if (!parsed) return cJSON_CreateArray();
+    if (cJSON_IsArray(parsed)) return parsed;
+    cJSON* inner = cJSON_DetachItemFromObjectCaseSensitive(parsed, "notes");
+    cJSON_Delete(parsed);
+    return (inner && cJSON_IsArray(inner)) ? inner : cJSON_CreateArray();
+}
+
+bool saveNotesArrayLocked(cJSON* notesArr) {
+    if (!SD_MMC.exists("/dockycam")) SD_MMC.mkdir("/dockycam");
+    cJSON* wrapper = cJSON_CreateObject();
+    cJSON_AddItemReferenceToObject(wrapper, "notes", notesArr);
+    char* json = cJSON_PrintUnformatted(wrapper);
+    cJSON_Delete(wrapper);
+    if (!json) return false;
+    File f = SD_MMC.open("/dockycam/notes.json", FILE_WRITE);
+    bool ok = false;
+    if (f) {
+        const size_t len = strlen(json);
+        ok = (f.write(reinterpret_cast<const uint8_t*>(json), len) == len);
+        f.flush();
+        f.close();
+    }
+    cJSON_free(json);
+    return ok;
+}
+
+esp_err_t sendNotesResponse(httpd_req_t* request, cJSON* notesArr) {
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddItemToObject(root, "notes", notesArr);
+    char* json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!json) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_set_hdr(request, "Cache-Control", "no-store");
+    const esp_err_t res = httpd_resp_sendstr(request, json);
+    cJSON_free(json);
+    return res;
+}
+
+esp_err_t sendSdNotes(httpd_req_t* request) {
+    if (!sdManager.lockSd(2000)) {
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "SD busy");
+    }
+    cJSON* arr = loadNotesArrayLocked();
+    sdManager.unlockSd();
+    return sendNotesResponse(request, arr);
+}
+
+esp_err_t updateSdNotes(httpd_req_t* request) {
+    if (!isJsonRequest(request) || request->content_len == 0 || request->content_len > 6144) {
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid notes request");
+    }
+    char* body = static_cast<char*>(ps_malloc(request->content_len + 1));
+    if (!body) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+    size_t received = 0;
+    while (received < request->content_len) {
+        const int n = httpd_req_recv(request, body + received, request->content_len - received);
+        if (n <= 0) {
+            free(body);
+            return ESP_FAIL;
+        }
+        received += static_cast<size_t>(n);
+    }
+    body[received] = '\0';
+    cJSON* req = cJSON_Parse(body);
+    free(body);
+    if (!cJSON_IsObject(req)) {
+        cJSON_Delete(req);
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+    }
+
+    const cJSON* actItem = cJSON_GetObjectItemCaseSensitive(req, "action");
+    const char* action = cJSON_IsString(actItem) ? actItem->valuestring : "";
+    const cJSON* idItem = cJSON_GetObjectItemCaseSensitive(req, "id");
+    const cJSON* titleItem = cJSON_GetObjectItemCaseSensitive(req, "title");
+    const cJSON* textItem = cJSON_GetObjectItemCaseSensitive(req, "text");
+
+    if (!sdManager.lockSd(3000)) {
+        cJSON_Delete(req);
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "SD busy");
+    }
+    cJSON* arr = loadNotesArrayLocked();
+    bool changed = false;
+
+    if (strcmp(action, "add") == 0) {
+        const char* titleStr = (cJSON_IsString(titleItem) && titleItem->valuestring) ? titleItem->valuestring : "";
+        const char* textStr = (cJSON_IsString(textItem) && textItem->valuestring) ? textItem->valuestring : "";
+        if (titleStr[0] || textStr[0]) {
+            time_t nowSec = time(nullptr);
+            const double ts = (nowSec > 1700000000) ? static_cast<double>(nowSec) : static_cast<double>(millis() / 1000);
+            static uint32_t seq = 1;
+            const double noteId = static_cast<double>(millis()) * 100.0 + static_cast<double>(seq++ % 100);
+            cJSON* item = cJSON_CreateObject();
+            cJSON_AddNumberToObject(item, "id", noteId);
+            cJSON_AddStringToObject(item, "title", titleStr);
+            cJSON_AddStringToObject(item, "text", textStr);
+            cJSON_AddNumberToObject(item, "ts", ts);
+            cJSON_InsertItemInArray(arr, 0, item);
+            while (cJSON_GetArraySize(arr) > 30) {
+                cJSON_DeleteItemFromArray(arr, cJSON_GetArraySize(arr) - 1);
+            }
+            changed = true;
+        }
+    } else if (strcmp(action, "update") == 0 && cJSON_IsNumber(idItem)) {
+        const double targetId = idItem->valuedouble;
+        const int sz = cJSON_GetArraySize(arr);
+        for (int i = 0; i < sz; ++i) {
+            cJSON* it = cJSON_GetArrayItem(arr, i);
+            const cJSON* curId = cJSON_GetObjectItemCaseSensitive(it, "id");
+            if (cJSON_IsNumber(curId) && fabs(curId->valuedouble - targetId) < 0.5) {
+                if (cJSON_IsString(titleItem) && titleItem->valuestring) {
+                    cJSON_ReplaceItemInObjectCaseSensitive(it, "title", cJSON_CreateString(titleItem->valuestring));
+                }
+                if (cJSON_IsString(textItem) && textItem->valuestring) {
+                    cJSON_ReplaceItemInObjectCaseSensitive(it, "text", cJSON_CreateString(textItem->valuestring));
+                }
+                time_t nowSec = time(nullptr);
+                if (nowSec > 1700000000) {
+                    cJSON_ReplaceItemInObjectCaseSensitive(it, "ts", cJSON_CreateNumber(static_cast<double>(nowSec)));
+                }
+                changed = true;
+                break;
+            }
+        }
+    } else if (strcmp(action, "delete") == 0 && cJSON_IsNumber(idItem)) {
+        const double targetId = idItem->valuedouble;
+        const int sz = cJSON_GetArraySize(arr);
+        for (int i = 0; i < sz; ++i) {
+            const cJSON* it = cJSON_GetArrayItem(arr, i);
+            const cJSON* curId = cJSON_GetObjectItemCaseSensitive(it, "id");
+            if (cJSON_IsNumber(curId) && fabs(curId->valuedouble - targetId) < 0.5) {
+                cJSON_DeleteItemFromArray(arr, i);
+                changed = true;
+                break;
+            }
+        }
+    } else if (strcmp(action, "clear") == 0) {
+        cJSON_Delete(arr);
+        arr = cJSON_CreateArray();
+        changed = true;
+    }
+
+    cJSON_Delete(req);
+    bool saved = true;
+    if (changed) {
+        saved = saveNotesArrayLocked(arr);
+    }
+    sdManager.unlockSd();
+    if (!saved) {
+        cJSON_Delete(arr);
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Could not save notes");
+    }
+    return sendNotesResponse(request, arr);
+}
+
 esp_err_t deleteSdFile(httpd_req_t* request) {
-    char body[160];
+    char body[256];
     if (!readJsonBody(request, body, sizeof(body))) {
         return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid delete request");
     }
@@ -954,6 +1327,10 @@ void updateStatusLed() {
         return;
     }
     const bool blinkOn = ((millis() / 700) % 2) == 0;
+    if (activeTransfers.load() > 0) {
+        setLedRgb(0, blinkOn ? 14 : 4, blinkOn ? 18 : 6); // Soft pulsing cyan: cloud file transfer
+        return;
+    }
     const Status st = getStatus();
     if (st.state == State::Streaming) {
         setLedRgb(0, 8, 18); // Soft blue: live streaming
@@ -1133,6 +1510,9 @@ void setup() {
         {"/sd/snapshot", HTTP_POST, triggerSdSnapshot, nullptr},
         {"/sd/files", HTTP_GET, sendSdFiles, nullptr},
         {"/sd/file", HTTP_GET, sendSdFile, nullptr},
+        {"/sd/upload", HTTP_POST, uploadSdFile, nullptr},
+        {"/sd/notes", HTTP_GET, sendSdNotes, nullptr},
+        {"/sd/notes", HTTP_POST, updateSdNotes, nullptr},
         {"/sd/delete", HTTP_POST, deleteSdFile, nullptr},
     });
     const auto streamServer = startServer(81, 32769, {{"/stream", HTTP_GET, stream, nullptr}});

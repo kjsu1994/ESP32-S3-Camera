@@ -3,6 +3,7 @@ package io.github.kjsu1994.workbenchcam
 import android.net.Network
 import java.io.ByteArrayOutputStream
 import java.io.IOException
+import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
@@ -89,6 +90,13 @@ internal data class SdFileItem(
     val category: String,
     val name: String,
     val sizeBytes: Long
+)
+
+internal data class SharedNote(
+    val id: Long,
+    val title: String,
+    val text: String,
+    val ts: Long
 )
 
 internal fun isAllowedLocalHost(host: String): Boolean {
@@ -324,6 +332,91 @@ internal class BoardApi(private val target: BoardTarget) {
             return connection.readBoardJson(512).optInt("deleted", 0)
         } finally {
             connection.disconnect()
+        }
+    }
+
+    fun uploadSharedFile(
+        filename: String,
+        contentLength: Long,
+        input: InputStream,
+        onProgress: (Long, Long) -> Unit = { _, _ -> }
+    ): SdFileItem {
+        val encName = URLEncoder.encode(filename, "UTF-8").replace("+", "%20")
+        val connection = open("/sd/upload?name=$encName", readTimeoutMs = 30000, connectTimeoutMs = 5000)
+        try {
+            connection.requestMethod = "POST"
+            connection.doOutput = true
+            connection.setFixedLengthStreamingMode(contentLength)
+            connection.setRequestProperty("Content-Type", "application/octet-stream")
+            val buf = ByteArray(16384)
+            var sent = 0L
+            var lastReport = 0L
+            connection.outputStream.use { out ->
+                while (true) {
+                    val n = input.read(buf)
+                    if (n <= 0) break
+                    out.write(buf, 0, n)
+                    sent += n
+                    val now = System.currentTimeMillis()
+                    if (now - lastReport >= 200 || sent >= contentLength) {
+                        lastReport = now
+                        onProgress(sent, contentLength)
+                    }
+                }
+                out.flush()
+            }
+            if (connection.responseCode != 200) throw IOException("Upload failed (HTTP ${connection.responseCode})")
+            val json = connection.readBoardJson(2048)
+            return SdFileItem(
+                category = json.optString("cat", "shared"),
+                name = json.optString("name", filename),
+                sizeBytes = json.optLong("size", sent)
+            )
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    fun listNotes(): List<SharedNote> {
+        val connection = open("/sd/notes", 4000)
+        try {
+            if (connection.responseCode != 200) throw IOException("Notes unavailable")
+            return parseNotes(connection.readBoardJson(65536))
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    fun addNote(title: String, text: String): List<SharedNote> =
+        postNotes(JSONObject().put("action", "add").put("title", title).put("text", text))
+
+    fun updateNote(id: Long, title: String, text: String): List<SharedNote> =
+        postNotes(JSONObject().put("action", "update").put("id", id).put("title", title).put("text", text))
+
+    fun deleteNote(id: Long): List<SharedNote> =
+        postNotes(JSONObject().put("action", "delete").put("id", id))
+
+    private fun postNotes(payload: JSONObject): List<SharedNote> {
+        val connection = open("/sd/notes", 5000)
+        try {
+            connection.post(payload.toString().toByteArray(Charsets.UTF_8))
+            if (connection.responseCode != 200) throw IOException("Notes update failed")
+            return parseNotes(connection.readBoardJson(65536))
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun parseNotes(json: JSONObject): List<SharedNote> {
+        val arr = json.optJSONArray("notes") ?: return emptyList()
+        return List(arr.length()) { idx ->
+            val obj = arr.getJSONObject(idx)
+            SharedNote(
+                id = obj.optLong("id", 0L),
+                title = obj.optString("title", ""),
+                text = obj.optString("text", ""),
+                ts = obj.optLong("ts", 0L)
+            )
         }
     }
 

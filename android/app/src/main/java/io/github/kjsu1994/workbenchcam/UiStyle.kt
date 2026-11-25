@@ -32,6 +32,8 @@ internal object UiStyle {
     const val DANGER_SOFT = 0xff36181A.toInt()
     const val AMBER = 0xffFBBF24.toInt()
     const val AMBER_SOFT = 0xff33270F.toInt()
+    const val CYAN = 0xff38BDF8.toInt()
+    const val CYAN_SOFT = 0xff122B3A.toInt()
     const val OVERLAY = 0xcc090E0C.toInt()
 
     fun dp(context: Context, value: Int): Int = (value * context.resources.displayMetrics.density).toInt()
@@ -315,6 +317,7 @@ internal object UiStyle {
     }
 
     fun categoryMeta(cat: String): Triple<String, Int, Int> = when (cat) {
+        "shared" -> Triple("공유함", CYAN_SOFT, CYAN)
         "blackbox" -> Triple("블랙박스", DANGER_SOFT, DANGER)
         "timelapse" -> Triple("타임랩스", AMBER_SOFT, AMBER)
         "snapshots" -> Triple("스냅샷", ACCENT_SOFT, ACCENT)

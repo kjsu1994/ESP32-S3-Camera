@@ -181,7 +181,6 @@ internal class SettingsScreen(
         // --- Section 2: Home Router (STA) Setup with Nearby Wi-Fi Scanner ---
         staSectionContainer = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
-            visibility = View.GONE
         }
         staSectionContainer.addView(UiStyle.sectionTitle(context, "집 공유기(STA) 연동 · PC 웹 접속").apply {
             setPadding(UiStyle.dp(context, 4), UiStyle.dp(context, 18), 0, UiStyle.dp(context, 8))
@@ -439,9 +438,19 @@ internal class SettingsScreen(
 
     fun setConnected(connected: Boolean) {
         disconnectBtn.visibility = if (connected) View.VISIBLE else View.GONE
-        staSectionContainer.visibility = if (connected) View.VISIBLE else View.GONE
+        staSectionContainer.visibility = View.VISIBLE
         sdSectionContainer.visibility = if (connected) View.VISIBLE else View.GONE
+        staScanBtn.isEnabled = connected
+        staScanBtn.alpha = if (connected) 1f else 0.45f
+        staSaveBtn.isEnabled = connected
+        staSaveBtn.alpha = if (connected) 1f else 0.45f
+        staBackToApBtn.isEnabled = connected
+        staBackToApBtn.alpha = if (connected) 1f else 0.45f
         if (!connected) {
+            staCurrentBadge.text = "미연결"
+            staCurrentBadge.background = UiStyle.rounded(context, UiStyle.SURFACE_ALT, 99)
+            staCurrentBadge.setTextColor(UiStyle.MUTED)
+            staWebUrlText.text = "실시간 탭에서 보드에 연결하면 주변 2.4GHz 공유기 검색과 연동 저장을 할 수 있습니다."
             boardDisconnectedHint.visibility = View.VISIBLE
             boardDisconnectedHint.text = "보드에 연결되면 해상도·회전·절전·상태 LED 설정을 바꿀 수 있습니다."
             boardControlsContainer.visibility = View.GONE
