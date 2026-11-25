@@ -9,6 +9,7 @@
 #include "esp_rom_gpio.h"
 #include "soc/gpio_sig_map.h"
 #include "esp_http_server.h"
+#include "esp_wifi.h"
 #include "lwip/sockets.h"
 #include "lwip/tcp.h"
 #include "board_pins.h"
@@ -48,7 +49,7 @@ uint8_t resolutionIndex(uint8_t options) {
     const uint8_t index = (options & resolutionMask) >> 3;
     return index < sizeof(resolutionKeys) / sizeof(*resolutionKeys) ? index : 0;
 }
-constexpr int xclkHz = 20000000;
+constexpr int xclkHz = 12000000;
 constexpr size_t maxJpegBytes = 256 * 1024;
 constexpr size_t partHeaderCapacity = 96;
 
@@ -158,9 +159,9 @@ bool startCamera(uint8_t options) {
     const uint8_t resolution = resolutionIndex(options);
     config.frame_size = frameSizes[resolution];
     config.jpeg_quality = resolution == static_cast<uint8_t>(Resolution::Hd) ? 16 : 14;
-    config.fb_count = 1;
+    config.fb_count = 2;
     config.fb_location = CAMERA_FB_IN_PSRAM;
-    config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+    config.grab_mode = CAMERA_GRAB_LATEST;
 
     const esp_err_t result = esp_camera_init(&config);
     if (result != ESP_OK) {
@@ -325,12 +326,11 @@ esp_err_t stream(httpd_req_t* request) {
         return httpd_resp_sendstr(request, "Camera initialization failed");
     }
 
-    // Discard the first frame after init so AEC/AWB settle cleanly.
+    // Discard the first frame after init so AEC/AWB and DMA buffers settle cleanly.
     if (camera_fb_t* warmup = esp_camera_fb_get()) {
         esp_camera_fb_return(warmup);
     }
 
-    sensor_t* sensor = esp_camera_sensor_get();
     const int sock = httpd_req_to_sockfd(request);
     const int enable = 1;
     const int keepIdle = 5;
@@ -383,18 +383,15 @@ esp_err_t stream(httpd_req_t* request) {
             "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
             static_cast<unsigned>(jpegLength));
         memcpy(packet + headerLength, frame->buf, jpegLength);
+        // Release the driver buffer immediately so DMA captures into the pair buffer in parallel.
+        esp_camera_fb_return(frame);
         const size_t end = headerLength + jpegLength;
         packet[end] = '\r';
         packet[end + 1] = '\n';
 
-        // Pause OV5640 (SW standby) and keep GDMA idle while Wi-Fi transmits to avoid
-        // RF/power/Core-0 interference that otherwise stalls TCP send to 1-5s per frame.
-        if (sensor && sensor->set_reg) sensor->set_reg(sensor, 0x3008, 0x40, 0x40);
         const uint32_t sendStarted = micros();
         sent = writeStream(request, packet, end + 2);
         const uint32_t sendElapsed = micros() - sendStarted;
-        if (sensor && sensor->set_reg) sensor->set_reg(sensor, 0x3008, 0x40, 0x00);
-        esp_camera_fb_return(frame);
         if (!sent || WiFi.softAPgetStationNum() == 0) {
             ending = Reason::Disconnected;
             break;
@@ -434,6 +431,7 @@ httpd_handle_t startServer(uint16_t port, uint16_t controlPort, std::initializer
     config.send_wait_timeout = 6;
     config.recv_wait_timeout = 2;
     config.stack_size = 8192;
+    config.core_id = 1;
     config.lru_purge_enable = true;
     config.max_open_sockets = 6;
     httpd_handle_t server = nullptr;
@@ -504,10 +502,37 @@ esp_err_t sendTelemetry(httpd_req_t* request) {
     return httpd_resp_sendstr(request, body);
 }
 
+int selectQuietChannel() {
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    const int apCount = WiFi.scanNetworks(false, true);
+    int chCount[14] = {};
+    for (int i = 0; i < apCount; ++i) {
+        const int ch = WiFi.channel(i);
+        if (ch >= 1 && ch <= 13) ++chCount[ch];
+    }
+    WiFi.scanDelete();
+    int bestChannel = 6;
+    int bestScore = 10000;
+    for (const int candidate : {1, 6, 11}) {
+        int score = 0;
+        for (int c = 1; c <= 13; ++c) {
+            const int distance = abs(c - candidate);
+            if (distance == 0) score += chCount[c] * 3;
+            else if (distance <= 2) score += chCount[c];
+        }
+        if (score < bestScore) {
+            bestScore = score;
+            bestChannel = candidate;
+        }
+    }
+    return bestChannel;
+}
+
 }
 
 void setup() {
-    const bool cpuConfigured = setCpuFrequencyMhz(160);
+    const bool cpuConfigured = setCpuFrequencyMhz(240);
     Serial.begin(115200);
     if (!cpuConfigured) Serial.println("[BOOT] CPU frequency unchanged");
     holdCameraClockLow();
@@ -523,13 +548,15 @@ void setup() {
     const IPAddress address(192, 168, 4, 1);
     WiFi.onEvent([](WiFiEvent_t) { Serial.println("[Wi-Fi] Station disconnected"); },
                  ARDUINO_EVENT_WIFI_AP_STADISCONNECTED);
+    const int channel = selectQuietChannel();
     WiFi.mode(WIFI_AP);
     WiFi.setSleep(false);
     if (!WiFi.softAPConfig(address, address, IPAddress(255, 255, 255, 0)) ||
-        !WiFi.softAP(apName, CAMERA_AP_PASSWORD, 1, false, 2)) {
+        !WiFi.softAP(apName, CAMERA_AP_PASSWORD, channel, false, 2)) {
         Serial.println("[Wi-Fi] SoftAP failed");
         return;
     }
+    esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20);
     if (!WiFi.setTxPower(WIFI_POWER_17dBm)) Serial.println("[Wi-Fi] TX power unchanged");
     const auto statusServer = startServer(80, 32768, {
         {"/status", HTTP_GET, sendStatus, nullptr},
@@ -546,7 +573,7 @@ void setup() {
         Serial.println("[Wi-Fi] HTTP server setup failed");
         return;
     }
-    Serial.printf("[Wi-Fi] %s at %s\n", apName, address.toString().c_str());
+    Serial.printf("[Wi-Fi] %s at %s (ch=%d)\n", apName, address.toString().c_str(), channel);
 }
 
 void loop() {
