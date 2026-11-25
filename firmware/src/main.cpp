@@ -376,6 +376,11 @@ esp_err_t stream(httpd_req_t* request) {
     uint8_t consecutiveFailures = 0;
     uint64_t captureUs = 0;
     uint64_t sendUs = 0;
+    uint32_t winStartMs = sessionStarted;
+    uint32_t winFrames = 0;
+    uint64_t winCapUs = 0;
+    uint64_t winSendUs = 0;
+    uint32_t winMaxSendUs = 0;
 
     while (sent && !shouldStop()) {
         const uint32_t started = millis();
@@ -426,6 +431,28 @@ esp_err_t stream(httpd_req_t* request) {
         ++sentFrames;
         captureUs += captureElapsed;
         sendUs += sendElapsed;
+        ++winFrames;
+        winCapUs += captureElapsed;
+        winSendUs += sendElapsed;
+        if (sendElapsed > winMaxSendUs) winMaxSendUs = sendElapsed;
+        const uint32_t winNow = millis();
+        if (winNow - winStartMs >= 5000 && winFrames > 0) {
+            const float winFps = winFrames * 1000.0f / (winNow - winStartMs);
+            Serial.printf("[CAM] Live: fps=%.1f cap=%lums send=%lums max_send=%lums mode=%s ch=%d rssi=%d opts=0x%02x\n",
+                          winFps,
+                          static_cast<unsigned long>(winCapUs / winFrames / 1000),
+                          static_cast<unsigned long>(winSendUs / winFrames / 1000),
+                          static_cast<unsigned long>(winMaxSendUs / 1000),
+                          staModeActive ? "sta" : "ap",
+                          staModeActive ? WiFi.channel() : activeWifiChannel,
+                          staModeActive ? WiFi.RSSI() : 0,
+                          static_cast<unsigned>(options));
+            winStartMs = winNow;
+            winFrames = 0;
+            winCapUs = 0;
+            winSendUs = 0;
+            winMaxSendUs = 0;
+        }
         if (frameIntervalMs > 0) {
             const uint32_t elapsed = millis() - started;
             if (elapsed < frameIntervalMs) delay(frameIntervalMs - elapsed);
@@ -943,13 +970,21 @@ void updateStatusLed() {
 }
 
 int selectQuietChannel() {
+    WiFi.persistent(false);
+    WiFi.setAutoReconnect(false);
     WiFi.mode(WIFI_STA);
-    WiFi.disconnect();
-    const int apCount = WiFi.scanNetworks(false, true);
-    int chCount[14] = {};
+    WiFi.disconnect(false, true);
+    delay(50);
+    const int apCount = WiFi.scanNetworks(false, true, false, 150);
+    int chWeight[14] = {};
     for (int i = 0; i < apCount; ++i) {
         const int ch = WiFi.channel(i);
-        if (ch >= 1 && ch <= 13) ++chCount[ch];
+        if (ch >= 1 && ch <= 13) {
+            int w = WiFi.RSSI(i) + 100;
+            if (w < 5) w = 5;
+            if (w > 60) w = 60;
+            chWeight[ch] += w;
+        }
     }
     if (apCount >= 0) {
         const size_t cached = cacheWifiScanResults(apCount);
@@ -957,19 +992,26 @@ int selectQuietChannel() {
     }
     WiFi.scanDelete();
     int bestChannel = 6;
-    int bestScore = 10000;
+    int bestScore = 1000000;
+    int score6 = 0, score11 = 0, score1 = 0;
     for (const int candidate : {6, 11, 1}) {
         int score = 0;
         for (int c = 1; c <= 13; ++c) {
             const int distance = abs(c - candidate);
-            if (distance == 0) score += chCount[c] * 3;
-            else if (distance <= 2) score += chCount[c];
+            if (distance == 0) score += chWeight[c] * 3;
+            else if (distance == 1) score += chWeight[c] * 2;
+            else if (distance == 2) score += chWeight[c];
         }
+        if (candidate == 6) score6 = score;
+        else if (candidate == 11) score11 = score;
+        else if (candidate == 1) score1 = score;
         if (score < bestScore) {
             bestScore = score;
             bestChannel = candidate;
         }
     }
+    Serial.printf("[Wi-Fi] Channel noise: ch6=%d ch11=%d ch1=%d -> picked ch%d\n",
+                  score6, score11, score1, bestChannel);
     return bestChannel;
 }
 
@@ -1001,9 +1043,13 @@ void setup() {
     }
 
     staModeActive = false;
+    WiFi.persistent(false);
+    WiFi.setAutoReconnect(false);
     if (staEnabled && !staSsid.isEmpty()) {
         Serial.printf("[Wi-Fi] Trying STA '%s' (12s timeout)...\n", staSsid.c_str());
         WiFi.mode(WIFI_STA);
+        esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);
+        esp_wifi_set_ps(WIFI_PS_NONE);
         WiFi.setSleep(false);
         WiFi.setHostname("dockycam");
         WiFi.begin(staSsid.c_str(), staPass.c_str());
@@ -1017,15 +1063,25 @@ void setup() {
         }
         if (WiFi.status() == WL_CONNECTED) {
             staModeActive = true;
+            WiFi.setAutoReconnect(true);
             activeWifiChannel = WiFi.channel();
-            WiFi.setTxPower(WIFI_POWER_17dBm);
-            Serial.printf("[Wi-Fi] STA connected: %s at %s (ch=%d rssi=%d)\n",
+            // Enforce HT20 + zero modem sleep AFTER association so STA never stalls on DTIM beacons.
+            esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);
+            esp_wifi_set_ps(WIFI_PS_NONE);
+            WiFi.setSleep(false);
+            const int rssi = WiFi.RSSI();
+            WiFi.setTxPower(rssi < -62 ? WIFI_POWER_19_5dBm : WIFI_POWER_17dBm);
+            wifi_ps_type_t psType = WIFI_PS_NONE;
+            esp_wifi_get_ps(&psType);
+            Serial.printf("[Wi-Fi] STA connected: %s at %s (ch=%d rssi=%d ps=%d)\n",
                           staSsid.c_str(), WiFi.localIP().toString().c_str(),
-                          activeWifiChannel, WiFi.RSSI());
+                          activeWifiChannel, rssi, static_cast<int>(psType));
         } else {
             Serial.println("[Wi-Fi] STA timeout -> falling back to SoftAP");
-            WiFi.disconnect(true);
-            delay(100);
+            WiFi.setAutoReconnect(false);
+            WiFi.disconnect(true, true);
+            WiFi.mode(WIFI_OFF);
+            delay(200);
         }
     }
 
