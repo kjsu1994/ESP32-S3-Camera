@@ -7,3 +7,5 @@ android/.idea/
 *.jks
 *.keystore
 android/.kotlin/
+
+.idea/
