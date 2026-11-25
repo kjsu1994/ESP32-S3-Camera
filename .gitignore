@@ -1,0 +1,9 @@
+firmware/.pio/
+firmware/include/config.local.h
+android/.gradle/
+android/**/build/
+android/local.properties
+android/.idea/
+*.jks
+*.keystore
+android/.kotlin/
