@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <Preferences.h>
+#include <SD_MMC.h>
 #include <initializer_list>
 #include "cJSON.h"
 #include <WiFi.h>
@@ -13,6 +14,7 @@
 #include "lwip/sockets.h"
 #include "lwip/tcp.h"
 #include "board_pins.h"
+#include "sd_recorder.h"
 
 #if __has_include("config.local.h")
 #include "config.local.h"
@@ -68,6 +70,7 @@ uint8_t boardOptions = 0;
 Preferences preferences;
 bool preferencesReady = false;
 bool powerBusReady = false;
+sdrec::Manager sdManager;
 
 #if CONFIG_SCCB_HARDWARE_I2C_PORT1
 TwoWire& powerBus = Wire;
@@ -316,12 +319,14 @@ esp_err_t stream(httpd_req_t* request) {
     }
 
     const uint32_t sessionStarted = millis();
+    sdManager.pauseForLive();
     setStatus(State::Streaming, Reason::None);
     const uint8_t options = getOptions();
     const uint32_t frameIntervalMs = (options & lowBandwidth) ? 167 : 0;
     if (!startCamera(options)) {
         free(packet);
         setStatus(State::Idle, Reason::Camera);
+        sdManager.resumeAfterLive();
         httpd_resp_set_status(request, "503 Service Unavailable");
         return httpd_resp_sendstr(request, "Camera initialization failed");
     }
@@ -385,6 +390,7 @@ esp_err_t stream(httpd_req_t* request) {
         memcpy(packet + headerLength, frame->buf, jpegLength);
         // Release the driver buffer immediately so DMA captures into the pair buffer in parallel.
         esp_camera_fb_return(frame);
+        sdManager.consumeLiveSnapshot(reinterpret_cast<const uint8_t*>(packet + headerLength), jpegLength);
         const size_t end = headerLength + jpegLength;
         packet[end] = '\r';
         packet[end + 1] = '\n';
@@ -409,6 +415,7 @@ esp_err_t stream(httpd_req_t* request) {
     stopCamera();
     free(packet);
     setStatus(State::Idle, ending);
+    sdManager.resumeAfterLive();
     const uint32_t durationMs = millis() - sessionStarted;
     const float fps = durationMs > 0 ? (sentFrames * 1000.0f / durationMs) : 0.0f;
     Serial.printf("[CAM] Stream ended: %s frames=%lu duration_ms=%lu fps=%.1f\n",
@@ -432,6 +439,7 @@ httpd_handle_t startServer(uint16_t port, uint16_t controlPort, std::initializer
     config.recv_wait_timeout = 2;
     config.stack_size = 8192;
     config.core_id = 1;
+    config.max_uri_handlers = 16;
     config.lru_purge_enable = true;
     config.max_open_sockets = 6;
     httpd_handle_t server = nullptr;
@@ -502,6 +510,235 @@ esp_err_t sendTelemetry(httpd_req_t* request) {
     return httpd_resp_sendstr(request, body);
 }
 
+const char* recordModeName(sdrec::RecordMode mode) {
+    switch (mode) {
+        case sdrec::RecordMode::Blackbox: return "blackbox";
+        case sdrec::RecordMode::Timelapse: return "timelapse";
+        default: return "off";
+    }
+}
+
+bool readJsonBody(httpd_req_t* request, char* out, size_t capacity) {
+    if (!isJsonRequest(request)) return false;
+    const size_t size = request->content_len;
+    if (size == 0 || size >= capacity) return false;
+    size_t received = 0;
+    while (received < size) {
+        const int count = httpd_req_recv(request, out + received, size - received);
+        if (count <= 0) return false;
+        received += count;
+    }
+    if (memchr(out, '\0', received)) return false;
+    out[received] = '\0';
+    return true;
+}
+
+esp_err_t syncBoardTime(httpd_req_t* request) {
+    char body[96];
+    if (!readJsonBody(request, body, sizeof(body))) {
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid time body");
+    }
+    cJSON* root = cJSON_ParseWithOpts(body, nullptr, true);
+    const cJSON* epoch = cJSON_GetObjectItemCaseSensitive(root, "epoch");
+    const bool ok = cJSON_IsObject(root) && cJSON_IsNumber(epoch);
+    const int64_t epochVal = ok ? static_cast<int64_t>(epoch->valuedouble) : 0;
+    cJSON_Delete(root);
+    if (!ok) return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Missing epoch");
+    sdManager.syncTime(epochVal);
+    httpd_resp_set_status(request, "204 No Content");
+    return httpd_resp_send(request, nullptr, 0);
+}
+
+esp_err_t sendSdStatus(httpd_req_t* request) {
+    const sdrec::SdStatus s = sdManager.getStatus();
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "mounted", s.mounted);
+    cJSON_AddNumberToObject(root, "total_mb", s.totalMb);
+    cJSON_AddNumberToObject(root, "used_mb", s.usedMb);
+    cJSON_AddNumberToObject(root, "free_mb", s.freeMb);
+    cJSON_AddStringToObject(root, "mode", recordModeName(s.mode));
+    cJSON_AddBoolToObject(root, "active", s.active);
+    cJSON_AddBoolToObject(root, "paused_for_live", s.pausedForLive);
+    cJSON_AddBoolToObject(root, "auto_start", s.autoStart);
+    cJSON_AddNumberToObject(root, "segment_s", s.segmentSeconds);
+    cJSON_AddNumberToObject(root, "interval_s", s.intervalSeconds);
+    cJSON_AddNumberToObject(root, "frames", s.frames);
+    cJSON_AddNumberToObject(root, "elapsed_s", s.elapsedSeconds);
+    cJSON_AddStringToObject(root, "file", s.currentFile);
+    cJSON_AddStringToObject(root, "error", s.lastError);
+    char* json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!json) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_set_hdr(request, "Cache-Control", "no-store");
+    const esp_err_t res = httpd_resp_sendstr(request, json);
+    cJSON_free(json);
+    return res;
+}
+
+esp_err_t updateSdRecord(httpd_req_t* request) {
+    char body[192];
+    if (!readJsonBody(request, body, sizeof(body))) {
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid record request");
+    }
+    cJSON* root = cJSON_ParseWithOpts(body, nullptr, true);
+    const cJSON* modeItem = cJSON_GetObjectItemCaseSensitive(root, "mode");
+    const cJSON* segItem = cJSON_GetObjectItemCaseSensitive(root, "segment_s");
+    const cJSON* intItem = cJSON_GetObjectItemCaseSensitive(root, "interval_s");
+    const cJSON* autoItem = cJSON_GetObjectItemCaseSensitive(root, "auto_start");
+
+    sdrec::RecordMode mode = sdrec::RecordMode::Off;
+    bool validMode = false;
+    if (cJSON_IsString(modeItem)) {
+        if (strcmp(modeItem->valuestring, "off") == 0) { mode = sdrec::RecordMode::Off; validMode = true; }
+        else if (strcmp(modeItem->valuestring, "blackbox") == 0) { mode = sdrec::RecordMode::Blackbox; validMode = true; }
+        else if (strcmp(modeItem->valuestring, "timelapse") == 0) { mode = sdrec::RecordMode::Timelapse; validMode = true; }
+    }
+    const uint16_t segS = cJSON_IsNumber(segItem) ? static_cast<uint16_t>(segItem->valueint) : 0;
+    const uint16_t intS = cJSON_IsNumber(intItem) ? static_cast<uint16_t>(intItem->valueint) : 0;
+    const int autoOpt = cJSON_IsBool(autoItem) ? (cJSON_IsTrue(autoItem) ? 1 : 0) : -1;
+    cJSON_Delete(root);
+    if (!validMode) {
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid recording mode");
+    }
+    std::string err;
+    if (!sdManager.configureRecording(mode, segS, intS, autoOpt, err)) {
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, err.c_str());
+    }
+    return sendSdStatus(request);
+}
+
+esp_err_t triggerSdSnapshot(httpd_req_t* request) {
+    if (!isJsonRequest(request) || request->content_len != 0) {
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Expected empty application/json");
+    }
+    if (!sdManager.isMounted()) {
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "SD card unavailable");
+    }
+    sdManager.requestSnapshot();
+    httpd_resp_set_status(request, "204 No Content");
+    return httpd_resp_send(request, nullptr, 0);
+}
+
+esp_err_t sendSdFiles(httpd_req_t* request) {
+    char query[64] = "";
+    char cat[16] = "all";
+    if (httpd_req_get_url_query_str(request, query, sizeof(query)) == ESP_OK) {
+        httpd_query_key_value(query, "cat", cat, sizeof(cat));
+    }
+    const auto files = sdManager.listFiles(cat, 60);
+    cJSON* root = cJSON_CreateObject();
+    cJSON* arr = cJSON_AddArrayToObject(root, "files");
+    for (const auto& f : files) {
+        cJSON* item = cJSON_CreateObject();
+        cJSON_AddStringToObject(item, "cat", f.category.c_str());
+        cJSON_AddStringToObject(item, "name", f.name.c_str());
+        cJSON_AddNumberToObject(item, "size", static_cast<double>(f.size));
+        cJSON_AddItemToArray(arr, item);
+    }
+    char* json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!json) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_set_hdr(request, "Cache-Control", "no-store");
+    const esp_err_t res = httpd_resp_sendstr(request, json);
+    cJSON_free(json);
+    return res;
+}
+
+esp_err_t sendSdFile(httpd_req_t* request) {
+    char query[128] = "";
+    char cat[16] = "";
+    char name[64] = "";
+    if (httpd_req_get_url_query_str(request, query, sizeof(query)) != ESP_OK ||
+        httpd_query_key_value(query, "cat", cat, sizeof(cat)) != ESP_OK ||
+        httpd_query_key_value(query, "name", name, sizeof(name)) != ESP_OK ||
+        !sdrec::Manager::isValidCategory(cat) || !sdrec::Manager::isValidName(name)) {
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid file parameter");
+    }
+    std::string path = std::string("/workbenchcam/") + cat + "/" + name;
+    if (!sdManager.lockSd(3000)) {
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "SD busy");
+    }
+    File file = SD_MMC.open(path.c_str(), FILE_READ);
+    if (!file || file.isDirectory()) {
+        if (file) file.close();
+        sdManager.unlockSd();
+        return httpd_resp_send_err(request, HTTPD_404_NOT_FOUND, "File not found");
+    }
+    const size_t totalSize = file.size();
+    const char* ext = strrchr(name, '.');
+    const bool isJpg = ext && strcasecmp(ext, ".jpg") == 0;
+    httpd_resp_set_type(request, isJpg ? "image/jpeg" : "video/x-msvideo");
+    httpd_resp_set_hdr(request, "Cache-Control", "no-store");
+    char lenBuf[24];
+    snprintf(lenBuf, sizeof(lenBuf), "%u", static_cast<unsigned>(totalSize));
+    httpd_resp_set_hdr(request, "X-File-Size", lenBuf);
+
+    constexpr size_t kChunkSize = 8192;
+    char* buf = static_cast<char*>(ps_malloc(kChunkSize));
+    if (!buf) {
+        file.close();
+        sdManager.unlockSd();
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Buffer unavailable");
+    }
+    esp_err_t res = ESP_OK;
+    while (file.available()) {
+        const size_t n = file.readBytes(buf, kChunkSize);
+        if (n == 0) break;
+        sdManager.unlockSd();
+        res = httpd_resp_send_chunk(request, buf, n);
+        if (res != ESP_OK) {
+            if (sdManager.lockSd(2000)) {
+                file.close();
+                sdManager.unlockSd();
+            }
+            free(buf);
+            return res;
+        }
+        if (!sdManager.lockSd(2000)) {
+            free(buf);
+            return ESP_FAIL;
+        }
+    }
+    file.close();
+    sdManager.unlockSd();
+    free(buf);
+    return httpd_resp_send_chunk(request, nullptr, 0);
+}
+
+esp_err_t deleteSdFile(httpd_req_t* request) {
+    char body[160];
+    if (!readJsonBody(request, body, sizeof(body))) {
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid delete request");
+    }
+    cJSON* root = cJSON_ParseWithOpts(body, nullptr, true);
+    const cJSON* catItem = cJSON_GetObjectItemCaseSensitive(root, "cat");
+    const cJSON* nameItem = cJSON_GetObjectItemCaseSensitive(root, "name");
+    const cJSON* allItem = cJSON_GetObjectItemCaseSensitive(root, "all");
+    const bool validCat = cJSON_IsString(catItem) && sdrec::Manager::isValidCategory(catItem->valuestring);
+    const bool clearAll = cJSON_IsTrue(allItem);
+    const bool validName = cJSON_IsString(nameItem) && sdrec::Manager::isValidName(nameItem->valuestring);
+    std::string cat = validCat ? catItem->valuestring : "";
+    std::string name = validName ? nameItem->valuestring : "";
+    cJSON_Delete(root);
+    if (!validCat || (!clearAll && !validName)) {
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid delete target");
+    }
+    if (clearAll) {
+        const int removed = sdManager.clearCategory(cat.c_str());
+        char resp[48];
+        snprintf(resp, sizeof(resp), "{\"deleted\":%d}", removed < 0 ? 0 : removed);
+        httpd_resp_set_type(request, "application/json");
+        return httpd_resp_sendstr(request, resp);
+    }
+    if (!sdManager.deleteFile(cat.c_str(), name.c_str())) {
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "File could not be deleted");
+    }
+    httpd_resp_set_status(request, "204 No Content");
+    return httpd_resp_send(request, nullptr, 0);
+}
+
 int selectQuietChannel() {
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
@@ -537,8 +774,10 @@ void setup() {
     if (!cpuConfigured) Serial.println("[BOOT] CPU frequency unchanged");
     holdCameraClockLow();
     Serial.printf("[BOOT] CPU=%uMHz PSRAM=%u bytes\n", getCpuFrequencyMhz(), ESP.getPsramSize());
+    pinMode(board::bootButton, INPUT_PULLUP);
     preferencesReady = preferences.begin("workbenchcam", false);
     if (preferencesReady) boardOptions = preferences.getUChar("options", 0);
+    sdManager.begin(startCamera, stopCamera, getOptions);
     startPowerMonitor();
     constexpr size_t passwordLength = sizeof(CAMERA_AP_PASSWORD) - 1;
     if (passwordLength < 8 || passwordLength > 63) {
@@ -564,6 +803,13 @@ void setup() {
         {"/settings", HTTP_GET, sendOptions, nullptr},
         {"/settings", HTTP_POST, updateOptions, nullptr},
         {"/stop", HTTP_POST, requestStop, nullptr},
+        {"/time", HTTP_POST, syncBoardTime, nullptr},
+        {"/sd/status", HTTP_GET, sendSdStatus, nullptr},
+        {"/sd/record", HTTP_POST, updateSdRecord, nullptr},
+        {"/sd/snapshot", HTTP_POST, triggerSdSnapshot, nullptr},
+        {"/sd/files", HTTP_GET, sendSdFiles, nullptr},
+        {"/sd/file", HTTP_GET, sendSdFile, nullptr},
+        {"/sd/delete", HTTP_POST, deleteSdFile, nullptr},
     });
     const auto streamServer = startServer(81, 32769, {{"/stream", HTTP_GET, stream, nullptr}});
     if (!statusServer || !streamServer) {
@@ -577,5 +823,13 @@ void setup() {
 }
 
 void loop() {
-    delay(1000);
+    static bool prevPressed = false;
+    static uint32_t lastTriggerMs = 0;
+    const bool pressed = (digitalRead(board::bootButton) == LOW);
+    if (pressed && !prevPressed && (millis() - lastTriggerMs) > 600) {
+        lastTriggerMs = millis();
+        sdManager.requestSnapshot();
+    }
+    prevPressed = pressed;
+    delay(50);
 }

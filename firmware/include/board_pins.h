@@ -10,5 +10,9 @@ constexpr int href = 7;
 constexpr int pclk = 13;
 constexpr int pwdn = -1;
 constexpr int reset = -1;
+constexpr int sdClk = 39;
+constexpr int sdCmd = 38;
+constexpr int sdD0 = 40;
+constexpr int bootButton = 0;
 constexpr int ov5640Pid = 0x5640;
 }
