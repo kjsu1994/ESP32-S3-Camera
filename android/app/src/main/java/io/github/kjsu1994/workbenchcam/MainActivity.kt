@@ -57,6 +57,10 @@ class MainActivity : Activity() {
     private var reconnectAttempted = false
     private var streamRetries = 0
     private var telemetryEnabled = false
+    private var gridEnabled = false
+    private var autoConnectEnabled = false
+    private var autoConnectAttempted = false
+    private var frozen = false
     private var telemetryPending = false
     private var nextTelemetryAt = 0L
     private var telemetryText: String? = null
@@ -84,6 +88,7 @@ class MainActivity : Activity() {
         framePending.set(false)
         val current = preview ?: return@Runnable
         val frame = current.latest.getAndSet(null) ?: return@Runnable
+        if (frozen && displayed != null) return@Runnable
         val first = displayed == null
         displayed = frame
         screen.showFrame(frame.bitmap)
@@ -111,7 +116,7 @@ class MainActivity : Activity() {
             val current = preview
             if (current != null && displayed != null) {
                 val timer = if (current.endsAt == 0L) "" else asClock(remainingSeconds(current.endsAt, now))
-                setStatus("실시간 영상", timer)
+                setStatus(if (frozen) "정지화면" else "실시간 영상", timer)
             } else if (cooldownEndsAt != 0L) {
                 val remaining = remainingSeconds(cooldownEndsAt, now)
                 if (remaining == 0L) {
@@ -139,7 +144,10 @@ class MainActivity : Activity() {
         secrets = ConnectionSecret(this)
         password = secrets.read().orEmpty()
         rememberPassword = password.isNotEmpty()
-        telemetryEnabled = getPreferences(MODE_PRIVATE).getBoolean("board_telemetry", false)
+        val prefs = getPreferences(MODE_PRIVATE)
+        telemetryEnabled = prefs.getBoolean("board_telemetry", false)
+        gridEnabled = prefs.getBoolean("video_grid", false)
+        autoConnectEnabled = prefs.getBoolean("auto_connect", false)
         createScreen(resources.configuration)
     }
 
@@ -170,11 +178,14 @@ class MainActivity : Activity() {
             config = config,
             fullscreen = fullscreen,
             fillVideo = fullscreenFill,
+            gridEnabled = gridEnabled,
             start = ::requestStart,
             stop = ::stopPreview,
             save = ::savePhoto,
             settings = ::showSettingsMenu,
             toggleFullscreen = ::toggleFullscreen,
+            toggleFreeze = ::toggleFreeze,
+            toggleGrid = ::toggleGrid,
             onToggleFill = { fill ->
                 fullscreenFill = fill
                 scheduleOverlayAutoHide()
@@ -193,6 +204,25 @@ class MainActivity : Activity() {
         } else {
             applySystemBars(hidden = false)
         }
+    }
+
+    private fun toggleFreeze() {
+        if (!frozen && (preview == null || displayed == null)) return
+        frozen = !frozen
+        val current = preview
+        val timer = if (current == null || current.endsAt == 0L) "" else asClock(
+            remainingSeconds(current.endsAt, SystemClock.elapsedRealtime())
+        )
+        setStatus(if (frozen) "정지화면" else if (current != null) "실시간 영상" else message, timer)
+        updateControls()
+        scheduleOverlayAutoHide()
+    }
+
+    private fun toggleGrid() {
+        gridEnabled = !gridEnabled
+        getPreferences(MODE_PRIVATE).edit().putBoolean("video_grid", gridEnabled).apply()
+        screen.showGrid(gridEnabled)
+        scheduleOverlayAutoHide()
     }
 
     private fun toggleFullscreen() {
@@ -278,6 +308,11 @@ class MainActivity : Activity() {
         if (previewOnReturn) {
             previewOnReturn = false
             network?.let(::startPreview)
+        } else if (autoConnectEnabled && !autoConnectAttempted && password.isNotEmpty() &&
+            network == null && !waitingForNetwork && preview == null
+        ) {
+            autoConnectAttempted = true
+            requestStart()
         }
         handler.post(refresh)
     }
@@ -345,6 +380,16 @@ class MainActivity : Activity() {
         val choices = mutableListOf<Pair<String, () -> Unit>>()
         network?.let { connected -> choices += "보드 설정" to { showBoardSettings(connected) } }
         choices += "Wi-Fi 설정" to { showSettings(false) }
+        choices += (if (gridEnabled) "그리드·십자선 숨기기" else "그리드·십자선 표시") to ::toggleGrid
+        choices += (if (autoConnectEnabled) "실행 시 자동 연결 끄기" else "실행 시 자동 연결 켜기") to {
+            autoConnectEnabled = !autoConnectEnabled
+            getPreferences(MODE_PRIVATE).edit().putBoolean("auto_connect", autoConnectEnabled).apply()
+            Toast.makeText(
+                this,
+                if (autoConnectEnabled) "앱 실행 시 자동으로 연결합니다" else "자동 연결을 껐습니다",
+                Toast.LENGTH_SHORT
+            ).show()
+        }
         choices += (if (telemetryEnabled) "온도·전력 숨기기" else "온도·전력 표시") to {
             telemetryEnabled = !telemetryEnabled
             getPreferences(MODE_PRIVATE).edit().putBoolean("board_telemetry", telemetryEnabled).apply()
@@ -399,11 +444,12 @@ class MainActivity : Activity() {
                 }
                 sizes.check(sizeIds.getValue(current.resolution))
                 content.addView(sizes)
-                hint.text = "해상도, 전송 속도와 회전은 다음 시청부터 적용됩니다"
+                hint.text = "시청 중 변경을 저장하면 영상에 바로 적용됩니다"
                 save.isEnabled = true
                 save.setOnClickListener {
                     val size = sizeIds.entries.first { it.value == sizes.checkedRadioButtonId }.key
                     val requested = BoardOptions(low.isChecked, rotate.isChecked, size)
+                    val changed = requested != current
                     save.isEnabled = false
                     Thread({
                         val saved = runCatching { settings.setOptions(requested) }.getOrNull() == requested
@@ -411,7 +457,12 @@ class MainActivity : Activity() {
                             if (!dialog.isShowing || isDestroyed) return@runOnUiThread
                             if (saved) {
                                 dialog.dismiss()
-                                Toast.makeText(this, "보드 설정을 저장했습니다", Toast.LENGTH_SHORT).show()
+                                if (changed && preview != null && network == connected) {
+                                    Toast.makeText(this, "설정을 적용하는 중입니다", Toast.LENGTH_SHORT).show()
+                                    restartPreviewForSettings(connected)
+                                } else {
+                                    Toast.makeText(this, "보드 설정을 저장했습니다", Toast.LENGTH_SHORT).show()
+                                }
                             } else {
                                 hint.text = "설정을 저장할 수 없습니다. 연결을 확인하세요"
                                 save.isEnabled = true
@@ -559,6 +610,7 @@ class MainActivity : Activity() {
         handler.removeCallbacks(retryPreview)
         handler.removeCallbacks(renderFrame)
         framePending.set(false)
+        frozen = false
         val session = Preview(available)
         preview = session
         displayed = null
@@ -599,11 +651,42 @@ class MainActivity : Activity() {
         )
     }
 
+    private fun restartPreviewForSettings(connected: Network) {
+        handler.removeCallbacks(retryPreview)
+        handler.removeCallbacks(renderFrame)
+        framePending.set(false)
+        streamRetries = 0
+        frozen = false
+        val session = preview ?: run {
+            startPreview(connected)
+            return
+        }
+        preview = null
+        stoppingPreview = true
+        setStatus("설정 적용 중")
+        updateControls()
+        session.stop(requestStop = true) {
+            runOnUiThread {
+                stoppingPreview = false
+                if (!isDestroyed && visible && network == connected && preview == null) {
+                    handler.postDelayed({
+                        if (!isDestroyed && visible && network == connected && preview == null && !stoppingPreview) {
+                            startPreview(connected)
+                        }
+                    }, 350)
+                } else if (!isDestroyed) {
+                    updateControls()
+                }
+            }
+        }
+    }
+
     private fun stopPreview() {
         handler.removeCallbacks(retryPreview)
         handler.removeCallbacks(renderFrame)
         framePending.set(false)
         streamRetries = 0
+        frozen = false
         val session = preview ?: return
         preview = null
         stoppingPreview = true
@@ -627,6 +710,7 @@ class MainActivity : Activity() {
         handler.removeCallbacks(renderFrame)
         framePending.set(false)
         streamRetries = 0
+        frozen = false
         preview?.stop()
         preview = null
         val listener = callback
@@ -718,7 +802,7 @@ class MainActivity : Activity() {
             }
         }
         screen.showControls(network != null, !waitingForNetwork && !stoppingPreview && preview == null && cooldownEndsAt == 0L,
-            preview != null, displayed != null)
+            preview != null, displayed != null, frozen)
     }
 
     private fun setStatus(label: String, time: String = "") {

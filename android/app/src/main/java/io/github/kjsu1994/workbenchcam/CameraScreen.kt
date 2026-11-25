@@ -15,21 +15,24 @@ import android.view.View.MeasureSpec
 import android.view.WindowInsets
 import android.widget.Button
 import android.widget.FrameLayout
-import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import java.util.Locale
 
 internal class CameraScreen(
     private val context: Context,
     config: Configuration,
     private val fullscreen: Boolean,
     private var fillVideo: Boolean,
+    private var gridEnabled: Boolean,
     start: () -> Unit,
     stop: () -> Unit,
     save: () -> Unit,
     settings: () -> Unit,
     toggleFullscreen: () -> Unit,
+    toggleFreeze: () -> Unit,
+    toggleGrid: () -> Unit,
     onToggleFill: (Boolean) -> Unit,
     onFullscreenVideoTap: () -> Unit
 ) {
@@ -45,15 +48,26 @@ internal class CameraScreen(
     private val title = text("WorkbenchCam", 23f, ink).apply { typeface = Typeface.DEFAULT_BOLD }
     private val status = text("", 15f, ink).apply { accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE }
     private val timer = text("", 15f, accent).apply { typeface = Typeface.MONOSPACE }
+    private val zoomBadge = text("", 13f, accent).apply {
+        typeface = Typeface.MONOSPACE
+        visibility = View.GONE
+        setPadding(dp(10), dp(4), dp(10), dp(4))
+        background = surface(0xcc080d0b.toInt(), border)
+    }
     private val telemetry = text("", 14f, muted).apply {
         visibility = View.GONE
         setPadding(dp(14), dp(8), dp(14), dp(8))
         background = surface(panel)
     }
-    private val image = ImageView(context).apply {
-        scaleType = if (fullscreen && fillVideo) ImageView.ScaleType.CENTER_CROP else ImageView.ScaleType.FIT_CENTER
+    private val image = ZoomableVideoView(
+        context = context,
+        onSingleTap = if (fullscreen) onFullscreenVideoTap else null,
+        onZoomChanged = ::updateZoomBadge
+    ).apply {
         contentDescription = "작업대 카메라 영상"
         visibility = View.INVISIBLE
+        setFillCrop(fullscreen && fillVideo)
+        setShowGrid(gridEnabled)
     }
     private val idle = text("영상 대기 중", 14f, muted).apply {
         gravity = Gravity.CENTER
@@ -62,10 +76,12 @@ internal class CameraScreen(
     private val startButton = button("연결 및 보기", true, start)
     private val stopButton = button("정지", false, stop)
     private val photoButton = button("사진 저장", false, save)
+    private val freezeButton = button("정지화면", false, toggleFreeze)
+    private val gridButton = button(if (gridEnabled) "그리드 끄기" else "그리드", false, toggleGrid)
     private val fullscreenButton = button(if (fullscreen) "나가기" else "전체화면", false, toggleFullscreen)
     private val scaleButton = button(if (fillVideo) "원본 비율" else "화면 채우기", false) {
         fillVideo = !fillVideo
-        image.scaleType = if (fillVideo) ImageView.ScaleType.CENTER_CROP else ImageView.ScaleType.FIT_CENTER
+        image.setFillCrop(fillVideo)
         onToggleFill(fillVideo)
         updateScaleLabel()
     }
@@ -98,6 +114,7 @@ internal class CameraScreen(
                 gravity = Gravity.CENTER_VERTICAL
                 addView(status, LinearLayout.LayoutParams(-2, -2))
                 addView(timer, LinearLayout.LayoutParams(-2, -2).apply { marginStart = dp(10) })
+                addView(zoomBadge, LinearLayout.LayoutParams(-2, -2).apply { marginStart = dp(10) })
             })
             addView(telemetry, LinearLayout.LayoutParams(-2, -2))
         }
@@ -106,6 +123,7 @@ internal class CameraScreen(
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(14), dp(8), dp(10), dp(8))
             addView(statusStack, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(12) })
+            addView(gridButton, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = dp(8) })
             addView(fullscreenButton, LinearLayout.LayoutParams(-2, -2))
         }
         val bottomBar = row().apply {
@@ -113,6 +131,7 @@ internal class CameraScreen(
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(10), dp(8), dp(10), dp(8))
             addView(startButton, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(8) })
+            addView(freezeButton, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(8) })
             addView(scaleButton, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(8) })
             addView(photoButton, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(8) })
             addView(stopButton, LinearLayout.LayoutParams(0, -2, 1f))
@@ -168,6 +187,10 @@ internal class CameraScreen(
             clipToOutline = true
             addView(image, FrameLayout.LayoutParams(-1, -1))
             addView(idle, FrameLayout.LayoutParams(-1, -1))
+            addView(zoomBadge, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.END).apply {
+                topMargin = dp(8)
+                marginEnd = dp(8)
+            })
         }
         val header = row().apply {
             gravity = Gravity.CENTER_VERTICAL
@@ -187,6 +210,7 @@ internal class CameraScreen(
         val actions = if (config.fontScale >= 1.4f && controlsWidth < 350) {
             column().apply {
                 addView(fullscreenButton, LinearLayout.LayoutParams(-1, -2))
+                addAfter(freezeButton, 8)
                 addAfter(photoButton, 8)
                 addAfter(stopButton, 8)
             }
@@ -196,7 +220,10 @@ internal class CameraScreen(
                     addView(photoButton, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(8) })
                     addView(stopButton, LinearLayout.LayoutParams(0, -2, 1f))
                 }, LinearLayout.LayoutParams(-1, -2))
-                addAfter(fullscreenButton, 8)
+                addAfter(row().apply {
+                    addView(freezeButton, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(8) })
+                    addView(fullscreenButton, LinearLayout.LayoutParams(0, -2, 1f))
+                }, 8)
             }
         }
 
@@ -249,11 +276,19 @@ internal class CameraScreen(
         if (value != null && telemetry.text != value) telemetry.text = value
     }
 
-    fun showControls(connected: Boolean, canStart: Boolean, playing: Boolean, hasFrame: Boolean) {
+    fun showGrid(enabled: Boolean) {
+        gridEnabled = enabled
+        image.setShowGrid(enabled)
+        gridButton.text = if (enabled) "그리드 끄기" else "그리드"
+    }
+
+    fun showControls(connected: Boolean, canStart: Boolean, playing: Boolean, hasFrame: Boolean, frozen: Boolean) {
         startButton.text = if (connected) "다시 보기" else "연결 및 보기"
         startButton.isEnabled = canStart
         stopButton.isEnabled = playing
         photoButton.isEnabled = hasFrame
+        freezeButton.text = if (frozen) "실시간 복귀" else "정지화면"
+        freezeButton.isEnabled = (playing && hasFrame) || frozen
         fullscreenButton.isEnabled = fullscreen || playing || hasFrame
         if (fullscreen) {
             startButton.visibility = if (playing) View.GONE else View.VISIBLE
@@ -263,6 +298,15 @@ internal class CameraScreen(
 
     fun showFullscreenOverlay(visible: Boolean) {
         hudOverlay?.visibility = if (visible) View.VISIBLE else View.GONE
+    }
+
+    private fun updateZoomBadge(zoom: Float) {
+        if (zoom > 1.02f) {
+            zoomBadge.text = String.format(Locale.US, "%.1f×", zoom)
+            zoomBadge.visibility = View.VISIBLE
+        } else {
+            zoomBadge.visibility = View.GONE
+        }
     }
 
     private fun updateScaleLabel() {
@@ -289,14 +333,14 @@ internal class CameraScreen(
     private fun button(label: String, primary: Boolean, action: () -> Unit) = Button(context).apply {
         text = label
         isAllCaps = false
-        textSize = 15f
+        textSize = if (fullscreen) 14f else 15f
         typeface = Typeface.DEFAULT_BOLD
         minWidth = 0
         minimumWidth = 0
         minHeight = dp(if (fullscreen) 44 else 52)
         minimumHeight = dp(if (fullscreen) 44 else 52)
         stateListAnimator = null
-        setPadding(dp(12), dp(8), dp(12), dp(8))
+        setPadding(dp(if (fullscreen) 8 else 12), dp(8), dp(if (fullscreen) 8 else 12), dp(8))
         val enabled = intArrayOf(android.R.attr.state_enabled)
         val states = arrayOf(enabled, intArrayOf())
         val activeColor = if (primary) accent else panel
