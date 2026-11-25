@@ -10,7 +10,8 @@ import org.json.JSONObject
 internal enum class VideoResolution(val key: String, val label: String) {
     QVGA("qvga", "320 × 240"),
     VGA("vga", "640 × 480"),
-    SVGA("svga", "800 × 600")
+    SVGA("svga", "800 × 600"),
+    HD("hd", "1280 × 720")
 }
 
 internal data class BoardTelemetry(val chipTempC: Double?, val powerMw: Int?)
@@ -72,7 +73,7 @@ internal class BoardApi(private val network: Network) {
             if (connection.responseCode != 200) throw IOException("Board settings unavailable")
             val json = connection.readBoardJson()
             return BoardOptions(json.getBoolean("low_bandwidth"), json.getBoolean("rotate_180"),
-                VideoResolution.entries.firstOrNull { it.key == json.optString("resolution") } ?: VideoResolution.QVGA)
+                VideoResolution.entries.firstOrNull { it.key == json.optString("resolution") } ?: VideoResolution.VGA)
         } finally {
             connection.disconnect()
         }

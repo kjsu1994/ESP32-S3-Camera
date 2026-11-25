@@ -19,7 +19,7 @@ internal class Preview(network: Network) {
     @Volatile private var stopped = false
     private var active: HttpURLConnection? = null
 
-    fun start(onEnd: (Result) -> Unit) {
+    fun start(onFrame: () -> Unit, onEnd: (Result) -> Unit) {
         Thread({
             var result: Result? = null
             var cleanEnd = false
@@ -49,6 +49,7 @@ internal class Preview(network: Network) {
                                 }
                                 val bitmap = decode(jpeg) ?: continue
                                 latest.set(Frame(jpeg, bitmap))
+                                onFrame()
                             }
                         }
                     }
@@ -86,9 +87,9 @@ internal class Preview(network: Network) {
     }
 
     @Synchronized
-    private fun open(path: String): HttpURLConnection {
+    private fun open(path: String, readTimeoutMs: Int = 6000): HttpURLConnection {
         if (stopped) throw IOException("Preview stopped")
-        val connection = board.open(path)
+        val connection = board.open(path, readTimeoutMs)
         active = connection
         return connection
     }
@@ -102,7 +103,7 @@ internal class Preview(network: Network) {
 
     private fun readStatus(): Result? {
         return try {
-            val status = open("/status")
+            val status = open("/status", 2000)
             try {
                 if (status.responseCode != 200) throw IOException("Unavailable status")
                 val json = status.readBoardJson()
@@ -121,7 +122,7 @@ internal class Preview(network: Network) {
     private fun decode(jpeg: ByteArray): Bitmap? {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, bounds)
-        if (bounds.outWidth !in 1..800 || bounds.outHeight !in 1..600) return null
+        if (bounds.outWidth !in 1..1280 || bounds.outHeight !in 1..720) return null
         return BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)
     }
 }

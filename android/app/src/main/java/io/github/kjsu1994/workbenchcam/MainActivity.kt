@@ -27,6 +27,7 @@ import android.widget.RadioButton
 import android.widget.RadioGroup
 import android.widget.RadioGroup.LayoutParams
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
@@ -46,6 +47,7 @@ class MainActivity : Activity() {
     private var visible = false
     private var previewOnReturn = false
     private var reconnectAttempted = false
+    private var streamRetries = 0
     private var telemetryEnabled = false
     private var telemetryPending = false
     private var nextTelemetryAt = 0L
@@ -53,7 +55,28 @@ class MainActivity : Activity() {
     private var cooldownEndsAt = 0L
     private var message = "보드 Wi-Fi에 연결하세요"
     private var countdown = ""
+    private val framePending = AtomicBoolean(false)
     private val handler = Handler(Looper.getMainLooper())
+    private val retryPreview = Runnable {
+        if (visible && preview == null && !stoppingPreview) {
+            network?.let(::startPreview)
+        }
+    }
+    private val renderFrame = Runnable {
+        framePending.set(false)
+        val current = preview ?: return@Runnable
+        val frame = current.latest.getAndSet(null) ?: return@Runnable
+        val first = displayed == null
+        displayed = frame
+        screen.showFrame(frame.bitmap)
+        if (first) {
+            reconnectAttempted = false
+            streamRetries = 0
+            updateControls()
+        }
+        val timer = if (current.endsAt == 0L) "" else asClock(remainingSeconds(current.endsAt, SystemClock.elapsedRealtime()))
+        setStatus("실시간 영상", timer)
+    }
     private val pauseInBackground = Runnable {
         if (!visible && preview != null) {
             stopPreview()
@@ -68,12 +91,6 @@ class MainActivity : Activity() {
                 network?.let { refreshTelemetry(it, now) }
             }
             val current = preview
-            current?.latest?.getAndSet(null)?.let { frame ->
-                val first = displayed == null
-                displayed = frame
-                screen.showFrame(frame.bitmap)
-                if (first) updateControls()
-            }
             if (current != null && displayed != null) {
                 val timer = if (current.endsAt == 0L) "" else asClock(remainingSeconds(current.endsAt, now))
                 setStatus("실시간 영상", timer)
@@ -87,7 +104,7 @@ class MainActivity : Activity() {
                     setStatus(message, asClock(remaining))
                 }
             }
-            handler.postDelayed(this, if (preview != null) 50 else 500)
+            handler.postDelayed(this, 500)
         }
     }
 
@@ -130,6 +147,7 @@ class MainActivity : Activity() {
     override fun onStop() {
         visible = false
         handler.removeCallbacks(refresh)
+        handler.removeCallbacks(retryPreview)
         if (isFinishing) {
             releaseNetwork()
         } else {
@@ -140,12 +158,16 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         handler.removeCallbacks(pauseInBackground)
+        handler.removeCallbacks(retryPreview)
+        handler.removeCallbacks(renderFrame)
         releaseNetwork()
         super.onDestroy()
     }
 
     private fun requestStart() {
         reconnectAttempted = false
+        streamRetries = 0
+        handler.removeCallbacks(retryPreview)
         network?.let {
             startPreview(it)
             return
@@ -391,30 +413,54 @@ class MainActivity : Activity() {
     }
 
     private fun startPreview(available: Network) {
+        handler.removeCallbacks(retryPreview)
+        handler.removeCallbacks(renderFrame)
+        framePending.set(false)
         val session = Preview(available)
         preview = session
         displayed = null
         screen.showFrame(null)
         setStatus("카메라 시작 중")
         updateControls()
-        session.start { result ->
-            runOnUiThread {
-                if (preview !== session) return@runOnUiThread
-                preview = null
-                val reason = when (result.reason) {
-                    "limit" -> "시청 시간이 끝났습니다"
-                    "camera" -> "카메라 오류"
-                    "cooldown" -> "카메라 냉각 중"
-                    "stopped" -> "시청을 중지했습니다"
-                    "stream_ended" -> "영상이 종료됐습니다"
-                    else -> "영상 수신이 중단됐습니다"
+        session.start(
+            onFrame = {
+                if (framePending.compareAndSet(false, true)) {
+                    handler.post(renderFrame)
                 }
-                setCooldown(reason, result.cooldownSeconds)
+            },
+            onEnd = { result ->
+                runOnUiThread {
+                    if (preview !== session) return@runOnUiThread
+                    preview = null
+                    handler.removeCallbacks(renderFrame)
+                    framePending.set(false)
+                    val retryable = result.reason in setOf("transport", "disconnected", "stream_ended", "camera")
+                    if (visible && network == available && !stoppingPreview && retryable && streamRetries < 3) {
+                        streamRetries += 1
+                        setStatus("영상에 다시 연결하는 중입니다 ($streamRetries/3)")
+                        updateControls()
+                        handler.postDelayed(retryPreview, 800)
+                        return@runOnUiThread
+                    }
+                    val reason = when (result.reason) {
+                        "limit" -> "시청 시간이 끝났습니다"
+                        "camera" -> "카메라 오류"
+                        "cooldown" -> "카메라 냉각 중"
+                        "stopped" -> "시청을 중지했습니다"
+                        "stream_ended" -> "영상이 종료됐습니다"
+                        else -> "영상 수신이 중단됐습니다"
+                    }
+                    setCooldown(reason, result.cooldownSeconds)
+                }
             }
-        }
+        )
     }
 
     private fun stopPreview() {
+        handler.removeCallbacks(retryPreview)
+        handler.removeCallbacks(renderFrame)
+        framePending.set(false)
+        streamRetries = 0
         val session = preview ?: return
         preview = null
         stoppingPreview = true
@@ -434,6 +480,10 @@ class MainActivity : Activity() {
     }
 
     private fun releaseNetwork() {
+        handler.removeCallbacks(retryPreview)
+        handler.removeCallbacks(renderFrame)
+        framePending.set(false)
+        streamRetries = 0
         preview?.stop()
         preview = null
         val listener = callback

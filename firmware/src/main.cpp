@@ -10,6 +10,7 @@
 #include "soc/gpio_sig_map.h"
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
+#include "lwip/tcp.h"
 #include "board_pins.h"
 
 #if __has_include("config.local.h")
@@ -39,9 +40,9 @@ constexpr uint8_t ina219Address = 0x40;
 static_assert(POWER_SHUNT_MILLIOHMS >= 1 && POWER_SHUNT_MILLIOHMS <= 1000,
               "Set the INA219 shunt resistance in milliohms");
 
-enum class Resolution : uint8_t { Vga, Qvga, Svga };
-constexpr const char* resolutionKeys[] = {"vga", "qvga", "svga"};
-constexpr framesize_t frameSizes[] = {FRAMESIZE_VGA, FRAMESIZE_QVGA, FRAMESIZE_SVGA};
+enum class Resolution : uint8_t { Vga, Qvga, Svga, Hd };
+constexpr const char* resolutionKeys[] = {"vga", "qvga", "svga", "hd"};
+constexpr framesize_t frameSizes[] = {FRAMESIZE_VGA, FRAMESIZE_QVGA, FRAMESIZE_SVGA, FRAMESIZE_HD};
 
 uint8_t resolutionIndex(uint8_t options) {
     const uint8_t index = (options & resolutionMask) >> 3;
@@ -156,10 +157,10 @@ bool startCamera(uint8_t options) {
     config.pixel_format = PIXFORMAT_JPEG;
     const uint8_t resolution = resolutionIndex(options);
     config.frame_size = frameSizes[resolution];
-    config.jpeg_quality = resolution == static_cast<uint8_t>(Resolution::Svga) ? 16 : 14;
-    config.fb_count = 1;
+    config.jpeg_quality = resolution == static_cast<uint8_t>(Resolution::Hd) ? 14 : 12;
+    config.fb_count = 2;
     config.fb_location = CAMERA_FB_IN_PSRAM;
-    config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+    config.grab_mode = CAMERA_GRAB_LATEST;
 
     const esp_err_t result = esp_camera_init(&config);
     if (result != ESP_OK) {
@@ -314,8 +315,7 @@ esp_err_t stream(httpd_req_t* request) {
     const uint32_t sessionStarted = millis();
     setStatus(State::Streaming, Reason::None);
     const uint8_t options = getOptions();
-    const bool highResolution = resolutionIndex(options) == static_cast<uint8_t>(Resolution::Svga);
-    const uint32_t frameIntervalMs = (options & lowBandwidth) ? 167 : highResolution ? 100 : 84;
+    const uint32_t frameIntervalMs = (options & lowBandwidth) ? 167 : 0;
     if (!startCamera(options)) {
         free(packet);
         setStatus(State::Idle, Reason::Camera);
@@ -323,8 +323,21 @@ esp_err_t stream(httpd_req_t* request) {
         return httpd_resp_sendstr(request, "Camera initialization failed");
     }
 
-    const int disableNagle = 1;
-    setsockopt(httpd_req_to_sockfd(request), IPPROTO_TCP, TCP_NODELAY, &disableNagle, sizeof(disableNagle));
+    // Discard the first frame after init so AEC/AWB and DMA buffers settle cleanly.
+    if (camera_fb_t* warmup = esp_camera_fb_get()) {
+        esp_camera_fb_return(warmup);
+    }
+
+    const int sock = httpd_req_to_sockfd(request);
+    const int enable = 1;
+    const int keepIdle = 3;
+    const int keepInterval = 1;
+    const int keepCount = 2;
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &enable, sizeof(enable));
+    setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &enable, sizeof(enable));
+    setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE, &keepIdle, sizeof(keepIdle));
+    setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &keepInterval, sizeof(keepInterval));
+    setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, &keepCount, sizeof(keepCount));
     constexpr char response[] =
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
@@ -332,6 +345,7 @@ esp_err_t stream(httpd_req_t* request) {
     bool sent = writeStream(request, response, sizeof(response) - 1);
     Reason ending = Reason::Disconnected;
     uint32_t sentFrames = 0;
+    uint8_t consecutiveFailures = 0;
     uint64_t captureUs = 0;
     uint64_t sendUs = 0;
 
@@ -341,24 +355,32 @@ esp_err_t stream(httpd_req_t* request) {
         camera_fb_t* frame = esp_camera_fb_get();
         const uint32_t captureElapsed = micros() - captureStarted;
         if (!frame) {
-            ending = Reason::Camera;
-            break;
+            if (++consecutiveFailures >= 5) {
+                ending = Reason::Camera;
+                break;
+            }
+            delay(10);
+            continue;
         }
         if (shouldStop()) {
             esp_camera_fb_return(frame);
             break;
         }
         const size_t jpegLength = frame->len;
-        if (jpegLength > maxJpegBytes) {
+        if (jpegLength < 4 || jpegLength > maxJpegBytes) {
             esp_camera_fb_return(frame);
-            ending = Reason::Camera;
-            break;
+            if (++consecutiveFailures >= 5) {
+                ending = Reason::Camera;
+                break;
+            }
+            continue;
         }
+        consecutiveFailures = 0;
         const int headerLength = snprintf(packet, partHeaderCapacity,
             "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
             static_cast<unsigned>(jpegLength));
         memcpy(packet + headerLength, frame->buf, jpegLength);
-        // Let the camera fill its single driver buffer while TCP transmits the copied frame.
+        // Release the driver buffer right away so DMA continues capturing into the pair buffer.
         esp_camera_fb_return(frame);
         const size_t end = headerLength + jpegLength;
         packet[end] = '\r';
@@ -373,17 +395,21 @@ esp_err_t stream(httpd_req_t* request) {
         ++sentFrames;
         captureUs += captureElapsed;
         sendUs += micros() - sendStarted;
-        const uint32_t elapsed = millis() - started;
-        if (elapsed < frameIntervalMs) delay(frameIntervalMs - elapsed);
+        if (frameIntervalMs > 0) {
+            const uint32_t elapsed = millis() - started;
+            if (elapsed < frameIntervalMs) delay(frameIntervalMs - elapsed);
+        }
     }
 
     if (shouldStop()) ending = Reason::Stopped;
     stopCamera();
     free(packet);
     setStatus(State::Idle, ending);
-    Serial.printf("[CAM] Stream ended: %s frames=%lu duration_ms=%lu\n",
+    const uint32_t durationMs = millis() - sessionStarted;
+    const float fps = durationMs > 0 ? (sentFrames * 1000.0f / durationMs) : 0.0f;
+    Serial.printf("[CAM] Stream ended: %s frames=%lu duration_ms=%lu fps=%.1f\n",
                   reasonName(ending), static_cast<unsigned long>(sentFrames),
-                  static_cast<unsigned long>(millis() - sessionStarted));
+                  static_cast<unsigned long>(durationMs), fps);
     if (sentFrames) {
         Serial.printf("[CAM] Avg capture=%lu ms, TCP send=%lu ms\n",
                       static_cast<unsigned long>(captureUs / sentFrames / 1000),
@@ -401,6 +427,8 @@ httpd_handle_t startServer(uint16_t port, uint16_t controlPort, std::initializer
     config.send_wait_timeout = 4;
     config.recv_wait_timeout = 2;
     config.stack_size = 8192;
+    config.lru_purge_enable = true;
+    config.max_open_sockets = 6;
     httpd_handle_t server = nullptr;
 
     if (httpd_start(&server, &config) != ESP_OK) {
@@ -472,11 +500,11 @@ esp_err_t sendTelemetry(httpd_req_t* request) {
 }
 
 void setup() {
-    const bool cpuConfigured = setCpuFrequencyMhz(160);
+    const bool cpuConfigured = setCpuFrequencyMhz(240);
     Serial.begin(115200);
     if (!cpuConfigured) Serial.println("[BOOT] CPU frequency unchanged");
     holdCameraClockLow();
-    Serial.printf("[BOOT] PSRAM=%u bytes\n", ESP.getPsramSize());
+    Serial.printf("[BOOT] CPU=%uMHz PSRAM=%u bytes\n", getCpuFrequencyMhz(), ESP.getPsramSize());
     preferencesReady = preferences.begin("workbenchcam", false);
     if (preferencesReady) boardOptions = preferences.getUChar("options", 0);
     startPowerMonitor();
@@ -489,8 +517,9 @@ void setup() {
     WiFi.onEvent([](WiFiEvent_t) { Serial.println("[Wi-Fi] Station disconnected"); },
                  ARDUINO_EVENT_WIFI_AP_STADISCONNECTED);
     WiFi.mode(WIFI_AP);
+    WiFi.setSleep(false);
     if (!WiFi.softAPConfig(address, address, IPAddress(255, 255, 255, 0)) ||
-        !WiFi.softAP(apName, CAMERA_AP_PASSWORD, 1, false, 1)) {
+        !WiFi.softAP(apName, CAMERA_AP_PASSWORD, 1, false, 2)) {
         Serial.println("[Wi-Fi] SoftAP failed");
         return;
     }
