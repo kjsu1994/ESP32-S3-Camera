@@ -59,7 +59,9 @@ internal data class WifiStatus(
     val channel: Int,
     val staEnabled: Boolean,
     val staSsid: String,
-    val ledEnabled: Boolean
+    val ledEnabled: Boolean,
+    val fwVersion: String = "",
+    val uptimeSeconds: Long = 0L
 )
 
 internal data class ScannedWifi(
@@ -182,7 +184,9 @@ internal class BoardApi(private val target: BoardTarget) {
                 channel = json.optInt("channel", 6),
                 staEnabled = json.optBoolean("sta_enabled", false),
                 staSsid = json.optString("sta_ssid", ""),
-                ledEnabled = json.optBoolean("led_enabled", true)
+                ledEnabled = json.optBoolean("led_enabled", true),
+                fwVersion = json.optString("fw_version", ""),
+                uptimeSeconds = json.optLong("uptime_s", 0L)
             )
         } finally {
             connection.disconnect()

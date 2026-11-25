@@ -467,8 +467,9 @@ internal class SettingsScreen(
         staCurrentBadge.text = if (isSta) "공유기 연결 · ${status.ssid}" else "직결 AP · ${status.ssid}"
         staCurrentBadge.background = UiStyle.rounded(context, if (isSta) UiStyle.ACCENT_SOFT else UiStyle.SURFACE_ALT, 99)
         staCurrentBadge.setTextColor(if (isSta) UiStyle.ACCENT else UiStyle.SECONDARY)
+        val fwTag = if (status.fwVersion.isNotEmpty()) "  ·  FW v${status.fwVersion}" else ""
         staWebUrlText.text = "PC 웹 파일매니저: http://${status.host}/  또는  http://${status.ip}/" +
-            if (isSta) "  (신호 ${status.rssi} dBm · ch${status.channel})" else "  (ch${status.channel})"
+            (if (isSta) "  (신호 ${status.rssi} dBm · ch${status.channel})" else "  (ch${status.channel})") + fwTag
         if (staSsidField.text.isEmpty() && status.staSsid.isNotEmpty()) {
             staSsidField.setText(status.staSsid)
         }

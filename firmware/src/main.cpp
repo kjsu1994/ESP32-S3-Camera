@@ -2,6 +2,7 @@
 #include <ESPmDNS.h>
 #include <Preferences.h>
 #include <SD_MMC.h>
+#include <Update.h>
 #include <atomic>
 #include <initializer_list>
 #include <map>
@@ -38,6 +39,7 @@
 
 namespace {
 constexpr char apName[] = "DockyCam";
+constexpr char kFirmwareVersion[] = "0.3.2";
 constexpr uint8_t lowBandwidth = 1 << 0;
 constexpr uint8_t rotate180 = 1 << 1;
 // Retain the v0.1.0 settings round-trip for installed clients.
@@ -378,6 +380,7 @@ esp_err_t stream(httpd_req_t* request) {
     constexpr char response[] =
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
         "Cache-Control: no-store\r\nConnection: close\r\n\r\n";
     bool sent = writeStream(request, response, sizeof(response) - 1);
     Reason ending = Reason::Disconnected;
@@ -500,7 +503,7 @@ httpd_handle_t startServer(uint16_t port, uint16_t controlPort, std::initializer
     config.recv_wait_timeout = (port == 80) ? 10 : 2;
     config.stack_size = 8192;
     config.core_id = 1;
-    config.max_uri_handlers = 24;
+    config.max_uri_handlers = 32;
     config.lru_purge_enable = true;
     config.max_open_sockets = 6;
     httpd_handle_t server = nullptr;
@@ -681,20 +684,63 @@ esp_err_t triggerSdSnapshot(httpd_req_t* request) {
     return httpd_resp_send(request, nullptr, 0);
 }
 
+int hexVal(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+void urlDecode(const char* in, char* out, size_t outSize) {
+    if (!outSize) return;
+    size_t w = 0;
+    for (size_t r = 0; in[r] && w + 1 < outSize; ++r) {
+        if (in[r] == '%' && in[r + 1] && in[r + 2]) {
+            const int hi = hexVal(in[r + 1]);
+            const int lo = hexVal(in[r + 2]);
+            if (hi >= 0 && lo >= 0) {
+                out[w++] = static_cast<char>((hi << 4) | lo);
+                r += 2;
+                continue;
+            }
+        } else if (in[r] == '+') {
+            out[w++] = ' ';
+            continue;
+        }
+        out[w++] = in[r];
+    }
+    out[w] = '\0';
+}
+
 esp_err_t sendSdFiles(httpd_req_t* request) {
-    char query[64] = "";
+    char query[320] = "";
     char cat[16] = "all";
+    char rawDir[220] = "";
+    char dir[128] = "";
     if (httpd_req_get_url_query_str(request, query, sizeof(query)) == ESP_OK) {
         httpd_query_key_value(query, "cat", cat, sizeof(cat));
+        if (httpd_query_key_value(query, "dir", rawDir, sizeof(rawDir)) == ESP_OK) {
+            urlDecode(rawDir, dir, sizeof(dir));
+        }
     }
-    const auto files = sdManager.listFiles(cat, 60);
+    if (!sdrec::Manager::isValidSubdir(dir)) {
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid dir");
+    }
+    std::vector<std::string> dirs;
+    const auto files = sdManager.listFiles(cat, 120, dir, &dirs);
     cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "dir", dir);
+    cJSON* dArr = cJSON_AddArrayToObject(root, "dirs");
+    for (const auto& d : dirs) {
+        cJSON_AddItemToArray(dArr, cJSON_CreateString(d.c_str()));
+    }
     cJSON* arr = cJSON_AddArrayToObject(root, "files");
     for (const auto& f : files) {
         cJSON* item = cJSON_CreateObject();
         cJSON_AddStringToObject(item, "cat", f.category.c_str());
         cJSON_AddStringToObject(item, "name", f.name.c_str());
         cJSON_AddNumberToObject(item, "size", static_cast<double>(f.size));
+        cJSON_AddNumberToObject(item, "mtime", static_cast<double>(f.mtime));
         cJSON_AddItemToArray(arr, item);
     }
     char* json = cJSON_PrintUnformatted(root);
@@ -733,34 +779,6 @@ struct TransferGuard {
     }
 };
 
-int hexVal(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-}
-
-void urlDecode(const char* in, char* out, size_t outSize) {
-    if (!outSize) return;
-    size_t w = 0;
-    for (size_t r = 0; in[r] && w + 1 < outSize; ++r) {
-        if (in[r] == '%' && in[r + 1] && in[r + 2]) {
-            const int hi = hexVal(in[r + 1]);
-            const int lo = hexVal(in[r + 2]);
-            if (hi >= 0 && lo >= 0) {
-                out[w++] = static_cast<char>((hi << 4) | lo);
-                r += 2;
-                continue;
-            }
-        } else if (in[r] == '+') {
-            out[w++] = ' ';
-            continue;
-        }
-        out[w++] = in[r];
-    }
-    out[w] = '\0';
-}
-
 const char* mimeForFilename(const char* name) {
     const char* ext = strrchr(name, '.');
     if (!ext) return "application/octet-stream";
@@ -780,17 +798,23 @@ const char* mimeForFilename(const char* name) {
 }
 
 esp_err_t sendSdFile(httpd_req_t* request) {
-    char query[320] = "";
+    char query[512] = "";
     char cat[16] = "";
     char rawName[256] = "";
     char name[128] = "";
+    char rawDir[220] = "";
+    char dir[128] = "";
     if (httpd_req_get_url_query_str(request, query, sizeof(query)) != ESP_OK ||
         httpd_query_key_value(query, "cat", cat, sizeof(cat)) != ESP_OK ||
         httpd_query_key_value(query, "name", rawName, sizeof(rawName)) != ESP_OK) {
         return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid file parameter");
     }
+    if (httpd_query_key_value(query, "dir", rawDir, sizeof(rawDir)) == ESP_OK) {
+        urlDecode(rawDir, dir, sizeof(dir));
+    }
     urlDecode(rawName, name, sizeof(name));
-    if (!sdrec::Manager::isValidCategory(cat) || !sdrec::Manager::isValidName(name)) {
+    if (!sdrec::Manager::isValidCategory(cat) || !sdrec::Manager::isValidSubdir(dir) ||
+        !sdrec::Manager::isValidName(name)) {
         return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid file parameter");
     }
     // Pause live stream & SD recording so file download runs at full Wi-Fi/SD speed.
@@ -800,7 +824,7 @@ esp_err_t sendSdFile(httpd_req_t* request) {
     const int nodelay = 1;
     setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
-    std::string path = std::string("/dockycam/") + cat + "/" + name;
+    std::string path = sdrec::Manager::buildCategoryPath(cat, dir, name);
     if (!sdManager.lockSd(3000)) {
         return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "SD busy");
     }
@@ -850,16 +874,21 @@ esp_err_t sendSdFile(httpd_req_t* request) {
 }
 
 esp_err_t uploadSdFile(httpd_req_t* request) {
-    char query[320] = "";
+    char query[512] = "";
     char rawName[256] = "";
     char decodedName[128] = "";
+    char rawDir[220] = "";
+    char dir[128] = "";
     if (httpd_req_get_url_query_str(request, query, sizeof(query)) != ESP_OK ||
         httpd_query_key_value(query, "name", rawName, sizeof(rawName)) != ESP_OK) {
         return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Missing filename");
     }
+    if (httpd_query_key_value(query, "dir", rawDir, sizeof(rawDir)) == ESP_OK) {
+        urlDecode(rawDir, dir, sizeof(dir));
+    }
     urlDecode(rawName, decodedName, sizeof(decodedName));
     const std::string safeName = sdrec::Manager::sanitizeSharedName(decodedName);
-    if (!sdrec::Manager::isValidName(safeName.c_str())) {
+    if (!sdrec::Manager::isValidSubdir(dir) || !sdrec::Manager::isValidName(safeName.c_str())) {
         return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid filename");
     }
     const size_t totalLen = request->content_len;
@@ -880,7 +909,8 @@ esp_err_t uploadSdFile(httpd_req_t* request) {
         return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Buffer unavailable");
     }
 
-    const std::string path = std::string("/dockycam/shared/") + safeName;
+    const std::string targetDir = sdrec::Manager::buildCategoryPath("shared", dir);
+    const std::string path = sdrec::Manager::buildCategoryPath("shared", dir, safeName.c_str());
     if (!sdManager.lockSd(3000)) {
         free(buf);
         return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "SD busy");
@@ -895,6 +925,11 @@ esp_err_t uploadSdFile(httpd_req_t* request) {
     }
     if (!SD_MMC.exists("/dockycam")) SD_MMC.mkdir("/dockycam");
     if (!SD_MMC.exists("/dockycam/shared")) SD_MMC.mkdir("/dockycam/shared");
+    if (dir[0] && !SD_MMC.exists(targetDir.c_str())) {
+        sdManager.unlockSd();
+        free(buf);
+        return httpd_resp_send_err(request, HTTPD_404_NOT_FOUND, "Target folder missing");
+    }
     File file = SD_MMC.open(path.c_str(), FILE_WRITE);
     if (!file) {
         sdManager.unlockSd();
@@ -1135,22 +1170,180 @@ esp_err_t updateSdNotes(httpd_req_t* request) {
     return sendNotesResponse(request, arr);
 }
 
-esp_err_t deleteSdFile(httpd_req_t* request) {
-    char body[256];
+esp_err_t mkdirSd(httpd_req_t* request) {
+    char body[320];
     if (!readJsonBody(request, body, sizeof(body))) {
-        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid delete request");
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid mkdir request");
+    }
+    cJSON* root = cJSON_ParseWithOpts(body, nullptr, true);
+    const cJSON* dirItem = cJSON_GetObjectItemCaseSensitive(root, "dir");
+    const cJSON* nameItem = cJSON_GetObjectItemCaseSensitive(root, "name");
+    std::string parent = (cJSON_IsString(dirItem) && dirItem->valuestring) ? dirItem->valuestring : "";
+    std::string folder = (cJSON_IsString(nameItem) && nameItem->valuestring) ? nameItem->valuestring : "";
+    cJSON_Delete(root);
+    std::string created;
+    if (folder.empty() || !sdManager.makeSharedDir(parent.c_str(), folder.c_str(), created)) {
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Could not create folder");
+    }
+    cJSON* resp = cJSON_CreateObject();
+    cJSON_AddBoolToObject(resp, "ok", true);
+    cJSON_AddStringToObject(resp, "name", created.c_str());
+    char* json = cJSON_PrintUnformatted(resp);
+    cJSON_Delete(resp);
+    if (!json) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+    httpd_resp_set_type(request, "application/json");
+    const esp_err_t res = httpd_resp_sendstr(request, json);
+    cJSON_free(json);
+    return res;
+}
+
+esp_err_t renameSd(httpd_req_t* request) {
+    char body[512];
+    if (!readJsonBody(request, body, sizeof(body))) {
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid rename request");
     }
     cJSON* root = cJSON_ParseWithOpts(body, nullptr, true);
     const cJSON* catItem = cJSON_GetObjectItemCaseSensitive(root, "cat");
+    const cJSON* dirItem = cJSON_GetObjectItemCaseSensitive(root, "dir");
+    const cJSON* fromItem = cJSON_GetObjectItemCaseSensitive(root, "from");
+    const cJSON* toItem = cJSON_GetObjectItemCaseSensitive(root, "to");
+    std::string cat = (cJSON_IsString(catItem) && catItem->valuestring) ? catItem->valuestring : "";
+    std::string dir = (cJSON_IsString(dirItem) && dirItem->valuestring) ? dirItem->valuestring : "";
+    std::string from = (cJSON_IsString(fromItem) && fromItem->valuestring) ? fromItem->valuestring : "";
+    std::string to = (cJSON_IsString(toItem) && toItem->valuestring) ? toItem->valuestring : "";
+    cJSON_Delete(root);
+    std::string finalName;
+    if (!sdManager.renameEntry(cat.c_str(), dir.c_str(), from.c_str(), to.c_str(), finalName)) {
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Rename failed");
+    }
+    cJSON* resp = cJSON_CreateObject();
+    cJSON_AddBoolToObject(resp, "ok", true);
+    cJSON_AddStringToObject(resp, "name", finalName.c_str());
+    char* json = cJSON_PrintUnformatted(resp);
+    cJSON_Delete(resp);
+    if (!json) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+    httpd_resp_set_type(request, "application/json");
+    const esp_err_t res = httpd_resp_sendstr(request, json);
+    cJSON_free(json);
+    return res;
+}
+
+esp_err_t uploadOtaFirmware(httpd_req_t* request) {
+    const size_t totalLen = request->content_len;
+    if (totalLen < 65536 || totalLen > 6 * 1024 * 1024) {
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid firmware size");
+    }
+    TransferGuard xferGuard;
+
+    constexpr size_t kChunkSize = 16384;
+    uint8_t* buf = static_cast<uint8_t*>(ps_malloc(kChunkSize));
+    if (!buf) {
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Buffer unavailable");
+    }
+
+    size_t remaining = totalLen;
+    bool began = false;
+    bool ok = true;
+    while (remaining > 0) {
+        const size_t want = remaining > kChunkSize ? kChunkSize : remaining;
+        const int got = httpd_req_recv(request, reinterpret_cast<char*>(buf), want);
+        if (got <= 0) {
+            if (got == HTTPD_SOCK_ERR_TIMEOUT) continue;
+            ok = false;
+            break;
+        }
+        if (!began) {
+            // Verify ESP32 firmware image magic byte 0xE9 before touching flash.
+            if (buf[0] != 0xE9 || !Update.begin(totalLen, U_FLASH)) {
+                ok = false;
+                break;
+            }
+            began = true;
+            Serial.printf("[OTA] Flashing %u bytes...\n", static_cast<unsigned>(totalLen));
+        }
+        if (Update.write(buf, static_cast<size_t>(got)) != static_cast<size_t>(got)) {
+            ok = false;
+            break;
+        }
+        remaining -= static_cast<size_t>(got);
+    }
+    free(buf);
+
+    if (!ok || !began || !Update.end(true)) {
+        if (began) Update.abort();
+        Serial.printf("[OTA] Failed (err=%u)\n", static_cast<unsigned>(Update.getError()));
+        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA update failed");
+    }
+    Serial.printf("[OTA] Success (%u bytes) -> rebooting\n", static_cast<unsigned>(totalLen));
+    rebootAtMs = millis() + 700;
+    char resp[96];
+    snprintf(resp, sizeof(resp), "{\"ok\":true,\"size\":%u,\"rebooting\":true}", static_cast<unsigned>(totalLen));
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_set_hdr(request, "Cache-Control", "no-store");
+    return httpd_resp_sendstr(request, resp);
+}
+
+esp_err_t deleteSdFile(httpd_req_t* request) {
+    if (!isJsonRequest(request) || request->content_len == 0 || request->content_len > 4096) {
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid delete request");
+    }
+    char* body = static_cast<char*>(ps_malloc(request->content_len + 1));
+    if (!body) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+    size_t received = 0;
+    while (received < request->content_len) {
+        const int n = httpd_req_recv(request, body + received, request->content_len - received);
+        if (n <= 0) {
+            free(body);
+            return ESP_FAIL;
+        }
+        received += static_cast<size_t>(n);
+    }
+    body[received] = '\0';
+    cJSON* root = cJSON_Parse(body);
+    free(body);
+    if (!cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+    }
+
+    const cJSON* itemsArr = cJSON_GetObjectItemCaseSensitive(root, "items");
+    if (cJSON_IsArray(itemsArr)) {
+        int deleted = 0;
+        const int cnt = cJSON_GetArraySize(itemsArr);
+        for (int i = 0; i < cnt; ++i) {
+            const cJSON* it = cJSON_GetArrayItem(itemsArr, i);
+            const cJSON* c = cJSON_GetObjectItemCaseSensitive(it, "cat");
+            const cJSON* d = cJSON_GetObjectItemCaseSensitive(it, "dir");
+            const cJSON* n = cJSON_GetObjectItemCaseSensitive(it, "name");
+            const cJSON* isD = cJSON_GetObjectItemCaseSensitive(it, "is_dir");
+            if (cJSON_IsString(c) && cJSON_IsString(n)) {
+                const char* dirStr = (cJSON_IsString(d) && d->valuestring) ? d->valuestring : "";
+                if (sdManager.deleteFile(c->valuestring, n->valuestring, dirStr, cJSON_IsTrue(isD))) {
+                    ++deleted;
+                }
+            }
+        }
+        cJSON_Delete(root);
+        char resp[48];
+        snprintf(resp, sizeof(resp), "{\"deleted\":%d}", deleted);
+        httpd_resp_set_type(request, "application/json");
+        return httpd_resp_sendstr(request, resp);
+    }
+
+    const cJSON* catItem = cJSON_GetObjectItemCaseSensitive(root, "cat");
+    const cJSON* dirItem = cJSON_GetObjectItemCaseSensitive(root, "dir");
     const cJSON* nameItem = cJSON_GetObjectItemCaseSensitive(root, "name");
     const cJSON* allItem = cJSON_GetObjectItemCaseSensitive(root, "all");
+    const cJSON* isDirItem = cJSON_GetObjectItemCaseSensitive(root, "is_dir");
     const bool validCat = cJSON_IsString(catItem) && sdrec::Manager::isValidCategory(catItem->valuestring);
     const bool clearAll = cJSON_IsTrue(allItem);
+    const bool isDir = cJSON_IsTrue(isDirItem);
     const bool validName = cJSON_IsString(nameItem) && sdrec::Manager::isValidName(nameItem->valuestring);
     std::string cat = validCat ? catItem->valuestring : "";
+    std::string dir = (cJSON_IsString(dirItem) && dirItem->valuestring) ? dirItem->valuestring : "";
     std::string name = validName ? nameItem->valuestring : "";
     cJSON_Delete(root);
-    if (!validCat || (!clearAll && !validName)) {
+    if (!validCat || !sdrec::Manager::isValidSubdir(dir.c_str()) || (!clearAll && !validName)) {
         return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid delete target");
     }
     if (clearAll) {
@@ -1160,7 +1353,7 @@ esp_err_t deleteSdFile(httpd_req_t* request) {
         httpd_resp_set_type(request, "application/json");
         return httpd_resp_sendstr(request, resp);
     }
-    if (!sdManager.deleteFile(cat.c_str(), name.c_str())) {
+    if (!sdManager.deleteFile(cat.c_str(), name.c_str(), dir.c_str(), isDir)) {
         return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "File could not be deleted");
     }
     httpd_resp_set_status(request, "204 No Content");
@@ -1185,6 +1378,11 @@ esp_err_t sendWifiStatus(httpd_req_t* request) {
     cJSON_AddBoolToObject(root, "sta_enabled", staEnabled);
     cJSON_AddStringToObject(root, "sta_ssid", staSsid.c_str());
     cJSON_AddBoolToObject(root, "led_enabled", ledEnabled);
+    cJSON_AddStringToObject(root, "fw_version", kFirmwareVersion);
+    cJSON_AddNumberToObject(root, "uptime_s", static_cast<double>(millis() / 1000));
+    const time_t nowSec = time(nullptr);
+    cJSON_AddNumberToObject(root, "epoch", static_cast<double>(nowSec));
+    cJSON_AddBoolToObject(root, "time_synced", nowSec > 1700000000);
     char* json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (!json) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
@@ -1404,6 +1602,8 @@ int selectQuietChannel() {
 void setup() {
     const bool cpuConfigured = setCpuFrequencyMhz(160);
     Serial.begin(115200);
+    setenv("TZ", "KST-9", 1);
+    tzset();
     if (!cpuConfigured) Serial.println("[BOOT] CPU frequency unchanged");
     holdCameraClockLow();
     Serial.printf("[BOOT] CPU=%uMHz PSRAM=%u bytes\n", getCpuFrequencyMhz(), ESP.getPsramSize());
@@ -1460,6 +1660,8 @@ void setup() {
             Serial.printf("[Wi-Fi] STA connected: %s at %s (ch=%d rssi=%d ps=%d)\n",
                           staSsid.c_str(), WiFi.localIP().toString().c_str(),
                           activeWifiChannel, rssi, static_cast<int>(psType));
+            configTzTime("KST-9", "pool.ntp.org", "time.google.com", "kr.pool.ntp.org");
+            Serial.println("[NTP] Syncing KST time...");
         } else {
             Serial.println("[Wi-Fi] STA timeout -> falling back to SoftAP");
             WiFi.setAutoReconnect(false);
@@ -1511,9 +1713,12 @@ void setup() {
         {"/sd/files", HTTP_GET, sendSdFiles, nullptr},
         {"/sd/file", HTTP_GET, sendSdFile, nullptr},
         {"/sd/upload", HTTP_POST, uploadSdFile, nullptr},
+        {"/sd/mkdir", HTTP_POST, mkdirSd, nullptr},
+        {"/sd/rename", HTTP_POST, renameSd, nullptr},
         {"/sd/notes", HTTP_GET, sendSdNotes, nullptr},
         {"/sd/notes", HTTP_POST, updateSdNotes, nullptr},
         {"/sd/delete", HTTP_POST, deleteSdFile, nullptr},
+        {"/ota/upload", HTTP_POST, uploadOtaFirmware, nullptr},
     });
     const auto streamServer = startServer(81, 32769, {{"/stream", HTTP_GET, stream, nullptr}});
     if (!statusServer || !streamServer) {

@@ -37,6 +37,7 @@ struct FileEntry {
     std::string category;
     std::string name;
     size_t size;
+    int64_t mtime;
 };
 
 // External camera hooks provided by main.cpp so camera settings stay 100% unified.
@@ -318,13 +319,27 @@ public:
         }
         std::string out;
         out.reserve(104);
-        for (const char* p = base; *p && out.size() < 100; ++p) {
+        bool truncated = false;
+        for (const char* p = base; *p; ++p) {
+            if (out.size() >= 100) {
+                truncated = true;
+                break;
+            }
             const unsigned char c = static_cast<unsigned char>(*p);
             if (c < 0x20 || c == 0x7f) continue;
             if (c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|') {
                 out.push_back('_');
             } else {
                 out.push_back(static_cast<char>(c));
+            }
+        }
+        if (truncated) {
+            // Drop any incomplete multi-byte UTF-8 sequence at the cut boundary.
+            while (!out.empty() && (static_cast<unsigned char>(out.back()) & 0xC0) == 0x80) {
+                out.pop_back();
+            }
+            if (!out.empty() && (static_cast<unsigned char>(out.back()) & 0x80) != 0) {
+                out.pop_back();
             }
         }
         // Collapse any ".." segments and trim leading/trailing spaces & dots
@@ -334,34 +349,68 @@ public:
         }
         while (!out.empty() && (out.front() == ' ' || out.front() == '.')) out.erase(out.begin());
         while (!out.empty() && (out.back() == ' ' || out.back() == '.')) out.pop_back();
-        // Avoid truncating in the middle of a multi-byte UTF-8 sequence
-        while (!out.empty() && (static_cast<unsigned char>(out.back()) & 0xC0) == 0x80) {
-            out.pop_back();
-        }
         if (out.empty()) return "file.bin";
         return out;
     }
 
-    std::vector<FileEntry> listFiles(const char* filterCat, size_t maxItems = 80) {
+    static bool isValidSubdir(const char* dir) {
+        if (!dir || !dir[0]) return true;
+        const size_t len = strlen(dir);
+        if (len > 120 || dir[0] == '/' || dir[len - 1] == '/') return false;
+        int depth = 0;
+        size_t start = 0;
+        while (start < len) {
+            size_t slash = start;
+            while (slash < len && dir[slash] != '/') ++slash;
+            if (slash == start) return false; // empty segment ("//")
+            std::string seg(dir + start, slash - start);
+            if (!isValidName(seg.c_str())) return false;
+            if (++depth > 3) return false;
+            start = slash + 1;
+        }
+        return true;
+    }
+
+    static std::string buildCategoryPath(const char* cat, const char* subdir = "", const char* name = "") {
+        std::string path = std::string("/dockycam/") + cat;
+        if (strcmp(cat, "shared") == 0 && subdir && subdir[0]) {
+            path += "/";
+            path += subdir;
+        }
+        if (name && name[0]) {
+            path += "/";
+            path += name;
+        }
+        return path;
+    }
+
+    std::vector<FileEntry> listFiles(const char* filterCat, size_t maxItems = 120,
+                                     const char* subdir = "", std::vector<std::string>* dirsOut = nullptr) {
         std::vector<FileEntry> out;
         if (!mounted_) return out;
+        if (!isValidSubdir(subdir)) return out;
         const char* cats[4] = {"blackbox", "timelapse", "snapshots", "shared"};
         if (xSemaphoreTakeRecursive(sdMutex_, pdMS_TO_TICKS(1000)) != pdTRUE) return out;
         for (const char* cat : cats) {
             if (filterCat && strcmp(filterCat, "all") != 0 && strcmp(filterCat, cat) != 0) continue;
-            std::string dirPath = std::string("/dockycam/") + cat;
+            const bool useSub = (strcmp(cat, "shared") == 0 && filterCat && strcmp(filterCat, "shared") == 0);
+            std::string dirPath = buildCategoryPath(cat, useSub ? subdir : "");
             File dir = SD_MMC.open(dirPath.c_str());
             if (!dir || !dir.isDirectory()) {
                 if (dir) dir.close();
                 continue;
             }
             while (File f = dir.openNextFile()) {
-                if (!f.isDirectory()) {
-                    const char* rawName = f.name();
-                    const char* base = strrchr(rawName, '/');
-                    base = base ? base + 1 : rawName;
+                const char* rawName = f.name();
+                const char* base = strrchr(rawName, '/');
+                base = base ? base + 1 : rawName;
+                if (f.isDirectory()) {
+                    if (useSub && dirsOut && isValidName(base)) {
+                        dirsOut->emplace_back(base);
+                    }
+                } else {
                     if (isValidName(base) && f.size() > 0) {
-                        out.push_back({cat, base, f.size()});
+                        out.push_back({cat, base, f.size(), static_cast<int64_t>(f.getLastWrite())});
                     }
                 }
                 f.close();
@@ -369,23 +418,107 @@ public:
             dir.close();
         }
         xSemaphoreGiveRecursive(sdMutex_);
+        if (dirsOut) {
+            std::sort(dirsOut->begin(), dirsOut->end());
+        }
         std::sort(out.begin(), out.end(), [](const FileEntry& a, const FileEntry& b) {
-            return a.name > b.name; // Newest first (YYYYMMDD_HHMMSS or 000001)
+            if (a.mtime != b.mtime) return a.mtime > b.mtime;
+            return a.name > b.name;
         });
         if (out.size() > maxItems) out.resize(maxItems);
         return out;
     }
 
-    bool deleteFile(const char* cat, const char* name) {
-        if (!mounted_ || !isValidCategory(cat) || !isValidName(name)) return false;
+    bool makeSharedDir(const char* parentSubdir, const char* folderName, std::string& createdOut) {
+        if (!mounted_ || !isValidSubdir(parentSubdir)) return false;
+        const std::string safe = sanitizeSharedName(folderName);
+        if (!isValidName(safe.c_str())) return false;
+        std::string fullSub = (parentSubdir && parentSubdir[0])
+                                  ? (std::string(parentSubdir) + "/" + safe)
+                                  : safe;
+        if (!isValidSubdir(fullSub.c_str())) return false;
+        std::string path = buildCategoryPath("shared", fullSub.c_str());
+        if (xSemaphoreTakeRecursive(sdMutex_, pdMS_TO_TICKS(1500)) != pdTRUE) return false;
+        if (!SD_MMC.exists("/dockycam")) SD_MMC.mkdir("/dockycam");
+        if (!SD_MMC.exists("/dockycam/shared")) SD_MMC.mkdir("/dockycam/shared");
+        const bool ok = SD_MMC.exists(path.c_str()) || SD_MMC.mkdir(path.c_str());
+        xSemaphoreGiveRecursive(sdMutex_);
+        if (ok) createdOut = safe;
+        return ok;
+    }
+
+    bool renameEntry(const char* cat, const char* subdir, const char* fromName, const char* toName,
+                     std::string& finalNameOut) {
+        if (!mounted_ || !isValidCategory(cat) || !isValidSubdir(subdir) || !isValidName(fromName)) {
+            return false;
+        }
+        const std::string safeTo = sanitizeSharedName(toName);
+        if (!isValidName(safeTo.c_str())) return false;
+        xSemaphoreTake(stateMutex_, portMAX_DELAY);
+        const bool isCurrent = (activeMode_ != RecordMode::Off && strcmp(currentFileName_, fromName) == 0);
+        xSemaphoreGive(stateMutex_);
+        if (isCurrent) return false;
+
+        const std::string src = buildCategoryPath(cat, subdir, fromName);
+        const std::string dst = buildCategoryPath(cat, subdir, safeTo.c_str());
+        if (src == dst) {
+            finalNameOut = safeTo;
+            return true;
+        }
+        if (xSemaphoreTakeRecursive(sdMutex_, pdMS_TO_TICKS(1500)) != pdTRUE) return false;
+        bool ok = false;
+        if (SD_MMC.exists(src.c_str()) && !SD_MMC.exists(dst.c_str())) {
+            ok = SD_MMC.rename(src.c_str(), dst.c_str());
+        }
+        xSemaphoreGiveRecursive(sdMutex_);
+        if (ok) finalNameOut = safeTo;
+        return ok;
+    }
+
+    bool removeDirRecursiveLocked(const std::string& path, int depth = 0) {
+        if (depth > 4) return false;
+        File dir = SD_MMC.open(path.c_str());
+        if (!dir || !dir.isDirectory()) {
+            if (dir) dir.close();
+            return false;
+        }
+        std::vector<std::string> childFiles;
+        std::vector<std::string> childDirs;
+        while (File f = dir.openNextFile()) {
+            const char* raw = f.name();
+            const char* base = strrchr(raw, '/');
+            base = base ? base + 1 : raw;
+            if (isValidName(base)) {
+                if (f.isDirectory()) childDirs.emplace_back(base);
+                else childFiles.emplace_back(base);
+            }
+            f.close();
+        }
+        dir.close();
+        for (const auto& fn : childFiles) {
+            SD_MMC.remove((path + "/" + fn).c_str());
+        }
+        for (const auto& dn : childDirs) {
+            removeDirRecursiveLocked(path + "/" + dn, depth + 1);
+        }
+        return SD_MMC.rmdir(path.c_str());
+    }
+
+    bool deleteFile(const char* cat, const char* name, const char* subdir = "", bool isDir = false) {
+        if (!mounted_ || !isValidCategory(cat) || !isValidSubdir(subdir) || !isValidName(name)) return false;
         xSemaphoreTake(stateMutex_, portMAX_DELAY);
         const bool isCurrent = (activeMode_ != RecordMode::Off && strcmp(currentFileName_, name) == 0);
         xSemaphoreGive(stateMutex_);
         if (isCurrent) return false; // Refuse deleting actively open file
 
-        std::string path = std::string("/dockycam/") + cat + "/" + name;
-        if (xSemaphoreTakeRecursive(sdMutex_, pdMS_TO_TICKS(1000)) != pdTRUE) return false;
-        const bool ok = SD_MMC.remove(path.c_str());
+        std::string path = buildCategoryPath(cat, subdir, name);
+        if (xSemaphoreTakeRecursive(sdMutex_, pdMS_TO_TICKS(1500)) != pdTRUE) return false;
+        bool ok = false;
+        if (isDir && strcmp(cat, "shared") == 0) {
+            ok = removeDirRecursiveLocked(path);
+        } else {
+            ok = SD_MMC.remove(path.c_str());
+        }
         xSemaphoreGiveRecursive(sdMutex_);
         return ok;
     }
@@ -456,8 +589,8 @@ private:
 
     std::string nextFilename(const char* prefix, const char* ext) {
         char buf[40];
-        if (timeSynced_) {
-            time_t now = time(nullptr);
+        const time_t now = time(nullptr);
+        if (timeSynced_ || now > 1700000000) {
             struct tm tmNow{};
             localtime_r(&now, &tmNow);
             snprintf(buf, sizeof(buf), "%s_%04d%02d%02d_%02d%02d%02d.%s",
