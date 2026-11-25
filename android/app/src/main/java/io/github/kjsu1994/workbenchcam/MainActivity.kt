@@ -10,6 +10,7 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.net.wifi.WifiManager
 import android.net.wifi.WifiNetworkSpecifier
 import android.os.Build
 import android.os.Bundle
@@ -34,6 +35,7 @@ import android.widget.Toast
 
 class MainActivity : Activity() {
     private lateinit var connectivity: ConnectivityManager
+    private var wifiLock: WifiManager.WifiLock? = null
     private lateinit var screen: CameraScreen
     private lateinit var secrets: ConnectionSecret
     private var password = ""
@@ -111,6 +113,10 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         connectivity = requireNotNull(getSystemService(ConnectivityManager::class.java))
+        wifiLock = applicationContext.getSystemService(WifiManager::class.java)?.createWifiLock(
+            WifiManager.WIFI_MODE_FULL_LOW_LATENCY,
+            "WorkbenchCam:stream"
+        )?.apply { setReferenceCounted(false) }
         secrets = ConnectionSecret(this)
         password = secrets.read().orEmpty()
         rememberPassword = password.isNotEmpty()
@@ -562,8 +568,13 @@ class MainActivity : Activity() {
     }
 
     private fun updateControls() {
-        if (preview != null) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        if (preview != null) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            wifiLock?.let { if (!it.isHeld) runCatching { it.acquire() } }
+        } else {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            wifiLock?.let { if (it.isHeld) runCatching { it.release() } }
+        }
         screen.showControls(network != null, !waitingForNetwork && !stoppingPreview && preview == null && cooldownEndsAt == 0L,
             preview != null, displayed != null)
     }

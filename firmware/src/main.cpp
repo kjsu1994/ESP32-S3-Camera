@@ -157,10 +157,10 @@ bool startCamera(uint8_t options) {
     config.pixel_format = PIXFORMAT_JPEG;
     const uint8_t resolution = resolutionIndex(options);
     config.frame_size = frameSizes[resolution];
-    config.jpeg_quality = resolution == static_cast<uint8_t>(Resolution::Hd) ? 14 : 12;
-    config.fb_count = 2;
+    config.jpeg_quality = resolution == static_cast<uint8_t>(Resolution::Hd) ? 16 : 14;
+    config.fb_count = 1;
     config.fb_location = CAMERA_FB_IN_PSRAM;
-    config.grab_mode = CAMERA_GRAB_LATEST;
+    config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
 
     const esp_err_t result = esp_camera_init(&config);
     if (result != ESP_OK) {
@@ -168,6 +168,8 @@ bool startCamera(uint8_t options) {
         holdCameraClockLow();
         return false;
     }
+    // Lower XCLK drive strength to reduce 2.4GHz RF harmonic coupling into the Wi-Fi antenna.
+    gpio_set_drive_capability(static_cast<gpio_num_t>(board::xclk), GPIO_DRIVE_CAP_0);
     sensor_t* sensor = esp_camera_sensor_get();
     const unsigned pid = sensor ? sensor->id.PID : 0;
     Serial.printf("[CAM] PID=0x%04x PSRAM=%u\n", pid, ESP.getPsramSize());
@@ -323,15 +325,16 @@ esp_err_t stream(httpd_req_t* request) {
         return httpd_resp_sendstr(request, "Camera initialization failed");
     }
 
-    // Discard the first frame after init so AEC/AWB and DMA buffers settle cleanly.
+    // Discard the first frame after init so AEC/AWB settle cleanly.
     if (camera_fb_t* warmup = esp_camera_fb_get()) {
         esp_camera_fb_return(warmup);
     }
 
+    sensor_t* sensor = esp_camera_sensor_get();
     const int sock = httpd_req_to_sockfd(request);
     const int enable = 1;
-    const int keepIdle = 3;
-    const int keepInterval = 1;
+    const int keepIdle = 5;
+    const int keepInterval = 2;
     const int keepCount = 2;
     setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &enable, sizeof(enable));
     setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &enable, sizeof(enable));
@@ -380,21 +383,25 @@ esp_err_t stream(httpd_req_t* request) {
             "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
             static_cast<unsigned>(jpegLength));
         memcpy(packet + headerLength, frame->buf, jpegLength);
-        // Release the driver buffer right away so DMA continues capturing into the pair buffer.
-        esp_camera_fb_return(frame);
         const size_t end = headerLength + jpegLength;
         packet[end] = '\r';
         packet[end + 1] = '\n';
 
+        // Pause OV5640 (SW standby) and keep GDMA idle while Wi-Fi transmits to avoid
+        // RF/power/Core-0 interference that otherwise stalls TCP send to 1-5s per frame.
+        if (sensor && sensor->set_reg) sensor->set_reg(sensor, 0x3008, 0x40, 0x40);
         const uint32_t sendStarted = micros();
         sent = writeStream(request, packet, end + 2);
+        const uint32_t sendElapsed = micros() - sendStarted;
+        if (sensor && sensor->set_reg) sensor->set_reg(sensor, 0x3008, 0x40, 0x00);
+        esp_camera_fb_return(frame);
         if (!sent || WiFi.softAPgetStationNum() == 0) {
             ending = Reason::Disconnected;
             break;
         }
         ++sentFrames;
         captureUs += captureElapsed;
-        sendUs += micros() - sendStarted;
+        sendUs += sendElapsed;
         if (frameIntervalMs > 0) {
             const uint32_t elapsed = millis() - started;
             if (elapsed < frameIntervalMs) delay(frameIntervalMs - elapsed);
@@ -424,7 +431,7 @@ httpd_handle_t startServer(uint16_t port, uint16_t controlPort, std::initializer
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = port;
     config.ctrl_port = controlPort;
-    config.send_wait_timeout = 4;
+    config.send_wait_timeout = 6;
     config.recv_wait_timeout = 2;
     config.stack_size = 8192;
     config.lru_purge_enable = true;
@@ -500,7 +507,7 @@ esp_err_t sendTelemetry(httpd_req_t* request) {
 }
 
 void setup() {
-    const bool cpuConfigured = setCpuFrequencyMhz(240);
+    const bool cpuConfigured = setCpuFrequencyMhz(160);
     Serial.begin(115200);
     if (!cpuConfigured) Serial.println("[BOOT] CPU frequency unchanged");
     holdCameraClockLow();

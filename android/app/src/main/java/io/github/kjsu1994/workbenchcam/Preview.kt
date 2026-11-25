@@ -25,7 +25,7 @@ internal class Preview(network: Network) {
             var cleanEnd = false
             try {
                 val startedAt = SystemClock.elapsedRealtime()
-                val stream = open(":81/stream")
+                val stream = open(":81/stream", 8000)
                 try {
                     if (stream.responseCode != 200) {
                         val retry = stream.getHeaderField("Retry-After")?.toIntOrNull() ?: 0
