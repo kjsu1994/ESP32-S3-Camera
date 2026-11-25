@@ -1,9 +1,11 @@
 package io.github.kjsu1994.workbenchcam
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.ContentValues
+import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.net.ConnectivityManager
@@ -20,7 +22,11 @@ import android.os.SystemClock
 import android.provider.MediaStore
 import android.text.InputType
 import android.view.View
+import android.view.WindowInsets
+import android.view.WindowInsetsController
 import android.view.WindowManager
+import android.window.OnBackInvokedCallback
+import android.window.OnBackInvokedDispatcher
 import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
@@ -57,8 +63,18 @@ class MainActivity : Activity() {
     private var cooldownEndsAt = 0L
     private var message = "보드 Wi-Fi에 연결하세요"
     private var countdown = ""
+    private var fullscreen = false
+    private var fullscreenFill = false
+    private var fullscreenOverlayVisible = true
+    private var backCallback: OnBackInvokedCallback? = null
     private val framePending = AtomicBoolean(false)
     private val handler = Handler(Looper.getMainLooper())
+    private val hideFullscreenOverlay = Runnable {
+        if (fullscreen && preview != null) {
+            fullscreenOverlayVisible = false
+            screen.showFullscreenOverlay(false)
+        }
+    }
     private val retryPreview = Runnable {
         if (visible && preview == null && !stoppingPreview) {
             network?.let(::startPreview)
@@ -112,6 +128,9 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        window.attributes = window.attributes.apply {
+            layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        }
         connectivity = requireNotNull(getSystemService(ConnectivityManager::class.java))
         wifiLock = applicationContext.getSystemService(WifiManager::class.java)?.createWifiLock(
             WifiManager.WIFI_MODE_FULL_LOW_LATENCY,
@@ -124,19 +143,132 @@ class MainActivity : Activity() {
         createScreen(resources.configuration)
     }
 
+    @Deprecated("Fallback for API 29-32; API 33+ uses OnBackInvokedCallback while fullscreen")
+    @Suppress("DEPRECATION")
+    @SuppressLint("GestureBackNavigation")
+    override fun onBackPressed() {
+        if (fullscreen) {
+            exitFullscreen()
+        } else {
+            super.onBackPressed()
+        }
+    }
+
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         createScreen(newConfig)
     }
 
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus && fullscreen) applySystemBars(hidden = true)
+    }
+
     private fun createScreen(config: Configuration) {
-        screen = CameraScreen(this, config, ::requestStart, ::stopPreview, ::savePhoto, ::showSettingsMenu)
+        screen = CameraScreen(
+            context = this,
+            config = config,
+            fullscreen = fullscreen,
+            fillVideo = fullscreenFill,
+            start = ::requestStart,
+            stop = ::stopPreview,
+            save = ::savePhoto,
+            settings = ::showSettingsMenu,
+            toggleFullscreen = ::toggleFullscreen,
+            onToggleFill = { fill ->
+                fullscreenFill = fill
+                scheduleOverlayAutoHide()
+            },
+            onFullscreenVideoTap = ::toggleFullscreenOverlay
+        )
         setContentView(screen.root)
         screen.root.requestApplyInsets()
         screen.showFrame(displayed?.bitmap)
         screen.showStatus(message, countdown)
         renderTelemetry()
         updateControls()
+        if (fullscreen) {
+            screen.showFullscreenOverlay(fullscreenOverlayVisible)
+            applySystemBars(hidden = true)
+        } else {
+            applySystemBars(hidden = false)
+        }
+    }
+
+    private fun toggleFullscreen() {
+        if (fullscreen) exitFullscreen() else enterFullscreen()
+    }
+
+    private fun enterFullscreen() {
+        if (fullscreen) return
+        fullscreen = true
+        fullscreenOverlayVisible = true
+        if (Build.VERSION.SDK_INT >= 33 && backCallback == null) {
+            val cb = OnBackInvokedCallback { exitFullscreen() }
+            backCallback = cb
+            onBackInvokedDispatcher.registerOnBackInvokedCallback(
+                OnBackInvokedDispatcher.PRIORITY_DEFAULT,
+                cb
+            )
+        }
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        createScreen(resources.configuration)
+        scheduleOverlayAutoHide()
+    }
+
+    private fun exitFullscreen() {
+        if (!fullscreen) return
+        handler.removeCallbacks(hideFullscreenOverlay)
+        fullscreen = false
+        if (Build.VERSION.SDK_INT >= 33) {
+            backCallback?.let { onBackInvokedDispatcher.unregisterOnBackInvokedCallback(it) }
+            backCallback = null
+        }
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        createScreen(resources.configuration)
+    }
+
+    private fun toggleFullscreenOverlay() {
+        if (!fullscreen) return
+        fullscreenOverlayVisible = !fullscreenOverlayVisible
+        screen.showFullscreenOverlay(fullscreenOverlayVisible)
+        if (fullscreenOverlayVisible) {
+            scheduleOverlayAutoHide()
+        } else {
+            handler.removeCallbacks(hideFullscreenOverlay)
+        }
+    }
+
+    private fun scheduleOverlayAutoHide() {
+        handler.removeCallbacks(hideFullscreenOverlay)
+        if (fullscreen && fullscreenOverlayVisible && preview != null) {
+            handler.postDelayed(hideFullscreenOverlay, 3000)
+        }
+    }
+
+    private fun applySystemBars(hidden: Boolean) {
+        if (Build.VERSION.SDK_INT >= 30) {
+            window.insetsController?.let { controller ->
+                if (hidden) {
+                    controller.hide(WindowInsets.Type.systemBars())
+                    controller.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                } else {
+                    controller.show(WindowInsets.Type.systemBars())
+                }
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            window.decorView.systemUiVisibility = if (hidden) {
+                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
+                    View.SYSTEM_UI_FLAG_FULLSCREEN or
+                    View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+                    View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or
+                    View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or
+                    View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+            } else {
+                View.SYSTEM_UI_FLAG_VISIBLE
+            }
+        }
     }
 
     override fun onStart() {
@@ -163,9 +295,14 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        handler.removeCallbacks(hideFullscreenOverlay)
         handler.removeCallbacks(pauseInBackground)
         handler.removeCallbacks(retryPreview)
         handler.removeCallbacks(renderFrame)
+        if (Build.VERSION.SDK_INT >= 33) {
+            backCallback?.let { onBackInvokedDispatcher.unregisterOnBackInvokedCallback(it) }
+            backCallback = null
+        }
         releaseNetwork()
         super.onDestroy()
     }
@@ -574,6 +711,11 @@ class MainActivity : Activity() {
         } else {
             window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             wifiLock?.let { if (it.isHeld) runCatching { it.release() } }
+            if (fullscreen && !fullscreenOverlayVisible) {
+                fullscreenOverlayVisible = true
+                screen.showFullscreenOverlay(true)
+                handler.removeCallbacks(hideFullscreenOverlay)
+            }
         }
         screen.showControls(network != null, !waitingForNetwork && !stoppingPreview && preview == null && cooldownEndsAt == 0L,
             preview != null, displayed != null)

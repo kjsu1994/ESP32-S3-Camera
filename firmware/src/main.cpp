@@ -532,7 +532,7 @@ int selectQuietChannel() {
 }
 
 void setup() {
-    const bool cpuConfigured = setCpuFrequencyMhz(240);
+    const bool cpuConfigured = setCpuFrequencyMhz(160);
     Serial.begin(115200);
     if (!cpuConfigured) Serial.println("[BOOT] CPU frequency unchanged");
     holdCameraClockLow();

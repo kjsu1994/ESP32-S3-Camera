@@ -23,10 +23,15 @@ import android.widget.TextView
 internal class CameraScreen(
     private val context: Context,
     config: Configuration,
+    private val fullscreen: Boolean,
+    private var fillVideo: Boolean,
     start: () -> Unit,
     stop: () -> Unit,
     save: () -> Unit,
-    settings: () -> Unit
+    settings: () -> Unit,
+    toggleFullscreen: () -> Unit,
+    onToggleFill: (Boolean) -> Unit,
+    onFullscreenVideoTap: () -> Unit
 ) {
     private val background = 0xff101613.toInt()
     private val panel = 0xff1d2822.toInt()
@@ -34,6 +39,7 @@ internal class CameraScreen(
     private val ink = 0xfff2f7f3.toInt()
     private val muted = 0xffb5c8ba.toInt()
     private val accent = 0xff9ae9ba.toInt()
+    private val overlayBar = 0xbb080d0b.toInt()
 
     val root = FrameLayout(context)
     private val title = text("WorkbenchCam", 23f, ink).apply { typeface = Typeface.DEFAULT_BOLD }
@@ -45,7 +51,7 @@ internal class CameraScreen(
         background = surface(panel)
     }
     private val image = ImageView(context).apply {
-        scaleType = ImageView.ScaleType.FIT_CENTER
+        scaleType = if (fullscreen && fillVideo) ImageView.ScaleType.CENTER_CROP else ImageView.ScaleType.FIT_CENTER
         contentDescription = "작업대 카메라 영상"
         visibility = View.INVISIBLE
     }
@@ -56,9 +62,91 @@ internal class CameraScreen(
     private val startButton = button("연결 및 보기", true, start)
     private val stopButton = button("정지", false, stop)
     private val photoButton = button("사진 저장", false, save)
+    private val fullscreenButton = button(if (fullscreen) "나가기" else "전체화면", false, toggleFullscreen)
+    private val scaleButton = button(if (fillVideo) "원본 비율" else "화면 채우기", false) {
+        fillVideo = !fillVideo
+        image.scaleType = if (fillVideo) ImageView.ScaleType.CENTER_CROP else ImageView.ScaleType.FIT_CENTER
+        onToggleFill(fillVideo)
+        updateScaleLabel()
+    }
     private val settingsButton = button("설정", false, settings).apply { contentDescription = "앱과 보드 설정" }
+    private var hudOverlay: FrameLayout? = null
 
     init {
+        if (fullscreen) {
+            buildFullscreenLayout(onFullscreenVideoTap)
+        } else {
+            buildStandardLayout(config)
+        }
+    }
+
+    private fun buildFullscreenLayout(onVideoTap: () -> Unit) {
+        root.setBackgroundColor(0xff000000.toInt())
+        val videoContainer = FrameLayout(context).apply {
+            setBackgroundColor(0xff000000.toInt())
+            addView(image, FrameLayout.LayoutParams(-1, -1))
+            addView(idle, FrameLayout.LayoutParams(-1, -1))
+            setOnClickListener { onVideoTap() }
+        }
+        root.addView(videoContainer, FrameLayout.LayoutParams(-1, -1))
+
+        telemetry.background = null
+        telemetry.setPadding(0, dp(2), 0, 0)
+        telemetry.textSize = 12f
+        val statusStack = column().apply {
+            addView(row().apply {
+                gravity = Gravity.CENTER_VERTICAL
+                addView(status, LinearLayout.LayoutParams(-2, -2))
+                addView(timer, LinearLayout.LayoutParams(-2, -2).apply { marginStart = dp(10) })
+            })
+            addView(telemetry, LinearLayout.LayoutParams(-2, -2))
+        }
+        val topBar = row().apply {
+            background = surface(overlayBar, border)
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(14), dp(8), dp(10), dp(8))
+            addView(statusStack, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(12) })
+            addView(fullscreenButton, LinearLayout.LayoutParams(-2, -2))
+        }
+        val bottomBar = row().apply {
+            background = surface(overlayBar, border)
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+            addView(startButton, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(8) })
+            addView(scaleButton, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(8) })
+            addView(photoButton, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(8) })
+            addView(stopButton, LinearLayout.LayoutParams(0, -2, 1f))
+        }
+        val overlay = FrameLayout(context).apply {
+            addView(topBar, FrameLayout.LayoutParams(-1, -2, Gravity.TOP))
+            addView(bottomBar, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
+        }
+        hudOverlay = overlay
+        root.addView(overlay, FrameLayout.LayoutParams(-1, -1))
+        root.setOnApplyWindowInsetsListener { _, insets ->
+            val offsets = if (Build.VERSION.SDK_INT >= 30) {
+                val cutout = insets.getInsets(WindowInsets.Type.displayCutout())
+                intArrayOf(cutout.left, cutout.top, cutout.right, cutout.bottom)
+            } else {
+                val cutout = insets.displayCutout
+                intArrayOf(
+                    cutout?.safeInsetLeft ?: 0,
+                    cutout?.safeInsetTop ?: 0,
+                    cutout?.safeInsetRight ?: 0,
+                    cutout?.safeInsetBottom ?: 0
+                )
+            }
+            overlay.setPadding(
+                offsets[0] + dp(16),
+                offsets[1] + dp(12),
+                offsets[2] + dp(16),
+                offsets[3] + dp(12)
+            )
+            insets
+        }
+    }
+
+    private fun buildStandardLayout(config: Configuration) {
         root.setBackgroundColor(background)
         root.setOnApplyWindowInsetsListener { view, insets ->
             val offsets = if (Build.VERSION.SDK_INT >= 30) {
@@ -98,13 +186,17 @@ internal class CameraScreen(
             else config.screenWidthDp - 32
         val actions = if (config.fontScale >= 1.4f && controlsWidth < 350) {
             column().apply {
-                addView(photoButton, LinearLayout.LayoutParams(-1, -2))
+                addView(fullscreenButton, LinearLayout.LayoutParams(-1, -2))
+                addAfter(photoButton, 8)
                 addAfter(stopButton, 8)
             }
         } else {
-            row().apply {
-                addView(photoButton, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(8) })
-                addView(stopButton, LinearLayout.LayoutParams(0, -2, 1f))
+            column().apply {
+                addView(row().apply {
+                    addView(photoButton, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(8) })
+                    addView(stopButton, LinearLayout.LayoutParams(0, -2, 1f))
+                }, LinearLayout.LayoutParams(-1, -2))
+                addAfter(fullscreenButton, 8)
             }
         }
 
@@ -162,6 +254,19 @@ internal class CameraScreen(
         startButton.isEnabled = canStart
         stopButton.isEnabled = playing
         photoButton.isEnabled = hasFrame
+        fullscreenButton.isEnabled = fullscreen || playing || hasFrame
+        if (fullscreen) {
+            startButton.visibility = if (playing) View.GONE else View.VISIBLE
+            stopButton.visibility = if (playing) View.VISIBLE else View.GONE
+        }
+    }
+
+    fun showFullscreenOverlay(visible: Boolean) {
+        hudOverlay?.visibility = if (visible) View.VISIBLE else View.GONE
+    }
+
+    private fun updateScaleLabel() {
+        scaleButton.text = if (fillVideo) "원본 비율" else "화면 채우기"
     }
 
     private fun column() = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
@@ -188,8 +293,8 @@ internal class CameraScreen(
         typeface = Typeface.DEFAULT_BOLD
         minWidth = 0
         minimumWidth = 0
-        minHeight = dp(52)
-        minimumHeight = dp(52)
+        minHeight = dp(if (fullscreen) 44 else 52)
+        minimumHeight = dp(if (fullscreen) 44 else 52)
         stateListAnimator = null
         setPadding(dp(12), dp(8), dp(12), dp(8))
         val enabled = intArrayOf(android.R.attr.state_enabled)
