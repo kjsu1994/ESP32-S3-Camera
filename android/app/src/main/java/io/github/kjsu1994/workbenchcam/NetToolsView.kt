@@ -163,10 +163,14 @@ internal class NetToolsView(
     private val dynamicChipContainer: LinearLayout
     private val dynamicEmptyHint: TextView
     private val monitorDeviceFilterBtn: TextView
+    private val monitorDensityBtn: TextView
+    private val monitorDedupBtn: TextView
     private val monitorProbeBtn: TextView
     private val monitorToConsoleBtn: TextView
     private val monitorStatsText: TextView
     private val monitorLogPanel: LiveLogPanel
+    private var monitorDensity = LogDisplayDensity.SUMMARY
+    private var monitorDedup = false
     private val liveInboundChannels = LinkedHashMap<String, LiveInboundChannel>()
     private val monitorAllEvents = ArrayDeque<MonitorEvent>()
     private var monitorSeq = 0
@@ -189,12 +193,16 @@ internal class NetToolsView(
     private val proxyRouteLabel: TextView
     private val proxyToggleBtn: Button
     private val proxyStatsText: TextView
+    private val proxyDensityBtn: TextView
+    private val proxyDedupBtn: TextView
     private val proxyPcapBtn: TextView
     private val renderProxyDir: (ProxyDirFilter) -> Unit
     private val renderProxyFmt: (PayloadFormat) -> Unit
     private val proxyLogPanel: LiveLogPanel
     private var proxyDirFilter = ProxyDirFilter.ALL
     private var proxyFormat = PayloadFormat.BOTH
+    private var proxyDensity = LogDisplayDensity.SUMMARY
+    private var proxyDedup = false
     private val proxyPackets = ArrayList<ProxyPacketRecord>()
     private var proxySeq = 0
     private var proxyC2tCount = 0
@@ -224,15 +232,20 @@ internal class NetToolsView(
     private val consoleConnBtn: Button
     private val consoleRxFmtBtn: Button
     private val consoleStatusBadge: TextView
+    private val consoleDensityBtn: TextView
+    private val consoleDedupBtn: TextView
     private val consoleLogPanel: LiveLogPanel
+    private var consoleDensity = LogDisplayDensity.SUMMARY
+    private var consoleDedup = false
     private val consoleInputField: EditText
     private val consoleEndingRow: LinearLayout
     private val consoleRecords = ArrayDeque<ConsoleRecord>()
     private var consoleSeq = 0
 
-    // Shared Fullscreen Live Log Viewer Dialog
+    // Shared Fullscreen Live Log Viewer & Packet Detail Inspector Dialogs
     private var fullscreenDialog: FullscreenLogDialog? = null
     private var fullscreenSource: FullscreenLogSource? = null
+    private var detailDialog: PacketDetailDialog? = null
 
     init {
         val wrapper = LinearLayout(context).apply {
@@ -438,6 +451,12 @@ internal class NetToolsView(
         val monFullscreenBtn = UiStyle.compactChipButton(
             context, "⛶ 전체화면", UiStyle.CYAN_SOFT, UiStyle.CYAN, UiStyle.CYAN
         ) { openFullscreenLog(FullscreenLogSource.MONITOR) }
+        monitorDensityBtn = UiStyle.compactChipButton(
+            context, "보기: 요약", UiStyle.SURFACE_ALT, UiStyle.INK, UiStyle.BORDER
+        ) { cycleMonitorDensity() }
+        monitorDedupBtn = UiStyle.compactChipButton(
+            context, "×N 묶기", UiStyle.SURFACE_ALT, UiStyle.SECONDARY, UiStyle.BORDER
+        ) { toggleMonitorDedup() }
         monitorDeviceFilterBtn = UiStyle.compactChipButton(
             context, "전체 장비", UiStyle.SURFACE_ALT, UiStyle.SECONDARY, UiStyle.BORDER
         ) { toggleDeviceOnlyFilter() }.apply { visibility = View.GONE }
@@ -458,6 +477,8 @@ internal class NetToolsView(
             gravity = Gravity.CENTER_VERTICAL
             val gap = UiStyle.dp(context, 6)
             addView(monFullscreenBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
+            addView(monitorDensityBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
+            addView(monitorDedupBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
             addView(monitorDeviceFilterBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
             addView(monitorProbeBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
             addView(monitorToConsoleBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
@@ -474,9 +495,10 @@ internal class NetToolsView(
 
         monitorLogPanel = LiveLogPanel(
             context = context,
-            emptyPlaceholder = "감지된 TCP/UDP 포트를 탭하거나 [자동 TCP+UDP 동시 감지 시작]을 누르면\n오가는 데이터가 실시간으로 기록됩니다.\n\n• 위·아래 스크롤로 이전 패킷 확인 (자동스크롤 일시정지)\n• 항목 탭으로 개별 복사 · [⛶ 전체화면]으로 실시간 크게 보기",
+            emptyPlaceholder = "감지된 TCP/UDP 포트를 탭하거나 [자동 TCP+UDP 동시 감지 시작]을 누르면\n오가는 데이터가 실시간으로 기록됩니다.\n\n• 위·아래 스크롤로 이전 패킷 확인 · [보기: 요약/1줄/전체] & [×N 묶기]\n• 항목 탭 → 100% 원문 상세(HEX 덤프/JSON 정렬) · 길게 눌러 즉시 복사",
             inlineMode = true,
-            onCopyEntry = { copySingleEntry(it) }
+            onInspectEntry = { list, idx -> openPacketDetail(list, idx) },
+            onLongCopyEntry = { copySingleEntry(it) }
         )
         streamCard.addView(monitorLogPanel.root, LinearLayout.LayoutParams(-1, UiStyle.dp(context, 250)))
         monitorPanel.addView(streamCard, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 12) })
@@ -579,6 +601,12 @@ internal class NetToolsView(
         val pxFullscreenBtn = UiStyle.compactChipButton(
             context, "⛶ 전체화면", UiStyle.CYAN_SOFT, UiStyle.CYAN, UiStyle.CYAN
         ) { openFullscreenLog(FullscreenLogSource.PROXY) }
+        proxyDensityBtn = UiStyle.compactChipButton(
+            context, "보기: 요약", UiStyle.SURFACE_ALT, UiStyle.INK, UiStyle.BORDER
+        ) { cycleProxyDensity() }
+        proxyDedupBtn = UiStyle.compactChipButton(
+            context, "×N 묶기", UiStyle.SURFACE_ALT, UiStyle.SECONDARY, UiStyle.BORDER
+        ) { toggleProxyDedup() }
         proxyPcapBtn = UiStyle.compactChipButton(
             context, "Wireshark .pcap 저장", UiStyle.ACCENT_SOFT, UiStyle.ACCENT, UiStyle.ACCENT
         ) { exportProxyPcap() }
@@ -595,6 +623,8 @@ internal class NetToolsView(
                     orientation = LinearLayout.HORIZONTAL
                     val gap = UiStyle.dp(context, 6)
                     addView(pxFullscreenBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
+                    addView(proxyDensityBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
+                    addView(proxyDedupBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
                     addView(proxyPcapBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
                     addView(pxCopyBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
                     addView(pxClearBtn)
@@ -608,9 +638,10 @@ internal class NetToolsView(
 
         proxyLogPanel = LiveLogPanel(
             context = context,
-            emptyPlaceholder = "중계 시작 후 클라이언트→대상(C→T) 및 대상→클라이언트(T→C)\n양방향 모든 TCP 데이터가 여기에 실시간으로 기록됩니다.\n\n• 위·아래 스크롤로 이전 패킷 확인 (최대 3,000건 보관)\n• 항목 탭으로 개별 복사 · [⛶ 전체화면]으로 실시간 크게 보기",
+            emptyPlaceholder = "중계 시작 후 클라이언트→대상(C→T) 및 대상→클라이언트(T→C)\n양방향 모든 TCP 데이터가 여기에 실시간으로 기록됩니다.\n\n• 항목 탭 → 100% 원문 상세 (TEXT / HEX 덤프 / JSON 정렬)\n• [보기: 요약/1줄/전체] · [×N 묶기] · [⛶ 전체화면] 지원",
             inlineMode = true,
-            onCopyEntry = { copySingleEntry(it) }
+            onInspectEntry = { list, idx -> openPacketDetail(list, idx) },
+            onLongCopyEntry = { copySingleEntry(it) }
         )
         pxCard.addView(proxyLogPanel.root, LinearLayout.LayoutParams(-1, UiStyle.dp(context, 280)))
         proxyPanel.addView(pxCard, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 12) })
@@ -660,6 +691,12 @@ internal class NetToolsView(
         val conFullscreenBtn = UiStyle.compactChipButton(
             context, "⛶ 전체화면", UiStyle.CYAN_SOFT, UiStyle.CYAN, UiStyle.CYAN
         ) { openFullscreenLog(FullscreenLogSource.CONSOLE) }
+        consoleDensityBtn = UiStyle.compactChipButton(
+            context, "보기: 요약", UiStyle.SURFACE_ALT, UiStyle.INK, UiStyle.BORDER
+        ) { cycleConsoleDensity() }
+        consoleDedupBtn = UiStyle.compactChipButton(
+            context, "×N 묶기", UiStyle.SURFACE_ALT, UiStyle.SECONDARY, UiStyle.BORDER
+        ) { toggleConsoleDedup() }
         val conCopyBtn = UiStyle.compactChipButton(context, "로그 복사", UiStyle.SURFACE_ALT, UiStyle.INK, UiStyle.BORDER) {
             copyText(consoleLogPanel.exportPlainText())
         }
@@ -670,6 +707,8 @@ internal class NetToolsView(
                     orientation = LinearLayout.HORIZONTAL
                     val gap = UiStyle.dp(context, 6)
                     addView(conFullscreenBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
+                    addView(consoleDensityBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
+                    addView(consoleDedupBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
                     addView(conCopyBtn)
                 })
             },
@@ -678,9 +717,10 @@ internal class NetToolsView(
 
         consoleLogPanel = LiveLogPanel(
             context = context,
-            emptyPlaceholder = "연결 후 명령어를 보내면 송수신 로그가 여기에 실시간으로 기록됩니다.\n\n• 위·아래 스크롤로 이전 로그 확인 · 항목 탭으로 개별 복사",
+            emptyPlaceholder = "연결 후 명령어를 보내면 송수신 로그가 여기에 실시간으로 기록됩니다.\n\n• 항목 탭 → 100% 원문 상세 (HEX 덤프/JSON 정렬) · 길게 눌러 즉시 복사",
             inlineMode = true,
-            onCopyEntry = { copySingleEntry(it) }
+            onInspectEntry = { list, idx -> openPacketDetail(list, idx) },
+            onLongCopyEntry = { copySingleEntry(it) }
         )
         conCard.addView(consoleLogPanel.root, LinearLayout.LayoutParams(-1, UiStyle.dp(context, 240)).apply { topMargin = UiStyle.dp(context, 8) })
 
@@ -825,6 +865,8 @@ internal class NetToolsView(
     fun stopAll() {
         handler.removeCallbacks(monitorRefreshRunnable)
         handler.removeCallbacks(proxyRefreshRunnable)
+        detailDialog?.dismiss()
+        detailDialog = null
         fullscreenDialog?.dismiss()
         fullscreenDialog = null
         fullscreenSource = null
@@ -1520,10 +1562,95 @@ internal class NetToolsView(
         }, "netlab-add-port").start()
     }
 
-    private fun formatPayloadBody(data: ByteArray, fmt: PayloadFormat): String = when (fmt) {
-        PayloadFormat.ASCII -> HexCodec.bytesToAscii(data, 260)
-        PayloadFormat.HEX -> HexCodec.bytesToHex(data, 128)
-        PayloadFormat.BOTH -> "${HexCodec.bytesToHex(data, 64)}\nTXT: ${HexCodec.bytesToAscii(data, 160)}"
+    private fun formatPayloadView(
+        data: ByteArray,
+        fmt: PayloadFormat,
+        density: LogDisplayDensity
+    ): Pair<String, Int> {
+        val full = (density == LogDisplayDensity.FULL)
+        return when (fmt) {
+            PayloadFormat.ASCII -> {
+                val lim = if (full) 4096 else 260
+                val text = if (full) LogFormatter.formatReadableText(data, lim) else HexCodec.bytesToAscii(data, lim)
+                text to (data.size - lim).coerceAtLeast(0)
+            }
+            PayloadFormat.HEX -> {
+                val lim = if (full) 2048 else 128
+                HexCodec.bytesToHex(data, lim) to (data.size - lim).coerceAtLeast(0)
+            }
+            PayloadFormat.BOTH -> {
+                val hexLim = if (full) 1024 else 64
+                val txtLim = if (full) 2048 else 160
+                val txt = if (full) LogFormatter.formatReadableText(data, txtLim) else HexCodec.bytesToAscii(data, txtLim)
+                val body = "${HexCodec.bytesToHex(data, hexLim)}\nTXT: $txt"
+                body to (data.size - hexLim).coerceAtLeast(0)
+            }
+        }
+    }
+
+    private fun cycleMonitorDensity() {
+        val all = LogDisplayDensity.entries
+        monitorDensity = all[(monitorDensity.ordinal + 1) % all.size]
+        styleDensityChip(monitorDensityBtn, monitorDensity)
+        monitorLogPanel.setDisplayDensity(monitorDensity)
+        refreshMonitorLogDisplay(0)
+    }
+
+    private fun toggleMonitorDedup() {
+        monitorDedup = !monitorDedup
+        styleDedupChip(monitorDedupBtn, monitorDedup)
+        refreshMonitorLogDisplay(0)
+    }
+
+    private fun cycleProxyDensity() {
+        val all = LogDisplayDensity.entries
+        proxyDensity = all[(proxyDensity.ordinal + 1) % all.size]
+        styleDensityChip(proxyDensityBtn, proxyDensity)
+        proxyLogPanel.setDisplayDensity(proxyDensity)
+        refreshProxyLogDisplay(0)
+    }
+
+    private fun toggleProxyDedup() {
+        proxyDedup = !proxyDedup
+        styleDedupChip(proxyDedupBtn, proxyDedup)
+        refreshProxyLogDisplay(0)
+    }
+
+    private fun cycleConsoleDensity() {
+        val all = LogDisplayDensity.entries
+        consoleDensity = all[(consoleDensity.ordinal + 1) % all.size]
+        styleDensityChip(consoleDensityBtn, consoleDensity)
+        consoleLogPanel.setDisplayDensity(consoleDensity)
+        refreshConsoleLogDisplay(0)
+    }
+
+    private fun toggleConsoleDedup() {
+        consoleDedup = !consoleDedup
+        styleDedupChip(consoleDedupBtn, consoleDedup)
+        refreshConsoleLogDisplay(0)
+    }
+
+    private fun styleDensityChip(chip: TextView, density: LogDisplayDensity) {
+        chip.text = "보기: ${density.label}"
+        val hi = density != LogDisplayDensity.SUMMARY
+        chip.setTextColor(if (hi) UiStyle.CYAN else UiStyle.INK)
+        chip.background = UiStyle.rippleRounded(
+            context,
+            if (hi) UiStyle.CYAN_SOFT else UiStyle.SURFACE_ALT,
+            10,
+            if (hi) UiStyle.CYAN else UiStyle.BORDER
+        )
+    }
+
+    private fun styleDedupChip(chip: TextView, enabled: Boolean) {
+        chip.text = if (enabled) "● ×N 묶기" else "×N 묶기"
+        chip.setTextColor(if (enabled) UiStyle.ON_ACCENT else UiStyle.SECONDARY)
+        chip.background = UiStyle.rippleRounded(
+            context,
+            if (enabled) UiStyle.AMBER else UiStyle.SURFACE_ALT,
+            10,
+            if (enabled) null else UiStyle.BORDER
+        )
     }
 
     private fun appendMonitorEvent(
@@ -1565,19 +1692,31 @@ internal class NetToolsView(
             selectedInboundFilterKey != null -> selectedInboundFilterKey
             else -> null
         }
-        return monitorAllEvents.asSequence()
+        val raw = monitorAllEvents.asSequence()
             .filter { ev -> channelFilter == null || ev.channelKey == channelFilter }
             .filter { ev -> !filterSelectedDeviceOnly || selectedDeviceIp.isEmpty() || ev.peerIp == selectedDeviceIp }
             .map { ev ->
                 val ts = timeFmt.format(Date(ev.timestampMs))
+                val payloadView = ev.data?.let { formatPayloadView(it, monitorFormat, monitorDensity) }
+                val body = payloadView?.first ?: ""
+                val extraBytes = payloadView?.second ?: 0
+                val fullText = ev.data?.let { LogFormatter.formatReadableText(it, 4096) } ?: ""
+                val compact = ev.data?.let { LogFormatter.compactOneLine(it) } ?: ""
+                val dedup = "${ev.channelKey}|${ev.peerIp}|${ev.data?.size ?: -1}|${ev.data?.contentHashCode() ?: ev.header.hashCode()}"
                 LogEntry(
                     seq = ev.seq,
                     header = "[$ts] ${ev.header}",
-                    body = ev.data?.let { formatPayloadBody(it, monitorFormat) } ?: "",
-                    accentColor = ev.accentColor
+                    body = body,
+                    accentColor = ev.accentColor,
+                    compactPreview = compact,
+                    rawBytes = ev.data,
+                    fullText = fullText,
+                    truncatedExtraBytes = extraBytes,
+                    dedupKey = dedup
                 )
             }
             .toList()
+        return if (monitorDedup) LogFilter.collapseConsecutiveDuplicates(raw) else raw
     }
 
     private fun refreshMonitorLogDisplay(addedDelta: Int = 0) {
@@ -1606,7 +1745,9 @@ internal class NetToolsView(
             statusColor = monitorStatsText.currentTextColor,
             running = running,
             runLabel = if (udpSniffer.isRunning() || tcpServerSniffer.isRunning()) "■ 감지 중지" else "▶ 자동 감지",
-            formatLabel = "표시: ${monitorFormat.label}"
+            formatLabel = "표시: ${monitorFormat.label}",
+            density = monitorDensity,
+            dedupEnabled = monitorDedup
         )
     }
 
@@ -1765,7 +1906,7 @@ internal class NetToolsView(
 
     private fun buildProxyLogEntries(): List<LogEntry> {
         val snapshot = synchronized(proxyPackets) { proxyPackets.toList() }
-        return snapshot.asSequence()
+        val raw = snapshot.asSequence()
             .filter { rec ->
                 when (proxyDirFilter) {
                     ProxyDirFilter.ALL -> true
@@ -1782,14 +1923,24 @@ internal class NetToolsView(
                 } else {
                     "T→C  ${pkt.srcIp}:${pkt.srcPort} → ${pkt.dstIp}:${pkt.dstPort} (${pkt.data.size}B)"
                 }
+                val (body, extraBytes) = formatPayloadView(pkt.data, proxyFormat, proxyDensity)
+                val compact = LogFormatter.compactOneLine(pkt.data)
+                val fullText = LogFormatter.formatReadableText(pkt.data, 4096)
+                val dedup = "${pkt.direction.name}|${pkt.srcIp}|${pkt.dstIp}:${pkt.dstPort}|${pkt.data.size}|${pkt.data.contentHashCode()}"
                 LogEntry(
                     seq = rec.seq,
                     header = "[$ts] $dirLabel",
-                    body = formatPayloadBody(pkt.data, proxyFormat),
-                    accentColor = if (isC2t) UiStyle.ACCENT else UiStyle.AMBER
+                    body = body,
+                    accentColor = if (isC2t) UiStyle.ACCENT else UiStyle.AMBER,
+                    compactPreview = compact,
+                    rawBytes = pkt.data,
+                    fullText = fullText,
+                    truncatedExtraBytes = extraBytes,
+                    dedupKey = dedup
                 )
             }
             .toList()
+        return if (proxyDedup) LogFilter.collapseConsecutiveDuplicates(raw) else raw
     }
 
     private fun refreshProxyLogDisplay(addedDelta: Int = 0) {
@@ -1821,7 +1972,9 @@ internal class NetToolsView(
             running = running,
             runLabel = if (running) "■ 중계 중지" else "▶ 중계 시작",
             filterLabel = "방향: ${proxyDirFilter.label}",
-            formatLabel = "표시: ${proxyFormat.label}"
+            formatLabel = "표시: ${proxyFormat.label}",
+            density = proxyDensity,
+            dedupEnabled = proxyDedup
         )
     }
 
@@ -2016,19 +2169,32 @@ internal class NetToolsView(
         refreshConsoleLogDisplay(1)
     }
 
-    private fun buildConsoleLogEntries(): List<LogEntry> = consoleRecords.map { rec ->
-        val ts = timeFmt.format(Date(rec.timestampMs))
-        val body = if (rec.rawRxBytes != null) {
-            if (consoleShowHex) HexCodec.bytesToHex(rec.rawRxBytes, 160) else HexCodec.bytesToAscii(rec.rawRxBytes, 320)
-        } else {
-            rec.textBody
+    private fun buildConsoleLogEntries(): List<LogEntry> {
+        val raw = consoleRecords.map { rec ->
+            val ts = timeFmt.format(Date(rec.timestampMs))
+            val rx = rec.rawRxBytes
+            val (body, extraBytes) = if (rx != null) {
+                val fmt = if (consoleShowHex) PayloadFormat.HEX else PayloadFormat.ASCII
+                formatPayloadView(rx, fmt, consoleDensity)
+            } else {
+                rec.textBody to 0
+            }
+            val fullText = rx?.let { LogFormatter.formatReadableText(it, 4096) } ?: rec.textBody
+            val compact = rx?.let { LogFormatter.compactOneLine(it) } ?: rec.textBody.replace('\n', ' ')
+            val dedup = "${rec.tag}|${rx?.size ?: -1}|${rx?.contentHashCode() ?: rec.textBody.hashCode()}"
+            LogEntry(
+                seq = rec.seq,
+                header = "[$ts] ${rec.tag}",
+                body = body,
+                accentColor = rec.accentColor,
+                compactPreview = compact,
+                rawBytes = rx,
+                fullText = fullText,
+                truncatedExtraBytes = extraBytes,
+                dedupKey = dedup
+            )
         }
-        LogEntry(
-            seq = rec.seq,
-            header = "[$ts] ${rec.tag}",
-            body = body,
-            accentColor = rec.accentColor
-        )
+        return if (consoleDedup) LogFilter.collapseConsecutiveDuplicates(raw) else raw
     }
 
     private fun refreshConsoleLogDisplay(addedDelta: Int = 0) {
@@ -2059,7 +2225,9 @@ internal class NetToolsView(
             statusColor = if (connected) UiStyle.ACCENT else UiStyle.MUTED,
             running = connected,
             runLabel = if (connected) "■ 끊기" else "▶ 연결",
-            formatLabel = if (consoleShowHex) "RX: HEX" else "RX: TEXT"
+            formatLabel = if (consoleShowHex) "RX: HEX" else "RX: TEXT",
+            density = consoleDensity,
+            dedupEnabled = consoleDedup
         )
         fullscreenDialog?.setConsoleInputHint(
             if (consoleHexTx) "HEX 바이트 전송 (예: AA 55 01 FF)" else "명령어 입력 후 전송"
@@ -2067,8 +2235,16 @@ internal class NetToolsView(
     }
 
     // =========================================================================
-    // Shared Fullscreen Live Log Viewer
+    // Shared Fullscreen Live Log Viewer & Packet Detail Inspector
     // =========================================================================
+
+    private fun openPacketDetail(entries: List<LogEntry>, index: Int) {
+        if (entries.isEmpty() || index !in entries.indices) return
+        detailDialog?.dismiss()
+        val dlg = PacketDetailDialog(context, entries, index)
+        detailDialog = dlg
+        dlg.show()
+    }
 
     private fun openFullscreenLog(source: FullscreenLogSource) {
         hideKeyboard()
@@ -2094,11 +2270,14 @@ internal class NetToolsView(
                         renderProxyFmt(proxyFormat)
                         refreshProxyLogDisplay(0)
                     },
+                    onCycleDensity = { cycleProxyDensity() },
+                    onToggleDedup = { toggleProxyDedup() },
                     onExportPcap = { exportProxyPcap() },
                     onCopyAll = { copyText(proxyLogPanel.exportPlainText()) },
                     onClear = { clearProxyLog() }
                 ),
-                onCopyEntry = { copySingleEntry(it) },
+                onInspectEntry = { list, idx -> openPacketDetail(list, idx) },
+                onLongCopyEntry = { copySingleEntry(it) },
                 onDismissed = {
                     if (fullscreenSource == FullscreenLogSource.PROXY) {
                         fullscreenDialog = null
@@ -2118,10 +2297,13 @@ internal class NetToolsView(
                         renderMonitorFmt(monitorFormat)
                         refreshMonitorLogDisplay(0)
                     },
+                    onCycleDensity = { cycleMonitorDensity() },
+                    onToggleDedup = { toggleMonitorDedup() },
                     onCopyAll = { copyText(monitorLogPanel.exportPlainText()) },
                     onClear = { clearMonitorLog() }
                 ),
-                onCopyEntry = { copySingleEntry(it) },
+                onInspectEntry = { list, idx -> openPacketDetail(list, idx) },
+                onLongCopyEntry = { copySingleEntry(it) },
                 onDismissed = {
                     if (fullscreenSource == FullscreenLogSource.MONITOR) {
                         fullscreenDialog = null
@@ -2136,11 +2318,14 @@ internal class NetToolsView(
                 actions = FullscreenLogActions(
                     onToggleRun = { toggleConsoleConnection() },
                     onCycleFormat = { toggleConsoleRxFormat() },
+                    onCycleDensity = { cycleConsoleDensity() },
+                    onToggleDedup = { toggleConsoleDedup() },
                     onCopyAll = { copyText(consoleLogPanel.exportPlainText()) },
                     onClear = { clearConsoleLog() },
                     onSendConsoleCommand = { raw -> sendConsoleRaw(raw) }
                 ),
-                onCopyEntry = { copySingleEntry(it) },
+                onInspectEntry = { list, idx -> openPacketDetail(list, idx) },
+                onLongCopyEntry = { copySingleEntry(it) },
                 onDismissed = {
                     if (fullscreenSource == FullscreenLogSource.CONSOLE) {
                         fullscreenDialog = null
@@ -2170,8 +2355,9 @@ internal class NetToolsView(
 
     private fun copySingleEntry(entry: LogEntry) {
         val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-        cm?.setPrimaryClip(ClipData.newPlainText("DockyCam Packet #${entry.seq}", entry.toClipboardText()))
-        Toast.makeText(context, "#${entry.seq} 항목을 복사했습니다", Toast.LENGTH_SHORT).show()
+        cm?.setPrimaryClip(ClipData.newPlainText("DockyCam Packet ${entry.displayIndexLabel()}", entry.toClipboardText()))
+        val sizeNote = entry.rawBytes?.let { " (${it.size}B 원문)" } ?: ""
+        Toast.makeText(context, "${entry.displayIndexLabel()} 원문을 복사했습니다$sizeNote", Toast.LENGTH_SHORT).show()
     }
 
     private fun styledInput(hintText: String, value: String, numeric: Boolean): EditText = EditText(context).apply {

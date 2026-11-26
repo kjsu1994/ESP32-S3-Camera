@@ -1,6 +1,8 @@
 package io.github.kjsu1994.workbenchcam
 
 import android.app.Dialog
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.graphics.Typeface
 import android.graphics.drawable.ColorDrawable
@@ -26,15 +28,206 @@ import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ListView
+import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
+
+internal enum class LogDisplayDensity(val label: String) {
+    SUMMARY("요약"),
+    COMPACT("1줄"),
+    FULL("전체")
+}
+
+internal enum class DetailViewMode(val label: String) {
+    TEXT("TEXT"),
+    HEX_DUMP("HEX 덤프"),
+    JSON("JSON 정렬")
+}
 
 internal data class LogEntry(
     val seq: Int,
     val header: String,
     val body: String,
-    val accentColor: Int
+    val accentColor: Int,
+    val compactPreview: String = "",
+    val rawBytes: ByteArray? = null,
+    val fullText: String = body,
+    val truncatedExtraBytes: Int = 0,
+    val dedupKey: String = "",
+    val firstSeq: Int = seq,
+    val repeatCount: Int = 1
 ) {
-    fun toClipboardText(): String = if (body.isEmpty()) header else "$header\n  $body"
+    fun displayIndexLabel(): String = if (repeatCount > 1) "#$firstSeq~$seq (×$repeatCount)" else "#$seq"
+
+    fun toClipboardText(): String {
+        val content = if (rawBytes != null) {
+            LogFormatter.formatReadableText(rawBytes)
+        } else {
+            fullText.ifEmpty { body }
+        }
+        return if (content.isEmpty()) "${displayIndexLabel()} $header" else "${displayIndexLabel()} $header\n$content"
+    }
+}
+
+internal object LogFormatter {
+    private val HEX_CHARS = "0123456789ABCDEF".toCharArray()
+
+    /**
+     * Wireshark-style canonical hex dump (default 8 bytes/line so portrait phones never wrap awkwardly).
+     */
+    fun formatCanonicalHexDump(data: ByteArray, bytesPerLine: Int = 8, maxBytes: Int = 32768): String {
+        if (data.isEmpty()) return "(빈 페이로드 · 0B)"
+        val limit = minOf(data.size, maxBytes)
+        val sb = StringBuilder(limit * 5)
+        var offset = 0
+        while (offset < limit) {
+            if (offset > 0) sb.append('\n')
+            // 4-digit hex offset (expands automatically past 64KB)
+            val offHex = offset.toString(16).uppercase().padStart(4, '0')
+            sb.append(offHex).append("  ")
+
+            val lineEnd = minOf(offset + bytesPerLine, limit)
+            for (i in offset until offset + bytesPerLine) {
+                if (i < lineEnd) {
+                    val b = data[i].toInt() and 0xFF
+                    sb.append(HEX_CHARS[b ushr 4]).append(HEX_CHARS[b and 0x0F]).append(' ')
+                } else {
+                    sb.append("   ")
+                }
+                if (bytesPerLine >= 8 && i == offset + (bytesPerLine / 2) - 1) {
+                    sb.append(' ')
+                }
+            }
+            sb.append("|")
+            for (i in offset until lineEnd) {
+                val c = data[i].toInt() and 0xFF
+                sb.append(if (c in 32..126) c.toChar() else '.')
+            }
+            sb.append('|')
+            offset += bytesPerLine
+        }
+        if (data.size > limit) {
+            sb.append("\n\n... (+${data.size - limit}B 생략 · [전체 복사] 또는 .pcap 저장으로 전체 확인)")
+        }
+        return sb.toString()
+    }
+
+    /**
+     * Decodes UTF-8 while keeping real newlines/tabs readable and replacing binary control bytes with '.'.
+     */
+    fun formatReadableText(data: ByteArray, maxBytes: Int = 65536): String {
+        if (data.isEmpty()) return "(빈 페이로드 · 0B)"
+        val limit = minOf(data.size, maxBytes)
+        val decoded = String(data, 0, limit, Charsets.UTF_8)
+        val sb = StringBuilder(decoded.length)
+        var i = 0
+        while (i < decoded.length) {
+            val ch = decoded[i]
+            when {
+                ch == '\r' -> {
+                    if (i + 1 < decoded.length && decoded[i + 1] == '\n') {
+                        sb.append('\n')
+                        i++
+                    } else {
+                        sb.append('\n')
+                    }
+                }
+                ch == '\n' || ch == '\t' -> sb.append(ch)
+                ch.code < 0x20 || ch.code == 0x7F -> sb.append('.')
+                else -> sb.append(ch)
+            }
+            i++
+        }
+        if (data.size > limit) {
+            sb.append("\n\n... (+${data.size - limit}B 생략)")
+        }
+        return sb.toString()
+    }
+
+    /**
+     * Single-line preview for compact mode (strips line breaks cleanly).
+     */
+    fun compactOneLine(data: ByteArray, maxChars: Int = 80): String {
+        if (data.isEmpty()) return "(0B)"
+        val ascii = HexCodec.bytesToAscii(data, maxChars)
+        val printableRatio = ascii.count { it != '.' }.toFloat() / ascii.length.coerceAtLeast(1)
+        return if (printableRatio >= 0.45f) {
+            ascii.replace('\n', ' ').replace('\r', ' ')
+        } else {
+            HexCodec.bytesToHex(data, 20)
+        }
+    }
+
+    /**
+     * Pretty-prints JSON objects/arrays (including JSON body embedded after HTTP headers).
+     * Returns null if no valid JSON structure is found.
+     */
+    fun tryPrettyJson(rawText: String): String? {
+        val trimmed = rawText.trim()
+        if (trimmed.isEmpty()) return null
+        val startIdx = when {
+            trimmed.startsWith("{") || trimmed.startsWith("[") -> 0
+            else -> {
+                val objIdx = trimmed.indexOf('{')
+                val arrIdx = trimmed.indexOf('[')
+                val candidate = listOf(objIdx, arrIdx).filter { it >= 0 }.minOrNull() ?: return null
+                // Only extract embedded JSON if preceded by whitespace/newline (e.g. HTTP body)
+                if (candidate > 0 && !trimmed[candidate - 1].isWhitespace()) return null
+                candidate
+            }
+        }
+        val prefix = if (startIdx > 0) trimmed.substring(0, startIdx).trimEnd() else ""
+        val jsonPart = trimmed.substring(startIdx).trim()
+        val openCh = jsonPart.firstOrNull() ?: return null
+        val expectedClose = if (openCh == '{') '}' else ']'
+        val endIdx = jsonPart.lastIndexOf(expectedClose)
+        if (endIdx <= 0) return null
+        val candidate = jsonPart.substring(0, endIdx + 1)
+
+        val sb = StringBuilder(candidate.length + 64)
+        var indent = 0
+        var inString = false
+        var escaped = false
+        for (ch in candidate) {
+            if (inString) {
+                sb.append(ch)
+                if (escaped) {
+                    escaped = false
+                } else if (ch == '\\') {
+                    escaped = true
+                } else if (ch == '"') {
+                    inString = false
+                }
+                continue
+            }
+            when (ch) {
+                '"' -> {
+                    inString = true
+                    sb.append(ch)
+                }
+                '{', '[' -> {
+                    sb.append(ch).append('\n')
+                    indent++
+                    repeat(indent) { sb.append("  ") }
+                }
+                '}', ']' -> {
+                    sb.append('\n')
+                    indent = (indent - 1).coerceAtLeast(0)
+                    repeat(indent) { sb.append("  ") }
+                    sb.append(ch)
+                }
+                ',' -> {
+                    sb.append(",\n")
+                    repeat(indent) { sb.append("  ") }
+                }
+                ':' -> sb.append(": ")
+                ' ', '\n', '\r', '\t' -> { /* skip outside strings */ }
+                else -> sb.append(ch)
+            }
+        }
+        if (inString || indent != 0) return null
+        return if (prefix.isNotEmpty()) "$prefix\n\n$sb" else sb.toString()
+    }
 }
 
 internal object LogFilter {
@@ -44,18 +237,60 @@ internal object LogFilter {
 
     fun clampFontSize(sp: Float): Float = sp.coerceIn(MIN_FONT_SP, MAX_FONT_SP)
 
-    fun matchesQuery(header: String, body: String, query: String): Boolean {
+    /**
+     * Multi-token case-insensitive matcher supporting `-exclude` tokens.
+     * Example: `C→T -PING -STATUS` includes entries matching `C→T` and hides entries matching `PING` or `STATUS`.
+     */
+    fun matchesQuery(header: String, body: String, query: String, extraText: String = ""): Boolean {
         val trimmed = query.trim()
         if (trimmed.isEmpty()) return true
         val tokens = trimmed.split(Regex("\\s+")).filter { it.isNotEmpty() }
-        return tokens.all { token ->
-            header.contains(token, ignoreCase = true) || body.contains(token, ignoreCase = true)
+        for (token in tokens) {
+            if (token.startsWith("-") && token.length > 1) {
+                val neg = token.substring(1)
+                if (header.contains(neg, ignoreCase = true) ||
+                    body.contains(neg, ignoreCase = true) ||
+                    (extraText.isNotEmpty() && extraText.contains(neg, ignoreCase = true))
+                ) {
+                    return false
+                }
+            } else {
+                val hit = header.contains(token, ignoreCase = true) ||
+                    body.contains(token, ignoreCase = true) ||
+                    (extraText.isNotEmpty() && extraText.contains(token, ignoreCase = true))
+                if (!hit) return false
+            }
         }
+        return true
     }
 
     fun filterEntries(entries: List<LogEntry>, query: String): List<LogEntry> {
         if (query.isBlank()) return entries
-        return entries.filter { matchesQuery(it.header, it.body, query) }
+        return entries.filter { entry ->
+            val extra = if (entry.fullText != entry.body) entry.fullText else ""
+            matchesQuery(entry.header, entry.body, query, extra)
+        }
+    }
+
+    /**
+     * Collapses consecutive entries with identical `dedupKey` into a single `×N` grouped row
+     * without discarding the underlying raw packets (so `.pcap` export remains 100% intact).
+     */
+    fun collapseConsecutiveDuplicates(entries: List<LogEntry>): List<LogEntry> {
+        if (entries.size <= 1) return entries
+        val out = ArrayList<LogEntry>(entries.size)
+        for (entry in entries) {
+            val prev = out.lastOrNull()
+            if (prev != null && entry.dedupKey.isNotEmpty() && prev.dedupKey == entry.dedupKey) {
+                out[out.lastIndex] = entry.copy(
+                    firstSeq = prev.firstSeq,
+                    repeatCount = prev.repeatCount + entry.repeatCount
+                )
+            } else {
+                out.add(entry)
+            }
+        }
+        return out
     }
 }
 
@@ -89,6 +324,7 @@ private class LogEntryAdapter(
 ) : BaseAdapter() {
     private var items: List<LogEntry> = emptyList()
     var bodyFontSp: Float = LogFilter.DEFAULT_FONT_SP
+    var density: LogDisplayDensity = LogDisplayDensity.SUMMARY
 
     fun replaceItems(newItems: List<LogEntry>) {
         items = newItems
@@ -102,7 +338,8 @@ private class LogEntryAdapter(
     private class Holder(
         val root: LinearLayout,
         val headerView: TextView,
-        val bodyView: TextView
+        val bodyView: TextView,
+        val truncHintView: TextView
     )
 
     override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
@@ -118,15 +355,22 @@ private class LogEntryAdapter(
                 setTextColor(UiStyle.INK)
                 setPadding(UiStyle.dp(context, 6), UiStyle.dp(context, 2), 0, 0)
             }
+            val truncTv = TextView(context).apply {
+                typeface = Typeface.MONOSPACE
+                setTextColor(UiStyle.CYAN)
+                setPadding(UiStyle.dp(context, 6), UiStyle.dp(context, 2), 0, 0)
+                visibility = View.GONE
+            }
             val row = LinearLayout(context).apply {
                 orientation = LinearLayout.VERTICAL
                 val hPad = UiStyle.dp(context, 10)
-                val vPad = UiStyle.dp(context, 6)
+                val vPad = UiStyle.dp(context, 5)
                 setPadding(hPad, vPad, hPad, vPad)
                 addView(headerTv, LinearLayout.LayoutParams(-1, -2))
                 addView(bodyTv, LinearLayout.LayoutParams(-1, -2))
+                addView(truncTv, LinearLayout.LayoutParams(-1, -2))
             }
-            holder = Holder(row, headerTv, bodyTv)
+            holder = Holder(row, headerTv, bodyTv, truncTv)
             row.tag = holder
             view = row
         } else {
@@ -135,9 +379,34 @@ private class LogEntryAdapter(
         }
 
         val entry = items[position]
-        holder.headerView.text = "#${entry.seq} ${entry.header}"
+        val compact = (density == LogDisplayDensity.COMPACT)
+        val vPad = UiStyle.dp(context, if (compact) 4 else 6)
+        val hPad = UiStyle.dp(context, 10)
+        holder.root.setPadding(hPad, vPad, hPad, vPad)
+
+        if (compact) {
+            val preview = entry.compactPreview.ifEmpty { entry.body.replace('\n', ' ') }
+            val line = if (preview.isNotEmpty()) {
+                "${entry.displayIndexLabel()} ${entry.header}  |  $preview"
+            } else {
+                "${entry.displayIndexLabel()} ${entry.header}"
+            }
+            holder.headerView.text = line
+            holder.headerView.setTextColor(entry.accentColor)
+            holder.headerView.textSize = (bodyFontSp - 0.5f).coerceAtLeast(9f)
+            holder.headerView.maxLines = 1
+            holder.headerView.ellipsize = TextUtils.TruncateAt.END
+            holder.bodyView.visibility = View.GONE
+            holder.truncHintView.visibility = View.GONE
+            return view
+        }
+
+        holder.headerView.maxLines = 3
+        holder.headerView.ellipsize = null
+        holder.headerView.text = "${entry.displayIndexLabel()} ${entry.header}"
         holder.headerView.setTextColor(entry.accentColor)
         holder.headerView.textSize = (bodyFontSp - 0.5f).coerceAtLeast(9f)
+
         if (entry.body.isEmpty()) {
             holder.bodyView.visibility = View.GONE
         } else {
@@ -145,19 +414,29 @@ private class LogEntryAdapter(
             holder.bodyView.text = entry.body
             holder.bodyView.textSize = bodyFontSp
         }
+
+        if (entry.truncatedExtraBytes > 0) {
+            holder.truncHintView.visibility = View.VISIBLE
+            holder.truncHintView.textSize = (bodyFontSp - 1f).coerceAtLeast(9f)
+            holder.truncHintView.text = "⋯ +${entry.truncatedExtraBytes}B 더 있음 · 탭하여 100% 전체 보기"
+        } else {
+            holder.truncHintView.visibility = View.GONE
+        }
         return view
     }
 }
 
 /**
  * Scrollable, high-throughput terminal log viewer with chronological ordering,
- * touch-aware auto-follow pause/resume, floating jump-to-latest pill, and 1-tap row copy.
+ * touch-aware auto-follow pause/resume, floating jump-to-latest pill,
+ * tap-to-inspect detail viewer, and long-press full copy.
  */
 internal class LiveLogPanel(
     private val context: Context,
     private var emptyPlaceholder: String,
     inlineMode: Boolean,
-    private val onCopyEntry: (LogEntry) -> Unit
+    private val onInspectEntry: (entries: List<LogEntry>, index: Int) -> Unit,
+    private val onLongCopyEntry: (LogEntry) -> Unit
 ) {
     val root: FrameLayout
     private val listView: LogListView
@@ -183,7 +462,15 @@ internal class LiveLogPanel(
             overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
             setOnItemClickListener { _, _, position, _ ->
                 if (position in currentEntries.indices) {
-                    onCopyEntry(currentEntries[position])
+                    onInspectEntry(currentEntries, position)
+                }
+            }
+            setOnItemLongClickListener { _, _, position, _ ->
+                if (position in currentEntries.indices) {
+                    onLongCopyEntry(currentEntries[position])
+                    true
+                } else {
+                    false
                 }
             }
             setOnScrollListener(object : AbsListView.OnScrollListener {
@@ -278,6 +565,13 @@ internal class LiveLogPanel(
 
     fun getFontSizeSp(): Float = adapter.bodyFontSp
 
+    fun setDisplayDensity(density: LogDisplayDensity) {
+        if (adapter.density != density) {
+            adapter.density = density
+            adapter.notifyDataSetChanged()
+        }
+    }
+
     fun setAutoFollow(enabled: Boolean, jumpNow: Boolean = enabled) {
         val changed = (autoFollow != enabled)
         autoFollow = enabled
@@ -343,7 +637,224 @@ internal class LiveLogPanel(
 
     fun exportPlainText(): String {
         if (currentEntries.isEmpty()) return ""
-        return currentEntries.joinToString("\n\n") { "#${it.seq} ${it.toClipboardText()}" }
+        return currentEntries.joinToString("\n\n") { it.toClipboardText() }
+    }
+}
+
+/**
+ * Full 100% payload inspector dialog triggered by tapping any log entry.
+ * Supports TEXT / Canonical HEX Dump / JSON Pretty-Print, full untruncated copy,
+ * and prev/next navigation across the visible log list.
+ */
+internal class PacketDetailDialog(
+    private val context: Context,
+    private val entries: List<LogEntry>,
+    startIndex: Int
+) {
+    private val dialog = Dialog(context, android.R.style.Theme_Black_NoTitleBar)
+    private var index = startIndex.coerceIn(0, (entries.size - 1).coerceAtLeast(0))
+    private var mode = DetailViewMode.TEXT
+
+    private val titleView: TextView
+    private val subtitleView: TextView
+    private val bodyScroll: ScrollView
+    private val bodyView: TextView
+    private val prevBtn: TextView
+    private val posLabel: TextView
+    private val nextBtn: TextView
+    private val copyBtn: TextView
+    private val renderModeChips: (DetailViewMode) -> Unit
+
+    init {
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
+        dialog.window?.apply {
+            setBackgroundDrawable(ColorDrawable(0xff060908.toInt()))
+            setLayout(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT)
+        }
+
+        titleView = UiStyle.label(context, "", 14.5f, UiStyle.ACCENT, bold = true).apply {
+            typeface = Typeface.MONOSPACE
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        subtitleView = UiStyle.label(context, "", 11.5f, UiStyle.SECONDARY).apply {
+            typeface = Typeface.MONOSPACE
+            maxLines = 2
+            ellipsize = TextUtils.TruncateAt.END
+        }
+
+        val closeBtn = UiStyle.compactChipButton(
+            context, "✕ 닫기", UiStyle.SURFACE_ALT, UiStyle.INK, UiStyle.BORDER
+        ) { dismiss() }
+
+        val topRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(LinearLayout(context).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(titleView)
+                addView(subtitleView)
+            }, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = UiStyle.dp(context, 8) })
+            addView(closeBtn)
+        }
+
+        val (modeChips, modeRenderer) = UiStyle.segmentedChips(
+            context,
+            DetailViewMode.entries.map { it to it.label },
+            mode
+        ) {
+            mode = it
+            renderCurrent()
+        }
+        renderModeChips = modeRenderer
+
+        val headerBox = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(UiStyle.SURFACE)
+            setPadding(UiStyle.dp(context, 12), UiStyle.dp(context, 10), UiStyle.dp(context, 12), UiStyle.dp(context, 10))
+            addView(topRow)
+            addView(modeChips, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 8) })
+        }
+
+        bodyView = TextView(context).apply {
+            textSize = 12f
+            typeface = Typeface.MONOSPACE
+            setTextColor(UiStyle.INK)
+            setTextIsSelectable(true)
+            val p = UiStyle.dp(context, 14)
+            setPadding(p, p, p, p)
+        }
+        bodyScroll = ScrollView(context).apply {
+            isFillViewport = true
+            setBackgroundColor(0xff060908.toInt())
+            addView(bodyView, FrameLayout.LayoutParams(-1, -2))
+        }
+
+        prevBtn = UiStyle.compactChipButton(context, "◀ 이전", UiStyle.SURFACE_ALT, UiStyle.INK, UiStyle.BORDER) {
+            if (index > 0) {
+                index--
+                renderCurrent()
+            }
+        }
+        posLabel = UiStyle.label(context, "", 12f, UiStyle.MUTED, bold = true).apply {
+            typeface = Typeface.MONOSPACE
+            gravity = Gravity.CENTER
+        }
+        nextBtn = UiStyle.compactChipButton(context, "다음 ▶", UiStyle.SURFACE_ALT, UiStyle.INK, UiStyle.BORDER) {
+            if (index < entries.lastIndex) {
+                index++
+                renderCurrent()
+            }
+        }
+        copyBtn = UiStyle.compactChipButton(context, "전체 복사", UiStyle.ACCENT_SOFT, UiStyle.ACCENT, UiStyle.ACCENT) {
+            copyCurrentFullPayload()
+        }
+
+        val bottomBar = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(UiStyle.SURFACE)
+            setPadding(UiStyle.dp(context, 12), UiStyle.dp(context, 8), UiStyle.dp(context, 12), UiStyle.dp(context, 8))
+            val gap = UiStyle.dp(context, 8)
+            addView(prevBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
+            addView(posLabel, LinearLayout.LayoutParams(0, -2, 1f))
+            addView(nextBtn, LinearLayout.LayoutParams(-2, -2).apply { marginStart = gap; marginEnd = gap })
+            addView(copyBtn)
+        }
+
+        val rootLayout = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(0xff060908.toInt())
+            addView(headerBox, LinearLayout.LayoutParams(-1, -2))
+            addView(View(context).apply { setBackgroundColor(UiStyle.BORDER) }, LinearLayout.LayoutParams(-1, UiStyle.dp(context, 1).coerceAtLeast(1)))
+            addView(bodyScroll, LinearLayout.LayoutParams(-1, 0, 1f))
+            addView(View(context).apply { setBackgroundColor(UiStyle.BORDER) }, LinearLayout.LayoutParams(-1, UiStyle.dp(context, 1).coerceAtLeast(1)))
+            addView(bottomBar, LinearLayout.LayoutParams(-1, -2))
+        }
+
+        rootLayout.setOnApplyWindowInsetsListener { v, insets ->
+            if (Build.VERSION.SDK_INT >= 30) {
+                val bars = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
+                v.setPadding(bars.left, bars.top, bars.right, bars.bottom)
+            } else {
+                @Suppress("DEPRECATION")
+                v.setPadding(
+                    insets.systemWindowInsetLeft,
+                    insets.systemWindowInsetTop,
+                    insets.systemWindowInsetRight,
+                    insets.systemWindowInsetBottom
+                )
+            }
+            insets
+        }
+
+        dialog.setContentView(rootLayout)
+        renderCurrent()
+    }
+
+    private fun renderCurrent() {
+        val entry = entries.getOrNull(index) ?: return
+        val byteStr = entry.rawBytes?.let { " · ${it.size}B" } ?: ""
+        titleView.text = "${entry.displayIndexLabel()} 패킷 원문$byteStr"
+        titleView.setTextColor(entry.accentColor)
+        subtitleView.text = entry.header
+
+        bodyView.text = renderEntryBody(entry, mode)
+        bodyScroll.scrollTo(0, 0)
+
+        posLabel.text = "${index + 1} / ${entries.size}"
+        prevBtn.isEnabled = index > 0
+        prevBtn.alpha = if (index > 0) 1f else 0.4f
+        nextBtn.isEnabled = index < entries.lastIndex
+        nextBtn.alpha = if (index < entries.lastIndex) 1f else 0.4f
+        renderModeChips(mode)
+    }
+
+    private fun renderEntryBody(entry: LogEntry, viewMode: DetailViewMode): String {
+        val raw = entry.rawBytes
+        return when (viewMode) {
+            DetailViewMode.TEXT -> {
+                if (raw != null) LogFormatter.formatReadableText(raw) else entry.fullText.ifEmpty { "(내용 없음)" }
+            }
+            DetailViewMode.HEX_DUMP -> {
+                val bytes = raw ?: entry.fullText.toByteArray(Charsets.UTF_8)
+                LogFormatter.formatCanonicalHexDump(bytes, bytesPerLine = 8)
+            }
+            DetailViewMode.JSON -> {
+                val src = if (raw != null) LogFormatter.formatReadableText(raw) else entry.fullText
+                LogFormatter.tryPrettyJson(src)
+                    ?: "(JSON 형식이 아닌 패킷입니다 · TEXT 또는 HEX 덤프 탭을 확인하세요)\n\n$src"
+            }
+        }
+    }
+
+    private fun copyCurrentFullPayload() {
+        val entry = entries.getOrNull(index) ?: return
+        val full = when (mode) {
+            DetailViewMode.TEXT -> entry.rawBytes?.let { LogFormatter.formatReadableText(it, maxBytes = Int.MAX_VALUE) } ?: entry.fullText
+            DetailViewMode.HEX_DUMP -> {
+                val bytes = entry.rawBytes ?: entry.fullText.toByteArray(Charsets.UTF_8)
+                LogFormatter.formatCanonicalHexDump(bytes, bytesPerLine = 8, maxBytes = 131072)
+            }
+            DetailViewMode.JSON -> {
+                val src = entry.rawBytes?.let { LogFormatter.formatReadableText(it, maxBytes = Int.MAX_VALUE) } ?: entry.fullText
+                LogFormatter.tryPrettyJson(src) ?: src
+            }
+        }
+        val textToCopy = "${entry.displayIndexLabel()} ${entry.header}\n$full"
+        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+        cm?.setPrimaryClip(ClipData.newPlainText("DockyCam Full Packet #${entry.seq}", textToCopy))
+        val sizeInfo = entry.rawBytes?.let { " (${it.size}B 전체)" } ?: ""
+        Toast.makeText(context, "${entry.displayIndexLabel()} 원문을 복사했습니다$sizeInfo", Toast.LENGTH_SHORT).show()
+    }
+
+    fun show() {
+        dialog.show()
+        dialog.window?.setLayout(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT)
+    }
+
+    fun dismiss() {
+        if (dialog.isShowing) runCatching { dialog.dismiss() }
     }
 }
 
@@ -351,6 +862,8 @@ internal data class FullscreenLogActions(
     val onToggleRun: (() -> Unit)? = null,
     val onCycleFilter: (() -> Unit)? = null,
     val onCycleFormat: (() -> Unit)? = null,
+    val onCycleDensity: (() -> Unit)? = null,
+    val onToggleDedup: (() -> Unit)? = null,
     val onExportPcap: (() -> Unit)? = null,
     val onCopyAll: () -> Unit,
     val onClear: () -> Unit,
@@ -359,14 +872,16 @@ internal data class FullscreenLogActions(
 
 /**
  * Dedicated edge-to-edge fullscreen live log viewer with keep-screen-on,
- * real-time search filter, font size adjustment, auto-scroll lock, and quick controls.
+ * real-time include/-exclude search filter, compact/summary/full density toggle,
+ * consecutive duplicate grouping, font size adjustment, and tap-to-inspect detail dialog.
  */
 internal class FullscreenLogDialog(
     private val context: Context,
     title: String,
     private val defaultEmptyText: String,
     private val actions: FullscreenLogActions,
-    onCopyEntry: (LogEntry) -> Unit,
+    onInspectEntry: (entries: List<LogEntry>, index: Int) -> Unit,
+    onLongCopyEntry: (LogEntry) -> Unit,
     private val onDismissed: () -> Unit
 ) {
     private val dialog = Dialog(context, android.R.style.Theme_Black_NoTitleBar)
@@ -376,6 +891,8 @@ internal class FullscreenLogDialog(
     private val runChip: TextView?
     private val filterChip: TextView?
     private val formatChip: TextView?
+    private val densityChip: TextView?
+    private val dedupChip: TextView?
     private val followChip: TextView
     private val searchToggleChip: TextView
     private val searchBar: LinearLayout
@@ -392,6 +909,7 @@ internal class FullscreenLogDialog(
             setBackgroundDrawable(ColorDrawable(0xff060908.toInt()))
             setLayout(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT)
             addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            @Suppress("DEPRECATION")
             setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
         }
 
@@ -447,6 +965,16 @@ internal class FullscreenLogDialog(
                 .also { controlsRow.addView(it, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap }) }
         }
 
+        densityChip = actions.onCycleDensity?.let { cb ->
+            UiStyle.compactChipButton(context, "보기: 요약", UiStyle.SURFACE_ALT, UiStyle.INK, UiStyle.BORDER) { cb() }
+                .also { controlsRow.addView(it, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap }) }
+        }
+
+        dedupChip = actions.onToggleDedup?.let { cb ->
+            UiStyle.compactChipButton(context, "×N 묶기", UiStyle.SURFACE_ALT, UiStyle.SECONDARY, UiStyle.BORDER) { cb() }
+                .also { controlsRow.addView(it, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap }) }
+        }
+
         followChip = UiStyle.compactChipButton(
             context, "▶ 라이브", UiStyle.ACCENT_SOFT, UiStyle.ACCENT, UiStyle.ACCENT
         ) {
@@ -493,7 +1021,7 @@ internal class FullscreenLogDialog(
         )
 
         searchField = EditText(context).apply {
-            hint = "실시간 로그 필터 (예: C→T, 01 03, GET, ERROR)"
+            hint = "포함: GET 01  /  제외: -PING -STATUS"
             textSize = 13f
             typeface = Typeface.MONOSPACE
             setTextColor(UiStyle.INK)
@@ -546,7 +1074,8 @@ internal class FullscreenLogDialog(
             context = context,
             emptyPlaceholder = defaultEmptyText,
             inlineMode = false,
-            onCopyEntry = onCopyEntry
+            onInspectEntry = onInspectEntry,
+            onLongCopyEntry = onLongCopyEntry
         ).apply {
             onAutoFollowChanged = { following -> renderFollowChip(following) }
         }
@@ -661,8 +1190,6 @@ internal class FullscreenLogDialog(
         dialog.window?.setLayout(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT)
     }
 
-    fun isShowing(): Boolean = dialog.isShowing
-
     fun dismiss() {
         if (dialog.isShowing) runCatching { dialog.dismiss() }
     }
@@ -673,7 +1200,9 @@ internal class FullscreenLogDialog(
         running: Boolean,
         runLabel: String? = null,
         filterLabel: String? = null,
-        formatLabel: String? = null
+        formatLabel: String? = null,
+        density: LogDisplayDensity? = null,
+        dedupEnabled: Boolean? = null
     ) {
         statsView.text = statusText
         statsView.setTextColor(statusColor)
@@ -693,6 +1222,28 @@ internal class FullscreenLogDialog(
         }
         if (formatChip != null && formatLabel != null) {
             formatChip.text = formatLabel
+        }
+        if (densityChip != null && density != null) {
+            densityChip.text = "보기: ${density.label}"
+            val highlighted = density != LogDisplayDensity.SUMMARY
+            densityChip.setTextColor(if (highlighted) UiStyle.CYAN else UiStyle.INK)
+            densityChip.background = UiStyle.rippleRounded(
+                context,
+                if (highlighted) UiStyle.CYAN_SOFT else UiStyle.SURFACE_ALT,
+                10,
+                if (highlighted) UiStyle.CYAN else UiStyle.BORDER
+            )
+            logPanel.setDisplayDensity(density)
+        }
+        if (dedupChip != null && dedupEnabled != null) {
+            dedupChip.text = if (dedupEnabled) "● ×N 묶기" else "×N 묶기"
+            dedupChip.setTextColor(if (dedupEnabled) UiStyle.ON_ACCENT else UiStyle.SECONDARY)
+            dedupChip.background = UiStyle.rippleRounded(
+                context,
+                if (dedupEnabled) UiStyle.AMBER else UiStyle.SURFACE_ALT,
+                10,
+                if (dedupEnabled) null else UiStyle.BORDER
+            )
         }
     }
 

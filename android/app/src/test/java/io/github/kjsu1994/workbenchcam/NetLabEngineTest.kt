@@ -357,4 +357,51 @@ class NetLabEngineTest {
         assertEquals(LogFilter.MAX_FONT_SP, LogFilter.clampFontSize(28f), 0.001f)
         assertEquals(12.5f, LogFilter.clampFontSize(12.5f), 0.001f)
     }
+
+    @Test fun logFilterSupportsExcludeTokensFullTextSearchAndDuplicateCollapsing() {
+        val entries = listOf(
+            LogEntry(1, "[17:50:01] C→T (4B)", "PING", 0, fullText = "PING", dedupKey = "C2T|PING"),
+            LogEntry(2, "[17:50:02] C→T (4B)", "PING", 0, fullText = "PING", dedupKey = "C2T|PING"),
+            LogEntry(3, "[17:50:03] C→T (4B)", "PING", 0, fullText = "PING", dedupKey = "C2T|PING"),
+            LogEntry(
+                4,
+                "[17:50:04] T→C (512B)",
+                "HEADER...",
+                0,
+                fullText = "HEADER...{\"status\":\"ALARM\",\"code\":42}",
+                dedupKey = "T2C|ALARM"
+            )
+        )
+
+        // Exclude -PING should hide entries 1..3 and keep only entry 4
+        val noPing = LogFilter.filterEntries(entries, "-ping")
+        assertEquals(listOf(4), noPing.map { it.seq })
+
+        // Searching a keyword present only in fullText (truncated from preview body) still matches
+        val deepMatch = LogFilter.filterEntries(entries, "ALARM -ping")
+        assertEquals(listOf(4), deepMatch.map { it.seq })
+
+        // Consecutive duplicates collapse into single x3 entry while preserving non-duplicates
+        val collapsed = LogFilter.collapseConsecutiveDuplicates(entries)
+        assertEquals(2, collapsed.size)
+        assertEquals(1, collapsed[0].firstSeq)
+        assertEquals(3, collapsed[0].seq)
+        assertEquals(3, collapsed[0].repeatCount)
+        assertEquals("#1~3 (×3)", collapsed[0].displayIndexLabel())
+        assertEquals(1, collapsed[1].repeatCount)
+    }
+
+    @Test fun logFormatterBuildsCanonicalHexDumpAndPrettyPrintsHttpEmbeddedJson() {
+        val hexDump = LogFormatter.formatCanonicalHexDump("GET /api\r\n".toByteArray(Charsets.US_ASCII), bytesPerLine = 8)
+        assertTrue(hexDump.contains("0000  47 45 54 20  2F 61 70 69 |GET /api|"))
+        assertTrue(hexDump.contains("0008  0D 0A"))
+
+        val httpJson = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"ok\":true,\"items\":[1,2]}"
+        val pretty = LogFormatter.tryPrettyJson(httpJson)
+        assertTrue("Expected pretty-printed JSON, got null", pretty != null)
+        assertTrue(pretty!!.contains("HTTP/1.1 200 OK"))
+        assertTrue(pretty.contains("\"ok\": true"))
+        assertTrue(pretty.contains("  \"items\": ["))
+        assertEquals(null, LogFormatter.tryPrettyJson("PLAIN TEXT ONLY"))
+    }
 }
