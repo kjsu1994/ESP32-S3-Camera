@@ -310,6 +310,8 @@ class MainActivity : Activity() {
             onCreateFolder = ::promptCreateSharedFolder,
             onRenameEntry = ::promptRenameSdEntry,
             onPlayFile = ::playSdFile,
+            onConvertMp4 = ::convertSdFileToMp4,
+            onQrShareFile = ::showQrForSdFile,
             onDownloadFile = ::downloadSdFile,
             onDeleteFile = ::confirmDeleteSdFile,
             onDeleteFolder = ::confirmDeleteSdFolder,
@@ -407,6 +409,7 @@ class MainActivity : Activity() {
             onScanHomeWifi = ::scanNearbyWifiFromBoard,
             onSaveHomeWifi = ::saveHomeWifiToBoard,
             onToggleBoardLed = ::updateBoardLedMode,
+            onShowWebQr = ::showQrForWebDashboard,
             onPickOtaFile = ::pickOtaFirmwareFile,
             onRebootBoard = ::confirmRebootBoard,
             onClearSdCategory = ::confirmClearSdCategory
@@ -1530,6 +1533,48 @@ class MainActivity : Activity() {
             return
         }
         SdPlayerDialog(this, connected, item, ::downloadSdFile).show()
+    }
+
+    private fun preferredQrHost(): String? =
+        wifiStatus?.ip?.takeIf(::isAllowedLocalHost) ?: boardTarget?.host
+
+    private fun qrWifiHint(): String {
+        val wf = wifiStatus
+        return when {
+            wf != null && wf.mode == "sta" -> "같은 Wi-Fi(${wf.ssid})에 연결된 다른 기기에서 카메라로 스캔하면 바로 열립니다"
+            else -> "다른 기기를 DockyCam Wi-Fi에 연결한 뒤 카메라로 스캔하세요"
+        }
+    }
+
+    private fun showQrForSdFile(item: SdFileItem) {
+        val connected = boardTarget ?: return
+        val url = BoardApi(connected).sdFileUrl(item, preferredQrHost())
+        val catLabel = UiStyle.categoryMeta(item.category).first
+        QrShareDialog.show(
+            activity = this,
+            title = item.name,
+            subtitle = "$catLabel · ${UiStyle.formatSize(item.sizeBytes)}",
+            url = url,
+            wifiHint = qrWifiHint()
+        )
+    }
+
+    private fun showQrForWebDashboard() {
+        val connected = boardTarget ?: return
+        val url = BoardApi(connected).webDashboardUrl(preferredQrHost())
+        QrShareDialog.show(
+            activity = this,
+            title = "DockyCam 웹 대시보드",
+            subtitle = "앱 설치 없이 브라우저에서 바로 열기",
+            url = url,
+            wifiHint = qrWifiHint()
+        )
+    }
+
+    private fun convertSdFileToMp4(item: SdFileItem) {
+        val connected = boardTarget ?: return
+        if (preview != null) stopPreview()
+        AviToMp4Converter.showConvertDialog(this, connected, item)
     }
 
     private fun downloadSdFile(item: SdFileItem) {

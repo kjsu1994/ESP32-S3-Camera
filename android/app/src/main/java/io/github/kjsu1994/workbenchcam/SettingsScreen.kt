@@ -42,6 +42,7 @@ internal class SettingsScreen(
     private val onScanHomeWifi: () -> Unit,
     private val onSaveHomeWifi: (staEnabled: Boolean, ssid: String, pass: String?) -> Unit,
     private val onToggleBoardLed: (Boolean) -> Unit,
+    private val onShowWebQr: () -> Unit,
     private val onPickOtaFile: () -> Unit,
     private val onRebootBoard: () -> Unit,
     private val onClearSdCategory: (String) -> Unit
@@ -65,6 +66,7 @@ internal class SettingsScreen(
     private val disconnectBtn: Button
     private val staCurrentBadge: TextView
     private val staWebUrlText: TextView
+    private val staWebQrBtn: TextView
     private val staScanBtn: Button
     private val staScanStatus: TextView
     private val staScanList: LinearLayout
@@ -233,10 +235,17 @@ internal class SettingsScreen(
                 LinearLayout.LayoutParams(0, -2, 1f))
             addView(staCurrentBadge)
         })
-        staWebUrlText = UiStyle.label(context, "PC 브라우저: http://192.168.4.1/", 12.5f, UiStyle.SECONDARY).apply {
+        staWebUrlText = UiStyle.label(context, "PC 브라우저: http://192.168.4.1/", 12.5f, UiStyle.SECONDARY)
+        staWebQrBtn = UiStyle.compactChipButton(
+            context, "QR 열기", UiStyle.CYAN_SOFT, UiStyle.CYAN, UiStyle.BORDER, onShowWebQr
+        ).apply { visibility = View.GONE }
+        staCard.addView(LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
             setPadding(0, UiStyle.dp(context, 6), 0, UiStyle.dp(context, 10))
-        }
-        staCard.addView(staWebUrlText)
+            addView(staWebUrlText, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = UiStyle.dp(context, 8) })
+            addView(staWebQrBtn)
+        })
 
         staScanBtn = UiStyle.secondaryButton(context, "주변 2.4GHz Wi-Fi 목록 검색") {
             setScanning(true)
@@ -579,6 +588,7 @@ internal class SettingsScreen(
         sdControlsContainer.visibility = if (connected) View.VISIBLE else View.GONE
         staScanBtn.isEnabled = connected
         staScanBtn.alpha = if (connected) 1f else 0.45f
+        staWebQrBtn.visibility = if (connected) View.VISIBLE else View.GONE
         staSaveBtn.isEnabled = connected
         staSaveBtn.alpha = if (connected) 1f else 0.45f
         staBackToApBtn.isEnabled = connected

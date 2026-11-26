@@ -61,6 +61,7 @@ internal class SdPlayerDialog(
     private lateinit var stepPrevBtn: TextView
     private lateinit var stepNextBtn: TextView
     private lateinit var saveFrameBtn: FrameLayout
+    private lateinit var mp4ConvertBtn: TextView
     private lateinit var loadingCard: LinearLayout
     private lateinit var loadingLabel: TextView
     private lateinit var loadingBarFill: View
@@ -119,6 +120,17 @@ internal class SdPlayerDialog(
         }.apply {
             visibility = View.GONE
         }
+        mp4ConvertBtn = UiStyle.compactChipButton(
+            activity, "MP4", UiStyle.AMBER_SOFT, UiStyle.AMBER, 0xff594218.toInt()
+        ) {
+            playing = false
+            updatePlayButton()
+            handler.removeCallbacks(playbackTick)
+            AviToMp4Converter.showConvertDialog(activity, target, item, cacheFile, aviIndex)
+        }.apply {
+            visibility = View.GONE
+            minimumHeight = UiStyle.dp(activity, 38)
+        }
         val downloadBtn = UiStyle.iconCircleButton(
             activity, R.drawable.ic_download, "원본 다운로드", UiStyle.SURFACE_ALT, UiStyle.INK, 40
         ) {
@@ -139,6 +151,9 @@ internal class SdPlayerDialog(
             }, LinearLayout.LayoutParams(0, -2, 1f).apply {
                 marginStart = UiStyle.dp(activity, 12)
                 marginEnd = UiStyle.dp(activity, 8)
+            })
+            addView(mp4ConvertBtn, LinearLayout.LayoutParams(-2, -2).apply {
+                marginEnd = UiStyle.dp(activity, 6)
             })
             addView(saveFrameBtn, LinearLayout.LayoutParams(UiStyle.dp(activity, 40), UiStyle.dp(activity, 40)).apply {
                 marginEnd = UiStyle.dp(activity, 6)
@@ -475,6 +490,7 @@ internal class SdPlayerDialog(
                     statusText.visibility = View.GONE
                     transportDock.visibility = View.VISIBLE
                     saveFrameBtn.visibility = View.VISIBLE
+                    mp4ConvertBtn.visibility = View.VISIBLE
                     seekBar.max = indexed.frames.lastIndex.coerceAtLeast(0)
                     playing = true
                     updatePlayButton()

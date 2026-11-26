@@ -64,6 +64,8 @@ internal class CameraScreen(
     private val onCreateFolder: () -> Unit,
     private val onRenameEntry: (category: String, dir: String, name: String, isDir: Boolean) -> Unit,
     private val onPlayFile: (SdFileItem) -> Unit,
+    private val onConvertMp4: (SdFileItem) -> Unit,
+    private val onQrShareFile: (SdFileItem) -> Unit,
     private val onDownloadFile: (SdFileItem) -> Unit,
     private val onDeleteFile: (SdFileItem) -> Unit,
     private val onDeleteFolder: (dir: String, name: String) -> Unit,
@@ -1560,16 +1562,24 @@ internal class CameraScreen(
             }
 
             if (!selectionMode) {
+                val isAvi = lower.endsWith(".avi")
                 val actions = LinearLayout(context).apply {
                     orientation = LinearLayout.HORIZONTAL
                     gravity = Gravity.END or Gravity.CENTER_VERTICAL
-                    setPadding(0, UiStyle.dp(context, 10), 0, 0)
                     val gap = UiStyle.dp(context, 6)
                     if (playable) {
                         addView(UiStyle.compactChipButton(
                             context, "재생", UiStyle.ACCENT_SOFT, UiStyle.ACCENT, UiStyle.ACCENT
                         ) { onPlayFile(item) }, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
                     }
+                    if (isAvi) {
+                        addView(UiStyle.compactChipButton(
+                            context, "MP4", UiStyle.AMBER_SOFT, UiStyle.AMBER, 0xff594218.toInt()
+                        ) { onConvertMp4(item) }, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
+                    }
+                    addView(UiStyle.compactChipButton(
+                        context, "QR", UiStyle.CYAN_SOFT, UiStyle.CYAN, UiStyle.BORDER
+                    ) { onQrShareFile(item) }, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
                     addView(UiStyle.compactChipButton(
                         context, "저장", UiStyle.SURFACE_ALT, UiStyle.INK, UiStyle.BORDER
                     ) { onDownloadFile(item) }, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
@@ -1581,7 +1591,13 @@ internal class CameraScreen(
                         context, "삭제", UiStyle.DANGER_SOFT, UiStyle.DANGER, 0xff5A2427.toInt()
                     ) { onDeleteFile(item) })
                 }
-                card.addView(actions)
+                val actionScroll = HorizontalScrollView(context).apply {
+                    isHorizontalScrollBarEnabled = false
+                    isFillViewport = true
+                    setPadding(0, UiStyle.dp(context, 10), 0, 0)
+                    addView(actions, FrameLayout.LayoutParams(-1, -2))
+                }
+                card.addView(actionScroll, LinearLayout.LayoutParams(-1, -2))
             }
 
             card.setOnClickListener {

@@ -309,6 +309,19 @@ internal class BoardApi(private val target: BoardTarget) {
     private fun encodeQuery(value: String): String =
         URLEncoder.encode(value, "UTF-8").replace("+", "%20")
 
+    fun webDashboardUrl(preferredHost: String? = null): String {
+        val host = preferredHost?.takeIf(::isAllowedLocalHost) ?: target.host
+        return "http://$host/"
+    }
+
+    fun sdFileUrl(item: SdFileItem, preferredHost: String? = null): String {
+        val host = preferredHost?.takeIf(::isAllowedLocalHost) ?: target.host
+        val encCat = encodeQuery(item.category)
+        val encName = encodeQuery(item.name)
+        val dirParam = if (item.dir.isNotEmpty()) "&dir=${encodeQuery(item.dir)}" else ""
+        return "http://$host/sd/file?cat=$encCat&name=$encName$dirParam"
+    }
+
     fun listSdDirectory(category: String = "all", dir: String = ""): SdListing {
         val encCat = encodeQuery(category)
         val dirParam = if (dir.isNotEmpty()) "&dir=${encodeQuery(dir)}" else ""
