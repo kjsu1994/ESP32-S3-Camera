@@ -6,12 +6,17 @@ import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Typeface
 import android.os.Build
+import android.text.Editable
+import android.text.TextUtils
+import android.text.TextWatcher
 import android.view.Gravity
 import android.view.View
 import android.view.View.MeasureSpec
 import android.view.WindowInsets
 import android.widget.Button
+import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -20,6 +25,11 @@ import android.widget.TextView
 import java.util.Locale
 
 internal enum class AppTab { LIVE, RECORD, LIBRARY }
+internal enum class LibrarySort(val label: String) {
+    LATEST("최신순"),
+    NAME("이름순"),
+    SIZE("용량순")
+}
 
 internal class CameraScreen(
     private val context: Context,
@@ -27,6 +37,7 @@ internal class CameraScreen(
     private val fullscreen: Boolean,
     private var fillVideo: Boolean,
     private var gridEnabled: Boolean,
+    private var hudEnabled: Boolean,
     private var activeTab: AppTab,
     private var selectedCategory: String,
     private val start: () -> Unit,
@@ -36,6 +47,7 @@ internal class CameraScreen(
     private val toggleFullscreen: () -> Unit,
     private val toggleFreeze: () -> Unit,
     private val toggleGrid: () -> Unit,
+    private val toggleHud: () -> Unit,
     private val onToggleFill: (Boolean) -> Unit,
     private val onFullscreenVideoTap: () -> Unit,
     private val onTabSelected: (AppTab) -> Unit,
@@ -48,9 +60,14 @@ internal class CameraScreen(
     private val onRefreshLibrary: () -> Unit,
     private val onUploadSharedFile: () -> Unit,
     private val onOpenNotes: () -> Unit,
+    private val onNavigateDir: (String) -> Unit,
+    private val onCreateFolder: () -> Unit,
+    private val onRenameEntry: (category: String, dir: String, name: String, isDir: Boolean) -> Unit,
     private val onPlayFile: (SdFileItem) -> Unit,
     private val onDownloadFile: (SdFileItem) -> Unit,
-    private val onDeleteFile: (SdFileItem) -> Unit
+    private val onDeleteFile: (SdFileItem) -> Unit,
+    private val onDeleteFolder: (dir: String, name: String) -> Unit,
+    private val onBatchDelete: (List<SdDeleteTarget>) -> Unit
 ) {
     val root = FrameLayout(context)
 
@@ -75,6 +92,29 @@ internal class CameraScreen(
         typeface = Typeface.MONOSPACE
         visibility = View.GONE
     }
+    private val liveHudBadge = TextView(context).apply {
+        textSize = 10.5f
+        typeface = Typeface.MONOSPACE
+        setTextColor(UiStyle.INK)
+        maxLines = 1
+        ellipsize = TextUtils.TruncateAt.END
+        background = UiStyle.rounded(context, UiStyle.OVERLAY, 99, UiStyle.BORDER)
+        setPadding(UiStyle.dp(context, 10), UiStyle.dp(context, 4), UiStyle.dp(context, 10), UiStyle.dp(context, 4))
+        visibility = View.GONE
+    }
+    private val fsTopHudText = TextView(context).apply {
+        textSize = 11f
+        typeface = Typeface.MONOSPACE
+        setTextColor(UiStyle.ACCENT)
+        maxLines = 1
+        ellipsize = TextUtils.TruncateAt.END
+        setPadding(0, UiStyle.dp(context, 3), 0, 0)
+        visibility = View.GONE
+    }
+    private var liveHudToggleBtn: TextView? = null
+    private var fsHudBtn: Button? = null
+    private var lastLiveHudText: String? = null
+    private var fsOverlayShown = true
     private val telemetryText = UiStyle.label(context, "", 12.5f, UiStyle.SECONDARY).apply {
         visibility = View.GONE
         background = UiStyle.rounded(context, UiStyle.SURFACE, 12, UiStyle.BORDER)
@@ -144,10 +184,28 @@ internal class CameraScreen(
     // Library Tab views
     private var libNotConnectedCard: View? = null
     private var libContent: LinearLayout? = null
+    private var libUploadBtn: Button? = null
+    private var libMkdirBtn: Button? = null
+    private var libBreadcrumbBar: LinearLayout? = null
+    private var libBreadcrumbRow: LinearLayout? = null
+    private var libSearchInput: EditText? = null
+    private var libSearchClearBtn: TextView? = null
+    private var libSelectToggleBtn: TextView? = null
+    private var libSelectionBar: LinearLayout? = null
+    private var libSelectionCount: TextView? = null
+    private var libBatchDeleteBtn: TextView? = null
     private var libUploadBanner: TextView? = null
     private var libSummaryText: TextView? = null
     private var libListContainer: LinearLayout? = null
     private var renderCategoryChips: ((String) -> Unit)? = null
+    private val sortChipViews = LinkedHashMap<LibrarySort, TextView>()
+
+    private var currentListing: SdListing? = null
+    private var libraryLoading = false
+    private var searchQuery = ""
+    private var currentSort = LibrarySort.LATEST
+    private var selectionMode = false
+    private val selectedItems = LinkedHashSet<SdDeleteTarget>()
 
     init {
         if (fullscreen) {
@@ -166,13 +224,21 @@ internal class CameraScreen(
             setOnClickListener { onVideoTap() }
         }
         root.addView(videoContainer, FrameLayout.LayoutParams(-1, -1))
+        val fsHudPin = FrameLayout(context).apply {
+            isClickable = false
+            isFocusable = false
+            addView(liveHudBadge, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.END))
+        }
+        root.addView(fsHudPin, FrameLayout.LayoutParams(-1, -1))
 
         telemetryText.background = null
         telemetryText.setPadding(0, UiStyle.dp(context, 2), 0, 0)
         telemetryText.textSize = 11.5f
 
+        val hBtn = UiStyle.secondaryButton(context, if (hudEnabled) "HUD 끄기" else "HUD", toggleHud)
         val gBtn = UiStyle.secondaryButton(context, if (gridEnabled) "그리드 끄기" else "그리드", toggleGrid)
         val exitBtn = UiStyle.secondaryButton(context, "나가기", toggleFullscreen)
+        fsHudBtn = hBtn
         fsGridBtn = gBtn
 
         val topBar = LinearLayout(context).apply {
@@ -189,8 +255,10 @@ internal class CameraScreen(
                     addView(timerText, LinearLayout.LayoutParams(-2, -2).apply { marginStart = UiStyle.dp(context, 8) })
                     addView(zoomBadge, LinearLayout.LayoutParams(-2, -2).apply { marginStart = UiStyle.dp(context, 8) })
                 })
+                addView(fsTopHudText)
                 addView(telemetryText)
             }, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = UiStyle.dp(context, 10) })
+            addView(hBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = UiStyle.dp(context, 8) })
             addView(gBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = UiStyle.dp(context, 8) })
             addView(exitBtn)
         }
@@ -240,6 +308,12 @@ internal class CameraScreen(
                     cutout?.safeInsetRight ?: 0, cutout?.safeInsetBottom ?: 0)
             }
             overlay.setPadding(
+                offsets[0] + UiStyle.dp(context, 16),
+                offsets[1] + UiStyle.dp(context, 12),
+                offsets[2] + UiStyle.dp(context, 16),
+                offsets[3] + UiStyle.dp(context, 12)
+            )
+            fsHudPin.setPadding(
                 offsets[0] + UiStyle.dp(context, 16),
                 offsets[1] + UiStyle.dp(context, 12),
                 offsets[2] + UiStyle.dp(context, 16),
@@ -369,6 +443,19 @@ internal class CameraScreen(
         )
         videoFullscreenBtn = fsIconBtn
 
+        val hudPillBtn = TextView(context).apply {
+            text = "HUD"
+            textSize = 10.5f
+            typeface = Typeface.MONOSPACE
+            gravity = Gravity.CENTER
+            isClickable = true
+            isFocusable = true
+            setPadding(UiStyle.dp(context, 10), UiStyle.dp(context, 5), UiStyle.dp(context, 10), UiStyle.dp(context, 5))
+            setOnClickListener { toggleHud() }
+        }
+        liveHudToggleBtn = hudPillBtn
+        styleLiveHudToggle()
+
         val videoStage = VideoFrame(context).apply {
             background = UiStyle.rounded(context, 0xff060908.toInt(), 18, UiStyle.BORDER)
             clipToOutline = true
@@ -376,6 +463,12 @@ internal class CameraScreen(
             addView(idleText, FrameLayout.LayoutParams(-1, -1))
             addView(zoomBadge, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START).apply {
                 setMargins(UiStyle.dp(context, 10), UiStyle.dp(context, 10), 0, 0)
+            })
+            addView(liveHudBadge, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.END).apply {
+                setMargins(UiStyle.dp(context, 10), UiStyle.dp(context, 10), UiStyle.dp(context, 10), 0)
+            })
+            addView(hudPillBtn, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.START).apply {
+                setMargins(UiStyle.dp(context, 10), 0, 0, UiStyle.dp(context, 10))
             })
             addView(fsIconBtn, FrameLayout.LayoutParams(UiStyle.dp(context, 38), UiStyle.dp(context, 38), Gravity.BOTTOM or Gravity.END).apply {
                 setMargins(0, 0, UiStyle.dp(context, 10), UiStyle.dp(context, 10))
@@ -660,6 +753,8 @@ internal class CameraScreen(
             selectedCategory
         ) {
             selectedCategory = it
+            exitSelectionModeInternal(render = false)
+            updateSharedControlsVisibility()
             onCategorySelected(it)
         }
         renderCategoryChips = catRenderer
@@ -674,14 +769,131 @@ internal class CameraScreen(
             addView(refreshBtn)
         })
 
+        val uploadBtn = UiStyle.primaryButton(context, "공유함 파일 업로드", onUploadSharedFile)
+        val mkdirBtn = UiStyle.secondaryButton(context, "+ 새 폴더", onCreateFolder)
+        val notesBtn = UiStyle.secondaryButton(context, "메모장", onOpenNotes)
+        libUploadBtn = uploadBtn
+        libMkdirBtn = mkdirBtn
         val cloudRow = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
-            val uploadBtn = UiStyle.primaryButton(context, "공유함 파일 업로드", onUploadSharedFile)
-            val notesBtn = UiStyle.secondaryButton(context, "빠른 메모장", onOpenNotes)
             addView(uploadBtn, LinearLayout.LayoutParams(0, -2, 1.25f).apply { marginEnd = UiStyle.dp(context, 8) })
-            addView(notesBtn, LinearLayout.LayoutParams(0, -2, 0.85f))
+            addView(mkdirBtn, LinearLayout.LayoutParams(0, -2, 0.85f).apply { marginEnd = UiStyle.dp(context, 8) })
+            addView(notesBtn, LinearLayout.LayoutParams(0, -2, 0.72f))
         }
         content.addView(cloudRow, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 10) })
+
+        // Breadcrumb bar (only shown inside shared subfolders)
+        val bcRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        libBreadcrumbRow = bcRow
+        val bcUpBtn = UiStyle.compactChipButton(
+            context, "← 상위", UiStyle.SURFACE_ALT, UiStyle.ACCENT, UiStyle.BORDER
+        ) {
+            val cur = currentListing?.dir.orEmpty()
+            if (cur.isNotEmpty()) {
+                val parent = cur.substringBeforeLast('/', "")
+                onNavigateDir(parent)
+            }
+        }
+        val bcScroll = HorizontalScrollView(context).apply {
+            isHorizontalScrollBarEnabled = false
+            addView(bcRow)
+        }
+        val bcBar = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            visibility = View.GONE
+            background = UiStyle.rounded(context, UiStyle.SURFACE, 12, UiStyle.BORDER)
+            setPadding(UiStyle.dp(context, 8), UiStyle.dp(context, 6), UiStyle.dp(context, 10), UiStyle.dp(context, 6))
+            addView(bcUpBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = UiStyle.dp(context, 8) })
+            addView(bcScroll, LinearLayout.LayoutParams(0, -2, 1f))
+        }
+        libBreadcrumbBar = bcBar
+        content.addView(bcBar, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 8) })
+
+        // Search input + Selection mode toggle
+        val searchClear = TextView(context).apply {
+            text = "✕"
+            textSize = 13f
+            setTextColor(UiStyle.MUTED)
+            gravity = Gravity.CENTER
+            visibility = View.GONE
+            isClickable = true
+            setPadding(UiStyle.dp(context, 10), UiStyle.dp(context, 6), UiStyle.dp(context, 10), UiStyle.dp(context, 6))
+            setOnClickListener { libSearchInput?.setText("") }
+        }
+        libSearchClearBtn = searchClear
+        val searchField = EditText(context).apply {
+            hint = "파일·폴더 이름 검색..."
+            textSize = 13.5f
+            setTextColor(UiStyle.INK)
+            setHintTextColor(UiStyle.MUTED)
+            setSingleLine(true)
+            background = null
+            setPadding(UiStyle.dp(context, 12), UiStyle.dp(context, 8), UiStyle.dp(context, 4), UiStyle.dp(context, 8))
+            minimumHeight = UiStyle.dp(context, 40)
+            addTextChangedListener(object : TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+                override fun afterTextChanged(s: Editable?) {
+                    searchQuery = s?.toString().orEmpty().trim()
+                    searchClear.visibility = if (searchQuery.isNotEmpty()) View.VISIBLE else View.GONE
+                    renderLibraryItems()
+                }
+            })
+        }
+        libSearchInput = searchField
+        val searchBox = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = UiStyle.rounded(context, UiStyle.SURFACE, 12, UiStyle.BORDER)
+            addView(searchField, LinearLayout.LayoutParams(0, -2, 1f))
+            addView(searchClear)
+        }
+        val selectBtn = UiStyle.compactChipButton(
+            context, "선택", UiStyle.SURFACE, UiStyle.SECONDARY, UiStyle.BORDER
+        ) {
+            toggleSelectionMode()
+        }.apply {
+            minimumHeight = UiStyle.dp(context, 40)
+            setPadding(UiStyle.dp(context, 14), UiStyle.dp(context, 8), UiStyle.dp(context, 14), UiStyle.dp(context, 8))
+        }
+        libSelectToggleBtn = selectBtn
+        content.addView(LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(searchBox, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = UiStyle.dp(context, 8) })
+            addView(selectBtn)
+        }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 10) })
+
+        // Selection batch action bar (shown only in selectionMode)
+        val selCount = UiStyle.label(context, "0개 선택됨", 13f, UiStyle.ACCENT, bold = true)
+        libSelectionCount = selCount
+        val selAllBtn = UiStyle.compactChipButton(
+            context, "전체 선택", UiStyle.SURFACE, UiStyle.INK, UiStyle.BORDER
+        ) { toggleSelectAllVisible() }
+        val selDelBtn = UiStyle.compactChipButton(
+            context, "선택 삭제", UiStyle.DANGER_SOFT, UiStyle.DANGER, 0xff5A2427.toInt()
+        ) {
+            if (selectedItems.isNotEmpty()) {
+                onBatchDelete(selectedItems.toList())
+            }
+        }
+        libBatchDeleteBtn = selDelBtn
+        val selBar = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            visibility = View.GONE
+            background = UiStyle.rounded(context, UiStyle.SURFACE_ALT, 12, UiStyle.ACCENT)
+            setPadding(UiStyle.dp(context, 12), UiStyle.dp(context, 8), UiStyle.dp(context, 10), UiStyle.dp(context, 8))
+            addView(selCount, LinearLayout.LayoutParams(0, -2, 1f))
+            addView(selAllBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = UiStyle.dp(context, 6) })
+            addView(selDelBtn)
+        }
+        libSelectionBar = selBar
+        content.addView(selBar, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 8) })
 
         val uploadBanner = UiStyle.label(context, "", 12.5f, UiStyle.CYAN, bold = true).apply {
             visibility = View.GONE
@@ -691,17 +903,47 @@ internal class CameraScreen(
         libUploadBanner = uploadBanner
         content.addView(uploadBanner, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 8) })
 
-        val summary = UiStyle.label(context, "파일 목록 불러오는 중...", 12.5f, UiStyle.MUTED).apply {
-            setPadding(UiStyle.dp(context, 4), UiStyle.dp(context, 10), 0, UiStyle.dp(context, 8))
+        // Sort pills + compact summary on one balanced row
+        sortChipViews.clear()
+        val sortRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        LibrarySort.entries.forEach { sort ->
+            val chip = UiStyle.compactChipButton(context, sort.label) {
+                currentSort = sort
+                styleSortChips()
+                renderLibraryItems()
+            }.apply {
+                textSize = 11.5f
+                setPadding(UiStyle.dp(context, 9), UiStyle.dp(context, 4), UiStyle.dp(context, 9), UiStyle.dp(context, 4))
+            }
+            sortChipViews[sort] = chip
+            sortRow.addView(chip, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = UiStyle.dp(context, 6) })
+        }
+        styleSortChips()
+
+        val summary = UiStyle.label(context, "파일 목록 불러오는 중...", 12f, UiStyle.MUTED).apply {
+            gravity = Gravity.END
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
         }
         libSummaryText = summary
-        content.addView(summary)
+        content.addView(LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(UiStyle.dp(context, 2), UiStyle.dp(context, 10), UiStyle.dp(context, 2), UiStyle.dp(context, 8))
+            addView(sortRow, LinearLayout.LayoutParams(-2, -2))
+            addView(summary, LinearLayout.LayoutParams(0, -2, 1f).apply { marginStart = UiStyle.dp(context, 8) })
+        })
 
         val listContainer = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
         }
         libListContainer = listContainer
         content.addView(listContainer)
+
+        updateSharedControlsVisibility()
 
         wrapper.addView(content)
         return ScrollView(context).apply {
@@ -761,6 +1003,46 @@ internal class CameraScreen(
         fsGridBtn?.text = if (enabled) "그리드 끄기" else "그리드"
     }
 
+    fun showHudEnabled(enabled: Boolean) {
+        hudEnabled = enabled
+        styleLiveHudToggle()
+        fsHudBtn?.text = if (enabled) "HUD 끄기" else "HUD"
+        refreshLiveHudVisibility()
+    }
+
+    fun showLiveHud(text: String?) {
+        lastLiveHudText = text
+        if (text != null) {
+            if (liveHudBadge.text != text) liveHudBadge.text = text
+            if (fsTopHudText.text != text) fsTopHudText.text = text
+        }
+        refreshLiveHudVisibility()
+    }
+
+    private fun styleLiveHudToggle() {
+        liveHudToggleBtn?.let { btn ->
+            btn.text = if (hudEnabled) "HUD ON" else "HUD"
+            btn.setTextColor(if (hudEnabled) UiStyle.ACCENT else UiStyle.MUTED)
+            btn.background = UiStyle.rounded(
+                context,
+                UiStyle.OVERLAY,
+                99,
+                if (hudEnabled) UiStyle.ACCENT else UiStyle.BORDER
+            )
+        }
+    }
+
+    private fun refreshLiveHudVisibility() {
+        val active = hudEnabled && !lastLiveHudText.isNullOrEmpty()
+        if (fullscreen) {
+            liveHudBadge.visibility = if (active && !fsOverlayShown) View.VISIBLE else View.GONE
+            fsTopHudText.visibility = if (active) View.VISIBLE else View.GONE
+        } else {
+            liveHudBadge.visibility = if (active) View.VISIBLE else View.GONE
+            fsTopHudText.visibility = View.GONE
+        }
+    }
+
     fun showControls(connected: Boolean, canStart: Boolean, playing: Boolean, hasFrame: Boolean, frozen: Boolean) {
         if (fullscreen) {
             fsStartBtn?.text = if (connected) "다시 보기" else "연결 및 보기"
@@ -782,6 +1064,7 @@ internal class CameraScreen(
         tileStop?.setState(playing)
         videoFullscreenBtn?.isEnabled = playing || hasFrame
         videoFullscreenBtn?.alpha = if (playing || hasFrame) 1f else 0.4f
+        liveHudToggleBtn?.visibility = if (playing || hasFrame) View.VISIBLE else View.GONE
 
         recNotConnectedCard?.visibility = if (connected) View.GONE else View.VISIBLE
         recContent?.visibility = if (connected) View.VISIBLE else View.GONE
@@ -804,7 +1087,7 @@ internal class CameraScreen(
             sdSnapshotBtn?.isEnabled = false
             return
         }
-        sdCapacityTitle?.text = "32GB SD카드 · 여유 ${UiStyle.formatMb(status.freeMb)}"
+        sdCapacityTitle?.text = "${UiStyle.formatSdCardLabel(status.totalMb)} · 여유 ${UiStyle.formatMb(status.freeMb)}"
         sdCapacitySub?.text = "사용 ${UiStyle.formatMb(status.usedMb)} / 전체 ${UiStyle.formatMb(status.totalMb)}"
         val ratio = if (status.totalMb > 0) (status.usedMb.toFloat() / status.totalMb.toFloat()).coerceIn(0f, 1f) else 0f
         sdBarFill?.post {
@@ -915,33 +1198,206 @@ internal class CameraScreen(
         }
     }
 
-    fun showSdFiles(files: List<SdFileItem>?, loading: Boolean = false) {
+    fun isSelectionModeActive(): Boolean = selectionMode
+
+    fun exitSelectionMode() {
+        exitSelectionModeInternal(render = true)
+    }
+
+    private fun exitSelectionModeInternal(render: Boolean) {
+        selectionMode = false
+        selectedItems.clear()
+        updateSelectionUi()
+        if (render) renderLibraryItems()
+    }
+
+    private fun toggleSelectionMode() {
+        selectionMode = !selectionMode
+        if (!selectionMode) selectedItems.clear()
+        updateSelectionUi()
+        renderLibraryItems()
+    }
+
+    private fun updateSelectionUi() {
+        libSelectToggleBtn?.let { btn ->
+            btn.text = if (selectionMode) "취소" else "선택"
+            btn.setTextColor(if (selectionMode) UiStyle.ACCENT else UiStyle.SECONDARY)
+            btn.background = UiStyle.rippleRounded(
+                context,
+                if (selectionMode) UiStyle.ACCENT_SOFT else UiStyle.SURFACE,
+                10,
+                if (selectionMode) UiStyle.ACCENT else UiStyle.BORDER
+            )
+        }
+        libSelectionBar?.visibility = if (selectionMode) View.VISIBLE else View.GONE
+        libSelectionCount?.text = "${selectedItems.size}개 선택됨"
+        libBatchDeleteBtn?.let { btn ->
+            val enabled = selectedItems.isNotEmpty()
+            btn.isEnabled = enabled
+            btn.alpha = if (enabled) 1f else 0.45f
+            btn.text = if (enabled) "선택 삭제 (${selectedItems.size})" else "선택 삭제"
+        }
+    }
+
+    private fun styleSortChips() {
+        sortChipViews.forEach { (sort, tv) ->
+            val active = sort == currentSort
+            tv.setTextColor(if (active) UiStyle.ACCENT else UiStyle.MUTED)
+            tv.background = UiStyle.rippleRounded(
+                context,
+                if (active) UiStyle.ACCENT_SOFT else UiStyle.SURFACE,
+                99,
+                if (active) UiStyle.ACCENT else UiStyle.BORDER
+            )
+        }
+    }
+
+    private fun updateSharedControlsVisibility() {
+        val isShared = selectedCategory == "shared"
+        val curDir = if (isShared) currentListing?.dir.orEmpty() else ""
+        val depth = if (curDir.isEmpty()) 0 else curDir.count { it == '/' } + 1
+        libMkdirBtn?.visibility = if (isShared) View.VISIBLE else View.GONE
+        libMkdirBtn?.isEnabled = isShared && depth < 3
+        libMkdirBtn?.alpha = if (depth < 3) 1f else 0.45f
+        libUploadBtn?.text = if (isShared && curDir.isNotEmpty()) "현재 폴더 업로드" else "공유함 파일 업로드"
+        updateBreadcrumb(if (isShared) curDir else "")
+    }
+
+    private fun updateBreadcrumb(dir: String) {
+        val bar = libBreadcrumbBar ?: return
+        val row = libBreadcrumbRow ?: return
+        if (dir.isEmpty()) {
+            bar.visibility = View.GONE
+            return
+        }
+        bar.visibility = View.VISIBLE
+        row.removeAllViews()
+        val rootCrumb = UiStyle.label(context, "공유함", 12.5f, UiStyle.CYAN, bold = true).apply {
+            isClickable = true
+            setPadding(UiStyle.dp(context, 4), UiStyle.dp(context, 4), UiStyle.dp(context, 4), UiStyle.dp(context, 4))
+            setOnClickListener { onNavigateDir("") }
+        }
+        row.addView(rootCrumb)
+        val parts = dir.split('/').filter { it.isNotEmpty() }
+        var acc = ""
+        parts.forEachIndexed { idx, part ->
+            acc = if (acc.isEmpty()) part else "$acc/$part"
+            val targetDir = acc
+            val isLast = idx == parts.lastIndex
+            row.addView(UiStyle.label(context, " / ", 12f, UiStyle.MUTED))
+            val seg = UiStyle.label(
+                context,
+                part,
+                12.5f,
+                if (isLast) UiStyle.INK else UiStyle.CYAN,
+                bold = true
+            ).apply {
+                if (!isLast) {
+                    isClickable = true
+                    setOnClickListener { onNavigateDir(targetDir) }
+                }
+                setPadding(UiStyle.dp(context, 2), UiStyle.dp(context, 4), UiStyle.dp(context, 2), UiStyle.dp(context, 4))
+            }
+            row.addView(seg)
+        }
+    }
+
+    private fun visibleEntries(): Pair<List<String>, List<SdFileItem>> {
+        val listing = currentListing ?: return emptyList<String>() to emptyList()
+        val q = searchQuery.lowercase(Locale.getDefault())
+        val dirs = if (selectedCategory == "shared") {
+            listing.dirs
+                .filter { q.isEmpty() || it.lowercase(Locale.getDefault()).contains(q) }
+                .sortedWith(String.CASE_INSENSITIVE_ORDER)
+        } else emptyList()
+        val filteredFiles = listing.files.filter {
+            q.isEmpty() || it.name.lowercase(Locale.getDefault()).contains(q) ||
+                UiStyle.formatSdTitle(it.name).lowercase(Locale.getDefault()).contains(q)
+        }
+        val sortedFiles = when (currentSort) {
+            LibrarySort.LATEST -> filteredFiles.sortedWith(
+                compareByDescending<SdFileItem> { it.mtime }.thenByDescending { it.name }
+            )
+            LibrarySort.NAME -> filteredFiles.sortedBy { it.name.lowercase(Locale.getDefault()) }
+            LibrarySort.SIZE -> filteredFiles.sortedWith(
+                compareByDescending<SdFileItem> { it.sizeBytes }.thenBy { it.name.lowercase(Locale.getDefault()) }
+            )
+        }
+        return dirs to sortedFiles
+    }
+
+    private fun toggleSelectAllVisible() {
+        val listing = currentListing ?: return
+        val (dirs, files) = visibleEntries()
+        val allTargets = buildList {
+            dirs.forEach { add(SdDeleteTarget("shared", listing.dir, it, isDir = true)) }
+            files.forEach { add(SdDeleteTarget(it.category, it.dir, it.name, isDir = false)) }
+        }
+        if (allTargets.isEmpty()) return
+        val allSelected = allTargets.all { it in selectedItems }
+        if (allSelected) {
+            selectedItems.removeAll(allTargets.toSet())
+        } else {
+            selectedItems.addAll(allTargets)
+        }
+        updateSelectionUi()
+        renderLibraryItems()
+    }
+
+    fun showSdListing(listing: SdListing?, loading: Boolean = false) {
+        libraryLoading = loading
+        if (!loading) {
+            currentListing = listing
+            selectedItems.clear()
+            if (selectionMode) {
+                selectionMode = false
+                updateSelectionUi()
+            }
+        }
+        updateSharedControlsVisibility()
+        renderLibraryItems()
+    }
+
+    private fun renderLibraryItems() {
         val container = libListContainer ?: return
         container.removeAllViews()
-        if (loading) {
-            libSummaryText?.text = "SD카드 파일 목록을 불러오는 중..."
+        if (libraryLoading) {
+            libSummaryText?.text = "목록 불러오는 중..."
             return
         }
-        if (files == null) {
-            libSummaryText?.text = "파일 목록을 읽을 수 없습니다. 새로고침을 눌러주세요."
+        val listing = currentListing
+        if (listing == null) {
+            libSummaryText?.text = "목록 읽기 실패 · 새로고침하세요"
             return
         }
+        val (dirs, files) = visibleEntries()
         val totalBytes = files.sumOf { it.sizeBytes }
-        libSummaryText?.text = if (files.isEmpty()) {
-            "저장된 파일이 없습니다"
+        val countParts = buildList {
+            if (dirs.isNotEmpty()) add("폴더 ${dirs.size}")
+            if (files.isNotEmpty() || dirs.isEmpty()) add("파일 ${files.size}")
+        }.joinToString(" · ")
+        libSummaryText?.text = if (dirs.isEmpty() && files.isEmpty()) {
+            if (searchQuery.isNotEmpty()) "검색 결과 없음" else "항목 없음"
         } else {
-            "총 ${files.size}개 파일 · ${UiStyle.formatSize(totalBytes)}"
+            "$countParts · ${UiStyle.formatSize(totalBytes)}"
         }
-        if (files.isEmpty()) {
+
+        if (dirs.isEmpty() && files.isEmpty()) {
             val empty = UiStyle.card(context, 20).apply {
                 gravity = Gravity.CENTER
-                addView(UiStyle.label(context, "아직 녹화된 파일이 없습니다", 14.5f, UiStyle.SECONDARY, bold = true))
-                addView(UiStyle.label(
-                    context,
-                    "녹화 탭에서 블랙박스·타임랩스를 시작하거나 SD 스냅샷을 찍어보세요.",
-                    12.5f,
-                    UiStyle.MUTED
-                ).apply {
+                val headline = when {
+                    searchQuery.isNotEmpty() -> "'$searchQuery' 검색 결과가 없습니다"
+                    selectedCategory == "shared" && listing.dir.isNotEmpty() -> "이 폴더가 비어 있습니다"
+                    selectedCategory == "shared" -> "공유함에 파일이 없습니다"
+                    else -> "아직 저장된 파일이 없습니다"
+                }
+                val sub = when {
+                    searchQuery.isNotEmpty() -> "검색어를 지우거나 다른 카테고리를 확인해 보세요."
+                    selectedCategory == "shared" -> "위의 파일 업로드 또는 + 새 폴더 버튼으로 자료를 정리해 보세요."
+                    else -> "녹화 탭에서 블랙박스·타임랩스를 시작하거나 SD 스냅샷을 찍어보세요."
+                }
+                addView(UiStyle.label(context, headline, 14.5f, UiStyle.SECONDARY, bold = true))
+                addView(UiStyle.label(context, sub, 12.5f, UiStyle.MUTED).apply {
                     gravity = Gravity.CENTER
                     setPadding(0, UiStyle.dp(context, 6), 0, 0)
                 })
@@ -949,58 +1405,187 @@ internal class CameraScreen(
             container.addView(empty)
             return
         }
-        files.forEach { item ->
-            val (catLabel, catBg, catFg) = UiStyle.categoryMeta(item.category)
+
+        // Folder cards (shared category)
+        dirs.forEach { folderName ->
+            val target = SdDeleteTarget("shared", listing.dir, folderName, isDir = true)
+            val checked = target in selectedItems
             val card = UiStyle.card(context, 12).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
+                if (selectionMode && checked) {
+                    background = UiStyle.rounded(context, UiStyle.SURFACE_ALT, 16, UiStyle.ACCENT)
+                }
+            }
+            if (selectionMode) {
+                card.addView(buildCheckCircle(checked), LinearLayout.LayoutParams(
+                    UiStyle.dp(context, 24), UiStyle.dp(context, 24)
+                ).apply { marginEnd = UiStyle.dp(context, 10) })
             }
             val metaCol = LinearLayout(context).apply {
                 orientation = LinearLayout.VERTICAL
                 addView(LinearLayout(context).apply {
                     orientation = LinearLayout.HORIZONTAL
                     gravity = Gravity.CENTER_VERTICAL
-                    addView(UiStyle.badge(context, catLabel, catBg, catFg))
-                    addView(UiStyle.label(context, UiStyle.formatSize(item.sizeBytes), 12f, UiStyle.MUTED).apply {
+                    addView(UiStyle.badge(context, "폴더", UiStyle.CYAN_SOFT, UiStyle.CYAN))
+                    addView(UiStyle.label(context, folderName, 14.5f, UiStyle.INK, bold = true).apply {
+                        maxLines = 1
+                        ellipsize = TextUtils.TruncateAt.END
                         setPadding(UiStyle.dp(context, 8), 0, 0, 0)
-                    })
-                })
-                addView(UiStyle.label(context, UiStyle.formatSdTitle(item.name), 14f, UiStyle.INK, bold = true).apply {
-                    setPadding(0, UiStyle.dp(context, 6), 0, 0)
-                })
-                addView(UiStyle.label(context, item.name, 11.5f, UiStyle.MUTED).apply {
-                    maxLines = 1
+                    }, LinearLayout.LayoutParams(0, -2, 1f))
                 })
             }
+            card.addView(metaCol, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = UiStyle.dp(context, 8) })
+            if (!selectionMode) {
+                val renamePill = UiStyle.compactChipButton(
+                    context, "이름변경", UiStyle.SURFACE_ALT, UiStyle.SECONDARY, UiStyle.BORDER
+                ) { onRenameEntry("shared", listing.dir, folderName, true) }
+                val delPill = UiStyle.compactChipButton(
+                    context, "삭제", UiStyle.DANGER_SOFT, UiStyle.DANGER, 0xff5A2427.toInt()
+                ) { onDeleteFolder(listing.dir, folderName) }
+                card.addView(renamePill, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = UiStyle.dp(context, 6) })
+                card.addView(delPill)
+            }
+            card.setOnClickListener {
+                if (selectionMode) {
+                    if (!selectedItems.add(target)) selectedItems.remove(target)
+                    updateSelectionUi()
+                    renderLibraryItems()
+                } else {
+                    val nextDir = if (listing.dir.isEmpty()) folderName else "${listing.dir}/$folderName"
+                    onNavigateDir(nextDir)
+                }
+            }
+            card.setOnLongClickListener {
+                if (!selectionMode) {
+                    selectionMode = true
+                    selectedItems.add(target)
+                    updateSelectionUi()
+                    renderLibraryItems()
+                }
+                true
+            }
+            container.addView(card, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = UiStyle.dp(context, 8) })
+        }
+
+        // File cards (clean 2-tier layout so title never truncates and all actions are 1-tap)
+        files.forEach { item ->
+            val target = SdDeleteTarget(item.category, item.dir, item.name, isDir = false)
+            val checked = target in selectedItems
+            val (catLabel, catBg, catFg) = UiStyle.categoryMeta(item.category)
             val lower = item.name.lowercase(Locale.US)
             val playable = lower.endsWith(".avi") || lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".png")
-            val dlBtn = UiStyle.iconCircleButton(
-                context, R.drawable.ic_download, "다운로드", UiStyle.SURFACE_ALT, UiStyle.INK, 38
-            ) { onDownloadFile(item) }
-            val delBtn = UiStyle.iconCircleButton(
-                context, R.drawable.ic_delete, "삭제", UiStyle.DANGER_SOFT, UiStyle.DANGER, 38
-            ) { onDeleteFile(item) }
 
-            card.addView(metaCol, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = UiStyle.dp(context, 8) })
-            if (playable) {
-                val playBtn = UiStyle.iconCircleButton(
-                    context, R.drawable.ic_play, "재생", UiStyle.ACCENT_SOFT, UiStyle.ACCENT, 38
-                ) { onPlayFile(item) }
-                card.addView(playBtn, LinearLayout.LayoutParams(UiStyle.dp(context, 38), UiStyle.dp(context, 38)).apply {
-                    marginEnd = UiStyle.dp(context, 6)
+            val card = UiStyle.card(context, 12).apply {
+                orientation = LinearLayout.VERTICAL
+                if (selectionMode && checked) {
+                    background = UiStyle.rounded(context, UiStyle.SURFACE_ALT, 16, UiStyle.ACCENT)
+                }
+            }
+
+            // Top row: optional check circle + category badge + size + date
+            val topMeta = LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                if (selectionMode) {
+                    addView(buildCheckCircle(checked), LinearLayout.LayoutParams(
+                        UiStyle.dp(context, 22), UiStyle.dp(context, 22)
+                    ).apply { marginEnd = UiStyle.dp(context, 8) })
+                }
+                addView(UiStyle.badge(context, catLabel, catBg, catFg))
+                val dateStr = UiStyle.formatShortDate(item.mtime)
+                val metaSummary = if (dateStr.isNotEmpty()) {
+                    "${UiStyle.formatSize(item.sizeBytes)} · $dateStr"
+                } else {
+                    UiStyle.formatSize(item.sizeBytes)
+                }
+                addView(UiStyle.label(context, metaSummary, 12f, UiStyle.MUTED).apply {
+                    setPadding(UiStyle.dp(context, 8), 0, 0, 0)
+                    maxLines = 1
+                    ellipsize = TextUtils.TruncateAt.END
+                }, LinearLayout.LayoutParams(0, -2, 1f))
+            }
+            card.addView(topMeta)
+
+            val displayTitle = UiStyle.formatSdTitle(item.name)
+            card.addView(UiStyle.label(context, displayTitle, 14.5f, UiStyle.INK, bold = true).apply {
+                maxLines = 2
+                ellipsize = TextUtils.TruncateAt.MIDDLE
+                setPadding(0, UiStyle.dp(context, 7), 0, 0)
+            })
+            if (displayTitle != item.name) {
+                card.addView(UiStyle.label(context, item.name, 11.5f, UiStyle.MUTED).apply {
+                    maxLines = 1
+                    ellipsize = TextUtils.TruncateAt.MIDDLE
+                    setPadding(0, UiStyle.dp(context, 2), 0, 0)
                 })
             }
-            card.addView(dlBtn, LinearLayout.LayoutParams(UiStyle.dp(context, 38), UiStyle.dp(context, 38)).apply {
-                marginEnd = UiStyle.dp(context, 6)
-            })
-            card.addView(delBtn)
-            card.setOnClickListener { if (playable) onPlayFile(item) else onDownloadFile(item) }
+
+            if (!selectionMode) {
+                val actions = LinearLayout(context).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.END or Gravity.CENTER_VERTICAL
+                    setPadding(0, UiStyle.dp(context, 10), 0, 0)
+                    val gap = UiStyle.dp(context, 6)
+                    if (playable) {
+                        addView(UiStyle.compactChipButton(
+                            context, "재생", UiStyle.ACCENT_SOFT, UiStyle.ACCENT, UiStyle.ACCENT
+                        ) { onPlayFile(item) }, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
+                    }
+                    addView(UiStyle.compactChipButton(
+                        context, "저장", UiStyle.SURFACE_ALT, UiStyle.INK, UiStyle.BORDER
+                    ) { onDownloadFile(item) }, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
+                    addView(UiStyle.compactChipButton(
+                        context, "이름변경", UiStyle.SURFACE_ALT, UiStyle.SECONDARY, UiStyle.BORDER
+                    ) { onRenameEntry(item.category, item.dir, item.name, false) },
+                        LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
+                    addView(UiStyle.compactChipButton(
+                        context, "삭제", UiStyle.DANGER_SOFT, UiStyle.DANGER, 0xff5A2427.toInt()
+                    ) { onDeleteFile(item) })
+                }
+                card.addView(actions)
+            }
+
+            card.setOnClickListener {
+                if (selectionMode) {
+                    if (!selectedItems.add(target)) selectedItems.remove(target)
+                    updateSelectionUi()
+                    renderLibraryItems()
+                } else {
+                    if (playable) onPlayFile(item) else onDownloadFile(item)
+                }
+            }
+            card.setOnLongClickListener {
+                if (!selectionMode) {
+                    selectionMode = true
+                    selectedItems.add(target)
+                    updateSelectionUi()
+                    renderLibraryItems()
+                }
+                true
+            }
             container.addView(card, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = UiStyle.dp(context, 8) })
         }
     }
 
+    private fun buildCheckCircle(checked: Boolean): TextView = TextView(context).apply {
+        text = if (checked) "✓" else ""
+        textSize = 13f
+        typeface = Typeface.DEFAULT_BOLD
+        gravity = Gravity.CENTER
+        setTextColor(UiStyle.ON_ACCENT)
+        background = UiStyle.rounded(
+            context,
+            if (checked) UiStyle.ACCENT else UiStyle.BG,
+            99,
+            if (checked) UiStyle.ACCENT else UiStyle.MUTED
+        )
+    }
+
     fun showFullscreenOverlay(visible: Boolean) {
+        fsOverlayShown = visible
         hudOverlay?.visibility = if (visible) View.VISIBLE else View.GONE
+        refreshLiveHudVisibility()
     }
 
     private fun updateZoomBadge(zoom: Float) {

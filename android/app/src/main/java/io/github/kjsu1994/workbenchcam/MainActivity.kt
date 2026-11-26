@@ -28,6 +28,8 @@ import android.view.View
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.WindowManager
+import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.Toast
 import android.window.OnBackInvokedCallback
 import android.window.OnBackInvokedDispatcher
@@ -62,6 +64,7 @@ class MainActivity : Activity() {
 
     private var telemetryEnabled = false
     private var gridEnabled = false
+    private var liveHudEnabled = true
     private var autoConnectEnabled = false
     private var autoConnectAttempted = false
     private var frozen = false
@@ -84,6 +87,8 @@ class MainActivity : Activity() {
     private var sdStatusPending = false
     private var nextSdPollAt = 0L
     private var selectedLibraryCategory = "all"
+    private var currentSharedDir = ""
+    private var lastSdListing: SdListing? = null
     private var cachedBoardOptions: BoardOptions? = null
 
     private val framePending = AtomicBoolean(false)
@@ -111,6 +116,7 @@ class MainActivity : Activity() {
             reconnectAttempted = false
             streamRetries = 0
             updateControls()
+            renderLiveHud(current)
         }
         val timer = if (current.endsAt == 0L) "" else asClock(remainingSeconds(current.endsAt, SystemClock.elapsedRealtime()))
         setStatus("실시간", timer)
@@ -139,14 +145,18 @@ class MainActivity : Activity() {
             if (current != null && displayed != null) {
                 val timer = if (current.endsAt == 0L) "" else asClock(remainingSeconds(current.endsAt, now))
                 setStatus(if (frozen) "정지화면" else "실시간", timer)
-            } else if (cooldownEndsAt != 0L) {
-                val remaining = remainingSeconds(cooldownEndsAt, now)
-                if (remaining == 0L) {
-                    cooldownEndsAt = 0L
-                    setStatus("대기 중")
-                    updateControls()
-                } else {
-                    setStatus(message, asClock(remaining))
+                renderLiveHud(current)
+            } else {
+                screen.showLiveHud(null)
+                if (cooldownEndsAt != 0L) {
+                    val remaining = remainingSeconds(cooldownEndsAt, now)
+                    if (remaining == 0L) {
+                        cooldownEndsAt = 0L
+                        setStatus("대기 중")
+                        updateControls()
+                    } else {
+                        setStatus(message, asClock(remaining))
+                    }
                 }
             }
             handler.postDelayed(this, 500)
@@ -169,6 +179,7 @@ class MainActivity : Activity() {
         val prefs = getPreferences(MODE_PRIVATE)
         telemetryEnabled = prefs.getBoolean("board_telemetry", false)
         gridEnabled = prefs.getBoolean("video_grid", false)
+        liveHudEnabled = prefs.getBoolean("live_hud", true)
         autoConnectEnabled = prefs.getBoolean("auto_connect", false)
         connectPreference = ConnectPreference.fromKey(prefs.getString("connect_pref", "auto"))
         manualLanIp = prefs.getString("manual_lan_ip", "").orEmpty()
@@ -192,6 +203,14 @@ class MainActivity : Activity() {
         }
         if (settingsOpen) {
             closeSettingsPage()
+            return true
+        }
+        if (activeTab == AppTab.LIBRARY && screen.isSelectionModeActive()) {
+            screen.exitSelectionMode()
+            return true
+        }
+        if (activeTab == AppTab.LIBRARY && selectedLibraryCategory == "shared" && currentSharedDir.isNotEmpty()) {
+            navigateSharedDir(currentSharedDir.substringBeforeLast('/', ""))
             return true
         }
         if (activeTab != AppTab.LIVE) {
@@ -233,6 +252,7 @@ class MainActivity : Activity() {
             fullscreen = fullscreen,
             fillVideo = fullscreenFill,
             gridEnabled = gridEnabled,
+            hudEnabled = liveHudEnabled,
             activeTab = activeTab,
             selectedCategory = selectedLibraryCategory,
             start = ::requestStart,
@@ -242,6 +262,7 @@ class MainActivity : Activity() {
             toggleFullscreen = ::toggleFullscreen,
             toggleFreeze = ::toggleFreeze,
             toggleGrid = ::toggleGrid,
+            toggleHud = ::toggleHud,
             onToggleFill = { fill ->
                 fullscreenFill = fill
                 scheduleOverlayAutoHide()
@@ -255,22 +276,32 @@ class MainActivity : Activity() {
             onSdSnapshot = ::triggerBoardSnapshot,
             onCategorySelected = { cat ->
                 selectedLibraryCategory = cat
+                if (cat != "shared") currentSharedDir = ""
                 refreshSdFiles()
             },
             onRefreshLibrary = ::refreshSdFiles,
             onUploadSharedFile = ::pickSharedFileForUpload,
             onOpenNotes = ::openSharedNotesDialog,
+            onNavigateDir = ::navigateSharedDir,
+            onCreateFolder = ::promptCreateSharedFolder,
+            onRenameEntry = ::promptRenameSdEntry,
             onPlayFile = ::playSdFile,
             onDownloadFile = ::downloadSdFile,
-            onDeleteFile = ::confirmDeleteSdFile
+            onDeleteFile = ::confirmDeleteSdFile,
+            onDeleteFolder = ::confirmDeleteSdFolder,
+            onBatchDelete = ::confirmBatchDeleteSd
         )
         setContentView(screen.root)
         screen.root.requestApplyInsets()
         screen.showFrame(displayed?.bitmap)
         screen.showStatus(message, countdown, currentStatusDotColor())
         renderTelemetry()
+        preview?.let(::renderLiveHud) ?: screen.showLiveHud(null)
         updateControls()
         screen.showSdStatus(sdStatus)
+        if (lastSdListing != null && activeTab == AppTab.LIBRARY) {
+            screen.showSdListing(lastSdListing, loading = false)
+        }
         if (!fullscreen && settingsOpen) {
             attachSettingsPage()
         }
@@ -313,6 +344,7 @@ class MainActivity : Activity() {
             initialConnectPref = connectPreference,
             initialManualIp = manualLanIp,
             initialGrid = gridEnabled,
+            initialHud = liveHudEnabled,
             initialTelemetry = telemetryEnabled,
             onBack = ::closeSettingsPage,
             onSaveWifi = ::saveWifiCredentials,
@@ -333,6 +365,12 @@ class MainActivity : Activity() {
                 gridEnabled = enabled
                 getPreferences(MODE_PRIVATE).edit().putBoolean("video_grid", enabled).apply()
                 screen.showGrid(enabled)
+            },
+            onToggleHud = { enabled ->
+                liveHudEnabled = enabled
+                getPreferences(MODE_PRIVATE).edit().putBoolean("live_hud", enabled).apply()
+                screen.showHudEnabled(enabled)
+                preview?.let(::renderLiveHud)
             },
             onToggleTelemetry = { enabled ->
                 telemetryEnabled = enabled
@@ -542,6 +580,33 @@ class MainActivity : Activity() {
         getPreferences(MODE_PRIVATE).edit().putBoolean("video_grid", gridEnabled).apply()
         screen.showGrid(gridEnabled)
         scheduleOverlayAutoHide()
+    }
+
+    private fun toggleHud() {
+        liveHudEnabled = !liveHudEnabled
+        getPreferences(MODE_PRIVATE).edit().putBoolean("live_hud", liveHudEnabled).apply()
+        screen.showHudEnabled(liveHudEnabled)
+        preview?.let(::renderLiveHud)
+        scheduleOverlayAutoHide()
+    }
+
+    private fun renderLiveHud(current: Preview) {
+        val st = current.stats
+        if (st == null) {
+            screen.showLiveHud(null)
+            return
+        }
+        val res = "${st.width}×${st.height}"
+        val fpsStr = if (st.fps > 0.05f) String.format(Locale.US, "%.1f fps", st.fps) else "측정 중"
+        val rateStr = if (st.bytesPerSec > 0L) " · ${UiStyle.formatRate(st.bytesPerSec)}" else ""
+        val netStr = wifiStatus?.let { wf ->
+            when {
+                wf.mode == "sta" && wf.rssi != 0 -> " · STA ${wf.rssi}dBm"
+                wf.mode == "sta" -> " · STA"
+                else -> " · AP"
+            }
+        } ?: if (boardTarget?.viaLan == true) " · LAN" else " · AP"
+        screen.showLiveHud("$res · $fpsStr$rateStr$netStr")
     }
 
     private fun toggleFullscreen() {
@@ -934,17 +999,104 @@ class MainActivity : Activity() {
         }, "sd-snapshot").start()
     }
 
+    private fun navigateSharedDir(dir: String) {
+        currentSharedDir = dir.trim('/')
+        refreshSdFiles()
+    }
+
     private fun refreshSdFiles() {
         val connected = boardTarget ?: return
         val cat = selectedLibraryCategory
-        screen.showSdFiles(null, loading = true)
+        val dir = if (cat == "shared") currentSharedDir else ""
+        screen.showSdListing(null, loading = true)
         Thread({
-            val list = runCatching { BoardApi(connected).listSdFiles(cat) }.getOrNull()
+            val listing = runCatching { BoardApi(connected).listSdDirectory(cat, dir) }.getOrNull()
             runOnUiThread {
                 if (isDestroyed || boardTarget != connected) return@runOnUiThread
-                screen.showSdFiles(list, loading = false)
+                if (listing != null && cat == "shared") {
+                    currentSharedDir = listing.dir
+                }
+                lastSdListing = listing
+                screen.showSdListing(listing, loading = false)
             }
         }, "sd-files-list").start()
+    }
+
+    private fun promptCreateSharedFolder() {
+        val connected = boardTarget ?: return
+        val parentDir = if (selectedLibraryCategory == "shared") currentSharedDir else ""
+        val input = EditText(this).apply {
+            hint = "새 폴더 이름 (한글/영문/숫자)"
+            setSingleLine(true)
+        }
+        val wrap = FrameLayout(this).apply {
+            val h = UiStyle.dp(this@MainActivity, 20)
+            val v = UiStyle.dp(this@MainActivity, 8)
+            setPadding(h, v, h, v)
+            addView(input, FrameLayout.LayoutParams(-1, -2))
+        }
+        AlertDialog.Builder(this)
+            .setTitle("새 폴더 만들기")
+            .setMessage(if (parentDir.isEmpty()) "위치: 공유함" else "위치: 공유함/$parentDir")
+            .setView(wrap)
+            .setNegativeButton("취소", null)
+            .setPositiveButton("만들기") { _, _ ->
+                val folderName = input.text.toString().trim()
+                if (folderName.isEmpty()) return@setPositiveButton
+                Thread({
+                    val created = runCatching {
+                        BoardApi(connected).createSharedFolder(parentDir, folderName)
+                    }.getOrNull()
+                    runOnUiThread {
+                        if (isDestroyed) return@runOnUiThread
+                        if (created != null) {
+                            Toast.makeText(this, "폴더 '$created' 생성 완료", Toast.LENGTH_SHORT).show()
+                            refreshSdFiles()
+                        } else {
+                            Toast.makeText(this, "폴더를 만들 수 없습니다 (중복·깊이 3단계 제한 확인)", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                }, "sd-mkdir").start()
+            }
+            .show()
+    }
+
+    private fun promptRenameSdEntry(category: String, dir: String, oldName: String, isDir: Boolean) {
+        val connected = boardTarget ?: return
+        val input = EditText(this).apply {
+            setText(oldName)
+            setSingleLine(true)
+            setSelection(oldName.length)
+        }
+        val wrap = FrameLayout(this).apply {
+            val h = UiStyle.dp(this@MainActivity, 20)
+            val v = UiStyle.dp(this@MainActivity, 8)
+            setPadding(h, v, h, v)
+            addView(input, FrameLayout.LayoutParams(-1, -2))
+        }
+        AlertDialog.Builder(this)
+            .setTitle(if (isDir) "폴더 이름 변경" else "파일 이름 변경")
+            .setView(wrap)
+            .setNegativeButton("취소", null)
+            .setPositiveButton("변경") { _, _ ->
+                val newName = input.text.toString().trim()
+                if (newName.isEmpty() || newName == oldName) return@setPositiveButton
+                Thread({
+                    val renamed = runCatching {
+                        BoardApi(connected).renameSdEntry(category, dir, oldName, newName)
+                    }.getOrNull()
+                    runOnUiThread {
+                        if (isDestroyed) return@runOnUiThread
+                        if (renamed != null) {
+                            Toast.makeText(this, "'$renamed'(으)로 변경했습니다", Toast.LENGTH_SHORT).show()
+                            refreshSdFiles()
+                        } else {
+                            Toast.makeText(this, "이름을 변경할 수 없습니다 (중복·녹화 중 확인)", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                }, "sd-rename").start()
+            }
+            .show()
     }
 
     @Suppress("DEPRECATION")
@@ -997,12 +1149,13 @@ class MainActivity : Activity() {
             Toast.makeText(this, "파일 크기를 확인할 수 없습니다", Toast.LENGTH_SHORT).show()
             return
         }
+        val targetDir = if (selectedLibraryCategory == "shared") currentSharedDir else ""
         screen.showUploadProgress("업로드 준비 중: $name (${UiStyle.formatSize(size)})")
         Thread({
             val started = SystemClock.elapsedRealtime()
             val result = runCatching {
                 checkNotNull(contentResolver.openInputStream(uri)).use { input ->
-                    BoardApi(connected).uploadSharedFile(name, size, input) { sent, total ->
+                    BoardApi(connected).uploadSharedFile(name, size, input, dir = targetDir) { sent, total ->
                         val pct = if (total > 0L) ((sent * 100L) / total).toInt().coerceIn(0, 100) else 0
                         val sec = ((SystemClock.elapsedRealtime() - started).coerceAtLeast(200L)) / 1000.0
                         val speed = UiStyle.formatSize((sent / sec).toLong()) + "/s"
@@ -1067,7 +1220,7 @@ class MainActivity : Activity() {
                 else -> "application/octet-stream"
             }
             val saved = try {
-                val conn = BoardApi(connected).openSdFile(item.category, item.name, 25000)
+                val conn = BoardApi(connected).openSdFile(item.category, item.name, 25000, item.dir)
                 try {
                     if (conn.responseCode != 200) throw IllegalStateException("HTTP ${conn.responseCode}")
                     val (collection, values) = if (isImage) {
@@ -1124,7 +1277,9 @@ class MainActivity : Activity() {
             .setNegativeButton("취소", null)
             .setPositiveButton("삭제") { _, _ ->
                 Thread({
-                    val ok = runCatching { BoardApi(connected).deleteSdFile(item.category, item.name) }.isSuccess
+                    val ok = runCatching {
+                        BoardApi(connected).deleteSdFile(item.category, item.name, item.dir, isDir = false)
+                    }.isSuccess
                     runOnUiThread {
                         if (isDestroyed) return@runOnUiThread
                         Toast.makeText(this, if (ok) "삭제했습니다" else "삭제할 수 없습니다 (녹화 중인 파일일 수 있음)", Toast.LENGTH_SHORT).show()
@@ -1134,6 +1289,61 @@ class MainActivity : Activity() {
                         }
                     }
                 }, "sd-file-delete").start()
+            }
+            .show()
+    }
+
+    private fun confirmDeleteSdFolder(dir: String, folderName: String) {
+        val connected = boardTarget ?: return
+        AlertDialog.Builder(this)
+            .setTitle("폴더 삭제")
+            .setMessage("'$folderName' 폴더와 내부 파일을 모두 삭제할까요?")
+            .setNegativeButton("취소", null)
+            .setPositiveButton("삭제") { _, _ ->
+                Thread({
+                    val ok = runCatching {
+                        BoardApi(connected).deleteSdFile("shared", folderName, dir, isDir = true)
+                    }.isSuccess
+                    runOnUiThread {
+                        if (isDestroyed) return@runOnUiThread
+                        Toast.makeText(this, if (ok) "폴더를 삭제했습니다" else "폴더 삭제에 실패했습니다", Toast.LENGTH_SHORT).show()
+                        if (ok) {
+                            refreshSdFiles()
+                            refreshSdStatus(connected, SystemClock.elapsedRealtime() + 2500L)
+                        }
+                    }
+                }, "sd-folder-delete").start()
+            }
+            .show()
+    }
+
+    private fun confirmBatchDeleteSd(items: List<SdDeleteTarget>) {
+        val connected = boardTarget ?: return
+        if (items.isEmpty()) return
+        val hasDir = items.any { it.isDir }
+        val msg = if (hasDir) {
+            "선택한 ${items.size}개 항목(폴더 내부 파일 포함)을 SD카드에서 삭제할까요?"
+        } else {
+            "선택한 ${items.size}개 파일을 SD카드에서 삭제할까요?"
+        }
+        AlertDialog.Builder(this)
+            .setTitle("선택 항목 일괄 삭제")
+            .setMessage(msg)
+            .setNegativeButton("취소", null)
+            .setPositiveButton("삭제") { _, _ ->
+                Thread({
+                    val deleted = runCatching { BoardApi(connected).deleteSdBatch(items) }.getOrNull()
+                    runOnUiThread {
+                        if (isDestroyed) return@runOnUiThread
+                        Toast.makeText(
+                            this,
+                            if (deleted != null) "${deleted}개 항목을 삭제했습니다" else "일괄 삭제에 실패했습니다",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                        refreshSdFiles()
+                        refreshSdStatus(connected, SystemClock.elapsedRealtime() + 2500L)
+                    }
+                }, "sd-batch-delete").start()
             }
             .show()
     }
@@ -1284,11 +1494,14 @@ class MainActivity : Activity() {
         boardTarget = null
         sdStatus = null
         wifiStatus = null
+        currentSharedDir = ""
+        lastSdListing = null
         cachedBoardOptions = null
         telemetryText = null
         nextTelemetryAt = 0L
         nextSdPollAt = 0L
         renderTelemetry()
+        screen.showLiveHud(null)
         screen.showSdStatus(null)
         settingsScreen?.setConnected(false)
         waitingForNetwork = false

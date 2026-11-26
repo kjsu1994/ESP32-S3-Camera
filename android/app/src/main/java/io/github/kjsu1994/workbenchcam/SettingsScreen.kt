@@ -20,6 +20,7 @@ internal class SettingsScreen(
     initialConnectPref: ConnectPreference,
     initialManualIp: String,
     initialGrid: Boolean,
+    initialHud: Boolean,
     initialTelemetry: Boolean,
     private val onBack: () -> Unit,
     private val onSaveWifi: (password: String, remember: Boolean, manualIp: String) -> Unit,
@@ -27,6 +28,7 @@ internal class SettingsScreen(
     private val onDisconnectWifi: () -> Unit,
     private val onToggleAutoConnect: (Boolean) -> Unit,
     private val onToggleGrid: (Boolean) -> Unit,
+    private val onToggleHud: (Boolean) -> Unit,
     private val onToggleTelemetry: (Boolean) -> Unit,
     private val onSaveBoardOptions: (BoardOptions) -> Unit,
     private val onScanHomeWifi: () -> Unit,
@@ -347,6 +349,14 @@ internal class SettingsScreen(
             onToggleGrid
         )
         displayCard.addView(gridRow)
+        val (hudRow, _) = UiStyle.switchRow(
+            context,
+            "라이브 뷰 HUD 표시",
+            "영상 위에 실시간 FPS · 전송량 · 해상도 · 연결 상태 표시 (보드 부하 없음)",
+            initialHud,
+            onToggleHud
+        )
+        displayCard.addView(hudRow)
         val (telRow, _) = UiStyle.switchRow(
             context,
             "칩 온도 · 소비전력 표시",
@@ -390,7 +400,10 @@ internal class SettingsScreen(
             setPadding(UiStyle.dp(context, 4), UiStyle.dp(context, 18), 0, UiStyle.dp(context, 8))
         })
         val infoCard = UiStyle.card(context)
-        infoCard.addView(UiStyle.label(context, "DockyCam v0.3.0", 14.5f, UiStyle.INK, bold = true))
+        val appVersion = runCatching {
+            context.packageManager.getPackageInfo(context.packageName, 0).versionName
+        }.getOrNull().orEmpty().ifEmpty { "0.3.3" }
+        infoCard.addView(UiStyle.label(context, "DockyCam v$appVersion", 14.5f, UiStyle.INK, bold = true))
         infoCard.addView(UiStyle.label(
             context,
             "ESP32-S3 · OV5640 작업대 카메라 · 단독 SD 블랙박스 · 집 공유기(STA) & PC 웹 매니저",

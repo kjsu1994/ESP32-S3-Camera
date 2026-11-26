@@ -11,8 +11,8 @@ android {
         applicationId = "io.github.kjsu1994.workbenchcam"
         minSdk = 29
         targetSdk = 36
-        versionCode = 12
-        versionName = "0.3.2"
+        versionCode = 13
+        versionName = "0.3.3"
     }
 
     compileOptions {

@@ -698,6 +698,7 @@ private:
         aviMoviBytes_ = 0;
         aviFrames_ = 0;
         segmentStartedMs_ = millis();
+        lastHeaderFlushMs_ = segmentStartedMs_;
         currentPath_ = path;
 
         xSemaphoreTake(stateMutex_, portMAX_DELAY);
@@ -732,6 +733,19 @@ private:
         activeFrames_ = aviFrames_;
         xSemaphoreGive(stateMutex_);
         return true;
+    }
+
+    void flushAviHeader(uint32_t fps) {
+        if (!aviFile_ || aviFrames_ == 0) return;
+        if (xSemaphoreTakeRecursive(sdMutex_, pdMS_TO_TICKS(1000)) != pdTRUE) return;
+        uint8_t header[detail::kAviHeaderSize];
+        detail::buildAviHeader(header, aviWidth_, aviHeight_, aviFrames_, fps, aviMoviBytes_);
+        const size_t pos = aviFile_.position();
+        aviFile_.seek(0);
+        aviFile_.write(header, sizeof(header));
+        aviFile_.seek(pos);
+        aviFile_.flush();
+        xSemaphoreGiveRecursive(sdMutex_);
     }
 
     void closeAviSegment(bool useActualFps) {
@@ -874,8 +888,21 @@ private:
                         xSemaphoreGive(stateMutex_);
                         continue;
                     }
+                    const uint32_t nowMs = millis();
+                    // Flush AVI header every 30s so sudden power loss keeps the segment playable
+                    if (aviFrames_ > 0 && (nowMs - lastHeaderFlushMs_) >= 30000UL) {
+                        lastHeaderFlushMs_ = nowMs;
+                        const uint32_t dtMs = nowMs - segmentStartedMs_;
+                        uint32_t curFps = aviFpsHint_;
+                        if (dtMs >= 1000) {
+                            curFps = static_cast<uint32_t>((static_cast<uint64_t>(aviFrames_) * 1000ULL + dtMs / 2) / dtMs);
+                            if (curFps < 1) curFps = 1;
+                            if (curFps > 30) curFps = 30;
+                        }
+                        flushAviHeader(curFps);
+                    }
                     // Rotate segment every segmentSeconds_
-                    if ((millis() - segmentStartedMs_) >= static_cast<uint32_t>(segmentSeconds_) * 1000UL) {
+                    if ((nowMs - segmentStartedMs_) >= static_cast<uint32_t>(segmentSeconds_) * 1000UL) {
                         closeAviSegment(true);
                         if (!openAviSegment("blackbox", "BB", aviWidth_, aviHeight_, 8)) {
                             stopCamera_();
@@ -913,15 +940,8 @@ private:
                             continue;
                         }
                         // Flush AVI header periodically (every 30 frames) for power-loss safety
-                        if ((aviFrames_ % 30) == 0 && xSemaphoreTakeRecursive(sdMutex_, pdMS_TO_TICKS(1000)) == pdTRUE) {
-                            uint8_t header[detail::kAviHeaderSize];
-                            detail::buildAviHeader(header, aviWidth_, aviHeight_, aviFrames_, 10, aviMoviBytes_);
-                            const size_t pos = aviFile_.position();
-                            aviFile_.seek(0);
-                            aviFile_.write(header, sizeof(header));
-                            aviFile_.seek(pos);
-                            aviFile_.flush();
-                            xSemaphoreGiveRecursive(sdMutex_);
+                        if ((aviFrames_ % 30) == 0) {
+                            flushAviHeader(10);
                         }
                     }
                 }
@@ -962,6 +982,7 @@ private:
     uint32_t aviFrames_ = 0;
     uint32_t activeFrames_ = 0;
     uint32_t segmentStartedMs_ = 0;
+    uint32_t lastHeaderFlushMs_ = 0;
     uint32_t lastCaptureMs_ = 0;
     uint32_t lastRemountMs_ = 0;
 };

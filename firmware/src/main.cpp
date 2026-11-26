@@ -39,7 +39,7 @@
 
 namespace {
 constexpr char apName[] = "DockyCam";
-constexpr char kFirmwareVersion[] = "0.3.2";
+constexpr char kFirmwareVersion[] = "0.3.3";
 constexpr uint8_t lowBandwidth = 1 << 0;
 constexpr uint8_t rotate180 = 1 << 1;
 // Retain the v0.1.0 settings round-trip for installed clients.

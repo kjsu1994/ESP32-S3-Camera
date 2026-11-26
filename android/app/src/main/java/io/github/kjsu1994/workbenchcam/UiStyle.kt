@@ -14,6 +14,8 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.Switch
 import android.widget.TextView
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 
 internal object UiStyle {
@@ -96,6 +98,26 @@ internal object UiStyle {
         setTextColor(textColor)
         background = rounded(context, bgColor, 99)
         setPadding(dp(context, 10), dp(context, 4), dp(context, 10), dp(context, 4))
+    }
+
+    fun compactChipButton(
+        context: Context,
+        label: String,
+        bgColor: Int = SURFACE_ALT,
+        textColor: Int = INK,
+        strokeColor: Int? = BORDER,
+        onClick: () -> Unit
+    ): TextView = TextView(context).apply {
+        text = label
+        textSize = 12f
+        typeface = Typeface.DEFAULT_BOLD
+        setTextColor(textColor)
+        gravity = Gravity.CENTER
+        isClickable = true
+        isFocusable = true
+        background = rippleRounded(context, bgColor, 10, strokeColor)
+        setPadding(dp(context, 10), dp(context, 6), dp(context, 10), dp(context, 6))
+        setOnClickListener { onClick() }
     }
 
     fun primaryButton(context: Context, label: String, onClick: () -> Unit): Button =
@@ -300,6 +322,20 @@ internal object UiStyle {
         String.format(Locale.US, "%.1f GB", mb / 1024.0)
     } else {
         "$mb MB"
+    }
+
+    fun formatSdCardLabel(totalMb: Long): String =
+        if (totalMb > 0L) "SD카드 (${formatMb(totalMb)})" else "SD카드"
+
+    fun formatRate(bytesPerSec: Long): String = when {
+        bytesPerSec >= 1024L * 1024L -> String.format(Locale.US, "%.1f MB/s", bytesPerSec / (1024.0 * 1024.0))
+        bytesPerSec >= 1024L -> String.format(Locale.US, "%.0f KB/s", bytesPerSec / 1024.0)
+        else -> "$bytesPerSec B/s"
+    }
+
+    fun formatShortDate(epochSec: Long): String {
+        if (epochSec <= 1_700_000_000L) return ""
+        return SimpleDateFormat("MM/dd HH:mm", Locale.US).format(Date(epochSec * 1000L))
     }
 
     fun formatDuration(seconds: Int): String {

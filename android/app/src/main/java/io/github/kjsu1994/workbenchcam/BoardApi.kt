@@ -7,6 +7,7 @@ import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
+import org.json.JSONArray
 import org.json.JSONObject
 
 internal enum class VideoResolution(val key: String, val label: String, val shortLabel: String) {
@@ -91,7 +92,22 @@ internal data class SdStatus(
 internal data class SdFileItem(
     val category: String,
     val name: String,
-    val sizeBytes: Long
+    val sizeBytes: Long,
+    val dir: String = "",
+    val mtime: Long = 0L
+)
+
+internal data class SdListing(
+    val dir: String,
+    val dirs: List<String>,
+    val files: List<SdFileItem>
+)
+
+internal data class SdDeleteTarget(
+    val category: String,
+    val dir: String,
+    val name: String,
+    val isDir: Boolean = false
 )
 
 internal data class SharedNote(
@@ -290,38 +306,107 @@ internal class BoardApi(private val target: BoardTarget) {
         }
     }
 
-    fun listSdFiles(category: String = "all"): List<SdFileItem> {
-        val encCat = URLEncoder.encode(category, "UTF-8")
-        val connection = open("/sd/files?cat=$encCat", 5000)
+    private fun encodeQuery(value: String): String =
+        URLEncoder.encode(value, "UTF-8").replace("+", "%20")
+
+    fun listSdDirectory(category: String = "all", dir: String = ""): SdListing {
+        val encCat = encodeQuery(category)
+        val dirParam = if (dir.isNotEmpty()) "&dir=${encodeQuery(dir)}" else ""
+        val connection = open("/sd/files?cat=$encCat$dirParam", 5000)
         try {
             if (connection.responseCode != 200) throw IOException("SD files unavailable")
             val json = connection.readBoardJson(65536)
-            val arr = json.optJSONArray("files") ?: return emptyList()
-            return List(arr.length()) { idx ->
-                val obj = arr.getJSONObject(idx)
-                SdFileItem(
-                    category = obj.optString("cat"),
-                    name = obj.optString("name"),
-                    sizeBytes = obj.optLong("size", 0L)
-                )
-            }
+            val resolvedDir = json.optString("dir", dir)
+            val dirsArr = json.optJSONArray("dirs")
+            val dirs = if (dirsArr != null) {
+                List(dirsArr.length()) { idx -> dirsArr.optString(idx) }.filter { it.isNotEmpty() }
+            } else emptyList()
+            val arr = json.optJSONArray("files")
+            val files = if (arr != null) {
+                List(arr.length()) { idx ->
+                    val obj = arr.getJSONObject(idx)
+                    SdFileItem(
+                        category = obj.optString("cat"),
+                        name = obj.optString("name"),
+                        sizeBytes = obj.optLong("size", 0L),
+                        dir = if (obj.optString("cat") == "shared") resolvedDir else "",
+                        mtime = obj.optLong("mtime", 0L)
+                    )
+                }
+            } else emptyList()
+            return SdListing(resolvedDir, dirs, files)
         } finally {
             connection.disconnect()
         }
     }
 
-    fun openSdFile(category: String, name: String, readTimeoutMs: Int = 10000): HttpURLConnection {
-        val encCat = URLEncoder.encode(category, "UTF-8")
-        val encName = URLEncoder.encode(name, "UTF-8")
-        return open("/sd/file?cat=$encCat&name=$encName", readTimeoutMs)
+    fun openSdFile(category: String, name: String, readTimeoutMs: Int = 10000, dir: String = ""): HttpURLConnection {
+        val encCat = encodeQuery(category)
+        val encName = encodeQuery(name)
+        val dirParam = if (dir.isNotEmpty()) "&dir=${encodeQuery(dir)}" else ""
+        return open("/sd/file?cat=$encCat&name=$encName$dirParam", readTimeoutMs)
     }
 
-    fun deleteSdFile(category: String, name: String) {
-        val connection = open("/sd/delete", 4000)
+    fun deleteSdFile(category: String, name: String, dir: String = "", isDir: Boolean = false) {
+        val connection = open("/sd/delete", 5000)
         try {
-            val body = JSONObject().put("cat", category).put("name", name).toString().toByteArray()
-            connection.post(body)
+            val payload = JSONObject().put("cat", category).put("name", name)
+            if (dir.isNotEmpty()) payload.put("dir", dir)
+            if (isDir) payload.put("is_dir", true)
+            connection.post(payload.toString().toByteArray(Charsets.UTF_8))
             if (connection.responseCode !in 200..204) throw IOException("Delete failed")
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    fun deleteSdBatch(items: List<SdDeleteTarget>): Int {
+        if (items.isEmpty()) return 0
+        val connection = open("/sd/delete", 8000)
+        try {
+            val arr = JSONArray()
+            items.forEach { target ->
+                val obj = JSONObject()
+                    .put("cat", target.category)
+                    .put("dir", target.dir)
+                    .put("name", target.name)
+                if (target.isDir) obj.put("is_dir", true)
+                arr.put(obj)
+            }
+            val body = JSONObject().put("items", arr).toString().toByteArray(Charsets.UTF_8)
+            connection.post(body)
+            if (connection.responseCode != 200) throw IOException("Batch delete failed")
+            return connection.readBoardJson(512).optInt("deleted", 0)
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    fun createSharedFolder(parentDir: String, name: String): String {
+        val connection = open("/sd/mkdir", 4000)
+        try {
+            val body = JSONObject().put("dir", parentDir).put("name", name).toString().toByteArray(Charsets.UTF_8)
+            connection.post(body)
+            if (connection.responseCode != 200) throw IOException("Create folder failed")
+            return connection.readBoardJson(512).optString("name", name)
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    fun renameSdEntry(category: String, dir: String, from: String, to: String): String {
+        val connection = open("/sd/rename", 4000)
+        try {
+            val body = JSONObject()
+                .put("cat", category)
+                .put("dir", dir)
+                .put("from", from)
+                .put("to", to)
+                .toString()
+                .toByteArray(Charsets.UTF_8)
+            connection.post(body)
+            if (connection.responseCode != 200) throw IOException("Rename failed")
+            return connection.readBoardJson(512).optString("name", to)
         } finally {
             connection.disconnect()
         }
@@ -343,10 +428,12 @@ internal class BoardApi(private val target: BoardTarget) {
         filename: String,
         contentLength: Long,
         input: InputStream,
+        dir: String = "",
         onProgress: (Long, Long) -> Unit = { _, _ -> }
     ): SdFileItem {
-        val encName = URLEncoder.encode(filename, "UTF-8").replace("+", "%20")
-        val connection = open("/sd/upload?name=$encName", readTimeoutMs = 30000, connectTimeoutMs = 5000)
+        val encName = encodeQuery(filename)
+        val dirParam = if (dir.isNotEmpty()) "&dir=${encodeQuery(dir)}" else ""
+        val connection = open("/sd/upload?name=$encName$dirParam", readTimeoutMs = 30000, connectTimeoutMs = 5000)
         try {
             connection.requestMethod = "POST"
             connection.doOutput = true
@@ -374,7 +461,8 @@ internal class BoardApi(private val target: BoardTarget) {
             return SdFileItem(
                 category = json.optString("cat", "shared"),
                 name = json.optString("name", filename),
-                sizeBytes = json.optLong("size", sent)
+                sizeBytes = json.optLong("size", sent),
+                dir = dir
             )
         } finally {
             connection.disconnect()

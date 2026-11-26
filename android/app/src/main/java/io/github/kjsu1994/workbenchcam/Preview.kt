@@ -10,9 +10,12 @@ import java.util.concurrent.atomic.AtomicReference
 internal class Preview(target: BoardTarget) {
     private val board = BoardApi(target)
     data class Frame(val jpeg: ByteArray, val bitmap: Bitmap)
+    data class StreamStats(val width: Int, val height: Int, val fps: Float, val bytesPerSec: Long)
     data class Result(val reason: String, val cooldownSeconds: Int)
 
     val latest = AtomicReference<Frame?>(null)
+    @Volatile var stats: StreamStats? = null
+        private set
     @Volatile var endsAt = 0L
         private set
     @Volatile private var stopped = false
@@ -40,6 +43,9 @@ internal class Preview(target: BoardTarget) {
                         }
                         stream.inputStream.use { input ->
                             val reader = MjpegReader(input)
+                            var windowStart = SystemClock.elapsedRealtime()
+                            var windowFrames = 0
+                            var windowBytes = 0L
                             while (!stopped) {
                                 val jpeg = reader.nextFrame()
                                 if (jpeg == null) {
@@ -47,6 +53,24 @@ internal class Preview(target: BoardTarget) {
                                     break
                                 }
                                 val bitmap = decode(jpeg) ?: continue
+                                val now = SystemClock.elapsedRealtime()
+                                windowFrames += 1
+                                windowBytes += jpeg.size
+                                val dt = now - windowStart
+                                if (stats == null) {
+                                    stats = StreamStats(bitmap.width, bitmap.height, 0f, 0L)
+                                }
+                                if (dt >= 1000L) {
+                                    stats = StreamStats(
+                                        width = bitmap.width,
+                                        height = bitmap.height,
+                                        fps = windowFrames * 1000f / dt.toFloat(),
+                                        bytesPerSec = windowBytes * 1000L / dt
+                                    )
+                                    windowStart = now
+                                    windowFrames = 0
+                                    windowBytes = 0L
+                                }
                                 latest.set(Frame(jpeg, bitmap))
                                 onFrame()
                             }

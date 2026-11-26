@@ -151,7 +151,7 @@ internal class SdPlayerDialog(
         Thread({
             val api = BoardApi(target)
             val bitmap = runCatching {
-                val conn = api.openSdFile(item.category, item.name, 10000)
+                val conn = api.openSdFile(item.category, item.name, 10000, item.dir)
                 activeConnection = conn
                 try {
                     if (conn.responseCode != 200) return@runCatching null
@@ -179,7 +179,7 @@ internal class SdPlayerDialog(
             val api = BoardApi(target)
             var frameCount = 0
             try {
-                val conn = api.openSdFile(item.category, item.name, 10000)
+                val conn = api.openSdFile(item.category, item.name, 10000, item.dir)
                 activeConnection = conn
                 try {
                     if (conn.responseCode != 200) throw IllegalStateException("HTTP ${conn.responseCode}")
