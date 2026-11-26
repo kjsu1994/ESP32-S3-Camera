@@ -47,7 +47,8 @@ private enum class LineEnding(val label: String, val suffix: String) {
     CRLF("\\r\\n", "\r\n")
 }
 
-private data class LiveUdpChannel(
+private data class LiveInboundChannel(
+    val protocol: String, // "UDP" or "TCP-IN"
     val localPort: Int,
     val sourceIp: String,
     val sourcePort: Int,
@@ -55,8 +56,15 @@ private data class LiveUdpChannel(
     var bytes: Long = 0L,
     var lastSeenMs: Long = 0L
 ) {
-    val key: String get() = "UDP:$localPort:$sourceIp"
+    val key: String get() = "$protocol:$localPort:$sourceIp"
+    val shortProto: String get() = if (protocol == "TCP-IN") "TCP" else "UDP"
 }
+
+private data class MonitorEvent(
+    val channelKey: String,
+    val peerIp: String,
+    val formattedLine: String
+)
 
 /**
  * Water-flow Hardware Network & Port Diagnostics tab (Tab 4: 도구).
@@ -106,22 +114,25 @@ internal class NetToolsView(
     private val discoveredHosts = ArrayList<DiscoveredHost>()
     private val openPorts = ArrayList<OpenPortResult>()
 
-    // Sub-Tab 2: Live Dynamic Monitor (Discovered TCP Tap + Multi-Port Auto UDP Sniffer)
+    // Sub-Tab 2: Live Dynamic Monitor (Multi-TCP Tap + Auto TCP Server + Auto UDP Sniffer)
     private val udpSniffer = MultiPortUdpSniffer()
-    private val tcpTapClient = DeviceConsoleClient()
-    private var activeTcpTapPort: Int? = null
-    private var selectedUdpFilterKey: String? = null // null = show all UDP when not in TCP tap
+    private val tcpServerSniffer = MultiPortTcpServerSniffer()
+    private val tcpTapClients = LinkedHashMap<Int, DeviceConsoleClient>()
+    private var focusedTcpTapPort: Int? = null // null = show all active TCP taps + inbound
+    private var selectedInboundFilterKey: String? = null
+    private var filterSelectedDeviceOnly = false
     private var monitorFormat = PayloadFormat.BOTH
-    private val autoUdpToggleBtn: Button
-    private val extraUdpPortField: EditText
+    private val autoSniffToggleBtn: Button
+    private val extraPortField: EditText
     private val dynamicChipContainer: LinearLayout
     private val dynamicEmptyHint: TextView
+    private val monitorDeviceFilterBtn: TextView
     private val monitorProbeBtn: TextView
     private val monitorToConsoleBtn: TextView
     private val monitorStatsText: TextView
     private val monitorLogView: TextView
-    private val liveUdpChannels = LinkedHashMap<String, LiveUdpChannel>()
-    private val monitorAllEvents = ArrayDeque<Pair<String, String>>() // (channelKey, formattedLine)
+    private val liveInboundChannels = LinkedHashMap<String, LiveInboundChannel>()
+    private val monitorAllEvents = ArrayDeque<MonitorEvent>()
     private var monitorEventCount = 0
     private var monitorTotalBytes = 0L
 
@@ -281,19 +292,19 @@ internal class NetToolsView(
         // ============================================================
         val monitorPanel = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
 
-        // Card A: Dynamic Port Chips (Discovered TCP Ports + Auto-Captured UDP Ports)
+        // Card A: Dynamic Port Chips (Discovered TCP Ports + Auto-Captured TCP/UDP Inbound Ports)
         val livePortCard = UiStyle.card(context, 14)
-        livePortCard.addView(UiStyle.label(context, "감지된 · 열려있는 포트 (탭하여 실시간 데이터 보기)", 14.5f, UiStyle.INK, bold = true))
+        livePortCard.addView(UiStyle.label(context, "감지된 · 열려있는 TCP / UDP 포트", 14.5f, UiStyle.INK, bold = true))
         livePortCard.addView(UiStyle.label(
             context,
-            "탐색에서 찾은 TCP 포트와 아래 자동 UDP 감지로 포착된 전송 포트가 실시간으로 표시됩니다.",
+            "탐색된 장비의 열린 TCP 포트와 아래 자동 TCP+UDP 동시 감지로 포착된 모든 포트가 유동 칩으로 표시됩니다.",
             12f,
             UiStyle.SECONDARY
         ).apply { setPadding(0, UiStyle.dp(context, 3), 0, UiStyle.dp(context, 10)) })
 
         dynamicEmptyHint = UiStyle.label(
             context,
-            "아직 감지된 포트가 없습니다. [1. 자동 탐색]에서 장비를 선택하거나 아래 [자동 UDP 감지 시작]을 눌러보세요.",
+            "아직 감지된 포트가 없습니다. [1. 자동 탐색]에서 장비를 선택하거나 아래 [자동 TCP+UDP 동시 감지 시작]을 눌러보세요.",
             12f,
             UiStyle.MUTED
         ).apply {
@@ -306,19 +317,19 @@ internal class NetToolsView(
         dynamicChipContainer = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
         livePortCard.addView(dynamicChipContainer)
 
-        // Auto Multi-Port UDP Sniffer Controls
-        autoUdpToggleBtn = UiStyle.primaryButton(context, "자동 UDP 전송 포트 감지 시작 (14개 포트 동시)") {
-            toggleAutoUdpSniffer()
+        // Auto Multi-Port TCP + UDP Sniffer Controls
+        autoSniffToggleBtn = UiStyle.primaryButton(context, "자동 TCP + UDP 동시 감지 시작 (28개 포트)") {
+            toggleAutoTcpUdpSniffer()
         }
-        livePortCard.addView(autoUdpToggleBtn, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 10) })
+        livePortCard.addView(autoSniffToggleBtn, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 10) })
 
-        extraUdpPortField = styledInput("추가 감시할 UDP 포트 (선택)", "", numeric = true)
-        val addUdpPortBtn = UiStyle.secondaryButton(context, "+ 포트 추가") { addCustomUdpPort() }
+        extraPortField = styledInput("추가 감시 포트 (TCP+UDP 동시, 1024~65535)", "", numeric = true)
+        val addPortBtn = UiStyle.secondaryButton(context, "+ 포트 추가") { addCustomSniffPort() }
         livePortCard.addView(LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            addView(extraUdpPortField, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = UiStyle.dp(context, 8) })
-            addView(addUdpPortBtn, LinearLayout.LayoutParams(-2, -2))
+            addView(extraPortField, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = UiStyle.dp(context, 8) })
+            addView(addPortBtn, LinearLayout.LayoutParams(-2, -2))
         }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 8) })
 
         monitorPanel.addView(livePortCard, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 12) })
@@ -332,12 +343,15 @@ internal class NetToolsView(
         ) { monitorFormat = it }
         streamCard.addView(monFmtChips, LinearLayout.LayoutParams(-1, -2))
 
-        monitorStatsText = UiStyle.label(context, "대기 중 · 위에서 포트를 탭하면 실시간 데이터가 표시됩니다", 12f, UiStyle.CYAN).apply {
+        monitorStatsText = UiStyle.label(context, "대기 중 · 포트를 탭하거나 자동 감지를 시작하면 실시간 패킷이 표시됩니다", 12f, UiStyle.CYAN).apply {
             typeface = Typeface.MONOSPACE
             setPadding(0, UiStyle.dp(context, 10), 0, UiStyle.dp(context, 8))
         }
         streamCard.addView(monitorStatsText)
 
+        monitorDeviceFilterBtn = UiStyle.compactChipButton(
+            context, "전체 장비", UiStyle.SURFACE_ALT, UiStyle.SECONDARY, UiStyle.BORDER
+        ) { toggleDeviceOnlyFilter() }.apply { visibility = View.GONE }
         monitorProbeBtn = UiStyle.compactChipButton(
             context, "프로브 전송", UiStyle.AMBER_SOFT, UiStyle.AMBER, 0xff594218.toInt()
         ) { sendQuickProbeOnTcpTap() }.apply { visibility = View.GONE }
@@ -354,6 +368,7 @@ internal class NetToolsView(
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             val gap = UiStyle.dp(context, 6)
+            addView(monitorDeviceFilterBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
             addView(monitorProbeBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
             addView(monitorToConsoleBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
             addView(monClearBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
@@ -367,7 +382,7 @@ internal class NetToolsView(
             LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = UiStyle.dp(context, 8) }
         )
 
-        monitorLogView = buildTerminalTextView("감지된 포트를 선택하거나 자동 UDP 감지를 시작하면\n전송 중인 데이터가 실시간으로 표시됩니다.")
+        monitorLogView = buildTerminalTextView("감지된 TCP/UDP 포트를 탭하거나 [자동 TCP+UDP 동시 감지 시작]을 누르면\n오가는 데이터가 실시간으로 표시됩니다.")
         streamCard.addView(monitorLogView, LinearLayout.LayoutParams(-1, -2))
         monitorPanel.addView(streamCard, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 12) })
 
@@ -544,7 +559,8 @@ internal class NetToolsView(
         hostScanCancel?.set(true)
         portScanCancel?.set(true)
         udpSniffer.stop()
-        tcpTapClient.disconnect()
+        tcpServerSniffer.stop()
+        stopAllTcpTaps()
         consoleClient.disconnect()
     }
 
@@ -834,8 +850,16 @@ internal class NetToolsView(
     private fun renderDynamicMonitorChips() {
         dynamicChipContainer.removeAllViews()
         val hasTcp = selectedDeviceIp.isNotEmpty() && openPorts.isNotEmpty()
-        val hasUdp = liveUdpChannels.isNotEmpty()
-        dynamicEmptyHint.visibility = if (hasTcp || hasUdp) View.GONE else View.VISIBLE
+        val hasInbound = liveInboundChannels.isNotEmpty()
+        dynamicEmptyHint.visibility = if (hasTcp || hasInbound) View.GONE else View.VISIBLE
+
+        // Show selected-device filter button whenever a device IP is selected
+        if (selectedDeviceIp.isNotEmpty()) {
+            monitorDeviceFilterBtn.visibility = View.VISIBLE
+            styleDeviceFilterButton()
+        } else {
+            monitorDeviceFilterBtn.visibility = View.GONE
+        }
 
         if (hasTcp) {
             dynamicChipContainer.addView(
@@ -844,20 +868,49 @@ internal class NetToolsView(
             )
             val tcpRow = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
             val gap = UiStyle.dp(context, 6)
+
+            val allTapping = tcpTapClients.size >= minOf(openPorts.size, 8) && tcpTapClients.isNotEmpty() && focusedTcpTapPort == null
+            tcpRow.addView(
+                UiStyle.compactChipButton(
+                    context,
+                    if (allTapping) "■ 전체 중지 (${tcpTapClients.size})" else "● 전체 동시 감시",
+                    if (allTapping) UiStyle.ACCENT else UiStyle.ACCENT_SOFT,
+                    if (allTapping) UiStyle.ON_ACCENT else UiStyle.ACCENT,
+                    UiStyle.ACCENT
+                ) {
+                    if (allTapping) {
+                        stopAllTcpTaps()
+                    } else {
+                        startAllTcpTapsForSelectedDevice()
+                    }
+                },
+                LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap }
+            )
+
             openPorts.forEach { p ->
-                val active = (activeTcpTapPort == p.port && tcpTapClient.isConnected())
-                val dot = if (p.activelySending) "● " else ""
+                val clientConnected = tcpTapClients[p.port]?.isConnected() == true
+                val focused = focusedTcpTapPort == p.port
+                val dot = if (clientConnected || p.activelySending) "● " else ""
                 val chip = UiStyle.compactChipButton(
                     context,
                     "$dot:${p.port} ${p.serviceName}",
-                    if (active) UiStyle.ACCENT else if (p.activelySending) UiStyle.ACCENT_SOFT else UiStyle.BG,
-                    if (active) UiStyle.ON_ACCENT else if (p.activelySending) UiStyle.ACCENT else UiStyle.INK,
-                    if (active || p.activelySending) UiStyle.ACCENT else UiStyle.BORDER
+                    when {
+                        focused -> UiStyle.ACCENT
+                        clientConnected -> UiStyle.ACCENT_SOFT
+                        p.activelySending -> UiStyle.ACCENT_SOFT
+                        else -> UiStyle.BG
+                    },
+                    when {
+                        focused -> UiStyle.ON_ACCENT
+                        clientConnected || p.activelySending -> UiStyle.ACCENT
+                        else -> UiStyle.INK
+                    },
+                    if (focused || clientConnected || p.activelySending) UiStyle.ACCENT else UiStyle.BORDER
                 ) {
-                    if (active) {
-                        stopTcpLiveTap()
+                    if (focused && clientConnected) {
+                        stopSingleTcpTap(p.port)
                     } else {
-                        startTcpLiveTap(selectedDeviceIp, p.port)
+                        startTcpLiveTap(selectedDeviceIp, p.port, exclusive = true)
                     }
                 }
                 tcpRow.addView(chip, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
@@ -871,102 +924,156 @@ internal class NetToolsView(
             )
         }
 
-        if (hasUdp) {
+        if (hasInbound) {
             dynamicChipContainer.addView(
-                UiStyle.label(context, "● 실시간 UDP 전송 감지됨 — 탭하여 해당 스트림만 보기", 11.5f, UiStyle.CYAN, bold = true)
+                UiStyle.label(context, "● 실시간 TCP · UDP 수신 포착됨 — 탭하여 해당 스트림만 보기", 11.5f, UiStyle.CYAN, bold = true)
                     .apply { setPadding(0, UiStyle.dp(context, 2), 0, UiStyle.dp(context, 6)) }
             )
-            val udpRow = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
+            val inRow = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
             val gap = UiStyle.dp(context, 6)
-            val allSelected = (activeTcpTapPort == null && selectedUdpFilterKey == null)
-            udpRow.addView(
+            val allSelected = (focusedTcpTapPort == null && selectedInboundFilterKey == null)
+            inRow.addView(
                 UiStyle.compactChipButton(
                     context,
-                    "전체 (${liveUdpChannels.size})",
+                    "전체 (${liveInboundChannels.size})",
                     if (allSelected) UiStyle.CYAN else UiStyle.BG,
                     if (allSelected) UiStyle.ON_ACCENT else UiStyle.CYAN,
                     UiStyle.CYAN
                 ) {
-                    stopTcpLiveTap()
-                    selectedUdpFilterKey = null
+                    focusedTcpTapPort = null
+                    selectedInboundFilterKey = null
                     renderDynamicMonitorChips()
                     refreshMonitorLogDisplay()
                 },
                 LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap }
             )
-            liveUdpChannels.values.sortedByDescending { it.lastSeenMs }.forEach { ch ->
-                val isSel = (activeTcpTapPort == null && selectedUdpFilterKey == ch.key)
+            liveInboundChannels.values.sortedByDescending { it.lastSeenMs }.forEach { ch ->
+                val isSel = (focusedTcpTapPort == null && selectedInboundFilterKey == ch.key)
+                val chipColor = if (ch.protocol == "TCP-IN") UiStyle.AMBER else UiStyle.CYAN
+                val chipSoft = if (ch.protocol == "TCP-IN") UiStyle.AMBER_SOFT else UiStyle.CYAN_SOFT
                 val chip = UiStyle.compactChipButton(
                     context,
-                    "● :${ch.localPort} · ${ch.sourceIp} (${ch.count})",
-                    if (isSel) UiStyle.CYAN else UiStyle.CYAN_SOFT,
-                    if (isSel) UiStyle.ON_ACCENT else UiStyle.CYAN,
-                    if (isSel) UiStyle.CYAN else UiStyle.BORDER
+                    "● ${ch.shortProto} :${ch.localPort} · ${ch.sourceIp} (${ch.count})",
+                    if (isSel) chipColor else chipSoft,
+                    if (isSel) UiStyle.ON_ACCENT else chipColor,
+                    if (isSel) chipColor else UiStyle.BORDER
                 ) {
-                    stopTcpLiveTap()
-                    selectedUdpFilterKey = ch.key
+                    focusedTcpTapPort = null
+                    selectedInboundFilterKey = ch.key
                     monitorToConsoleBtn.visibility = View.VISIBLE
                     monitorProbeBtn.visibility = View.GONE
-                    monitorStatsText.text = "UDP :${ch.localPort} ← ${ch.sourceIp}:${ch.sourcePort} · ${ch.count}건 (${UiStyle.formatSize(ch.bytes)})"
-                    monitorStatsText.setTextColor(UiStyle.CYAN)
+                    monitorStatsText.text = "${ch.shortProto} :${ch.localPort} ← ${ch.sourceIp}:${ch.sourcePort} · ${ch.count}건 (${UiStyle.formatSize(ch.bytes)})"
+                    monitorStatsText.setTextColor(chipColor)
                     renderDynamicMonitorChips()
                     refreshMonitorLogDisplay()
                 }
-                udpRow.addView(chip, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
+                inRow.addView(chip, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
             }
             dynamicChipContainer.addView(
                 HorizontalScrollView(context).apply {
                     isHorizontalScrollBarEnabled = false
-                    addView(udpRow)
+                    addView(inRow)
                 }
             )
         }
     }
 
-    private fun startTcpLiveTap(ip: String, port: Int) {
-        tcpTapClient.disconnect()
-        activeTcpTapPort = port
-        selectedUdpFilterKey = null
+    private fun toggleDeviceOnlyFilter() {
+        filterSelectedDeviceOnly = !filterSelectedDeviceOnly
+        styleDeviceFilterButton()
+        refreshMonitorLogDisplay()
+    }
+
+    private fun styleDeviceFilterButton() {
+        monitorDeviceFilterBtn.text = if (filterSelectedDeviceOnly) "● $selectedDeviceIp 만" else "전체 장비"
+        monitorDeviceFilterBtn.setTextColor(if (filterSelectedDeviceOnly) UiStyle.ON_ACCENT else UiStyle.SECONDARY)
+        monitorDeviceFilterBtn.background = UiStyle.rippleRounded(
+            context,
+            if (filterSelectedDeviceOnly) UiStyle.ACCENT else UiStyle.SURFACE_ALT,
+            10,
+            if (filterSelectedDeviceOnly) null else UiStyle.BORDER
+        )
+    }
+
+    private fun startAllTcpTapsForSelectedDevice() {
+        val ip = selectedDeviceIp
+        if (ip.isEmpty() || openPorts.isEmpty()) return
+        stopAllTcpTaps()
+        focusedTcpTapPort = null
+        selectedInboundFilterKey = null
+        val targets = openPorts.take(8)
+        targets.forEach { res ->
+            startTcpLiveTap(ip, res.port, exclusive = false)
+        }
+        monitorStatsText.text = "● $ip 열린 TCP ${targets.size}개 포트 동시 감시 중"
+        monitorStatsText.setTextColor(UiStyle.ACCENT)
+        renderDynamicMonitorChips()
+    }
+
+    private fun startTcpLiveTap(ip: String, port: Int, exclusive: Boolean = true) {
+        if (exclusive) {
+            stopAllTcpTaps()
+            focusedTcpTapPort = port
+            selectedInboundFilterKey = null
+        } else {
+            tcpTapClients.remove(port)?.disconnect()
+        }
         monitorProbeBtn.visibility = View.VISIBLE
         monitorToConsoleBtn.visibility = View.VISIBLE
-        monitorStatsText.text = "TCP $ip:$port 실시간 데이터 연결 중..."
-        monitorStatsText.setTextColor(UiStyle.AMBER)
+        if (exclusive) {
+            monitorStatsText.text = "TCP $ip:$port 실시간 데이터 연결 중..."
+            monitorStatsText.setTextColor(UiStyle.AMBER)
+        }
+
+        val client = DeviceConsoleClient()
+        tcpTapClients[port] = client
         renderDynamicMonitorChips()
 
         var tapCount = 0
         var tapBytes = 0L
-        tcpTapClient.connect(
+        client.connect(
             tcp = true,
             host = ip,
             port = port,
             onConnected = { msg ->
                 handler.post {
-                    monitorStatsText.text = "● $msg · 실시간 수신 대기 중"
-                    monitorStatsText.setTextColor(UiStyle.ACCENT)
-                    appendMonitorLine("TCP:$port", "[${timeFmt.format(Date())}] $msg (데이터 수신 대기)")
+                    if (tcpTapClients[port] !== client) return@post
+                    if (exclusive) {
+                        monitorStatsText.text = "● $msg · 실시간 수신 대기 중"
+                        monitorStatsText.setTextColor(UiStyle.ACCENT)
+                    }
+                    appendMonitorEvent("TCP:$port", ip, "[${timeFmt.format(Date())}] $msg")
                     renderDynamicMonitorChips()
                     if (PortRegistry.isHttpLike(port)) {
-                        // Automatically send a lightweight HTTP probe so HTTP/MJPEG ports immediately show headers
-                        sendQuickProbeOnTcpTap()
+                        sendProbeToPort(ip, port, client)
                     }
                 }
             },
             onReceive = { data, from ->
                 handler.post {
+                    if (tcpTapClients[port] !== client) return@post
                     tapCount++
                     tapBytes += data.size
-                    monitorStatsText.text = "● TCP $ip:$port · ${tapCount}건 · ${UiStyle.formatSize(tapBytes)}"
-                    monitorStatsText.setTextColor(UiStyle.ACCENT)
-                    val formatted = formatPacketLine(timeFmt.format(Date()), "$from (${data.size}B)", data)
-                    appendMonitorLine("TCP:$port", formatted)
+                    monitorEventCount++
+                    monitorTotalBytes += data.size
+                    if (focusedTcpTapPort == port || focusedTcpTapPort == null) {
+                        monitorStatsText.text = "● TCP $ip:$port · ${tapCount}건 · ${UiStyle.formatSize(tapBytes)}"
+                        monitorStatsText.setTextColor(UiStyle.ACCENT)
+                    }
+                    val formatted = formatPacketLine(timeFmt.format(Date()), "TCP $from (${data.size}B)", data)
+                    appendMonitorEvent("TCP:$port", ip, formatted)
                 }
             },
             onDisconnected = { reason ->
                 handler.post {
-                    if (activeTcpTapPort == port) {
-                        monitorStatsText.text = "TCP $ip:$port 종료: $reason (총 ${tapCount}건)"
-                        monitorStatsText.setTextColor(UiStyle.MUTED)
-                        activeTcpTapPort = null
+                    if (tcpTapClients[port] === client) {
+                        tcpTapClients.remove(port)
+                        if (focusedTcpTapPort == port) {
+                            monitorStatsText.text = "TCP $ip:$port 종료: $reason (총 ${tapCount}건)"
+                            monitorStatsText.setTextColor(UiStyle.MUTED)
+                            focusedTcpTapPort = null
+                        }
+                        if (tcpTapClients.isEmpty()) monitorProbeBtn.visibility = View.GONE
                         renderDynamicMonitorChips()
                     }
                 }
@@ -974,138 +1081,150 @@ internal class NetToolsView(
         )
     }
 
-    private fun stopTcpLiveTap() {
-        if (activeTcpTapPort != null || tcpTapClient.isConnected()) {
-            activeTcpTapPort = null
-            tcpTapClient.disconnect()
-            monitorProbeBtn.visibility = View.GONE
-            renderDynamicMonitorChips()
-        }
+    private fun stopSingleTcpTap(port: Int) {
+        tcpTapClients.remove(port)?.disconnect()
+        if (focusedTcpTapPort == port) focusedTcpTapPort = null
+        if (tcpTapClients.isEmpty()) monitorProbeBtn.visibility = View.GONE
+        renderDynamicMonitorChips()
+        refreshMonitorLogDisplay()
+    }
+
+    private fun stopAllTcpTaps() {
+        tcpTapClients.values.forEach { it.disconnect() }
+        tcpTapClients.clear()
+        focusedTcpTapPort = null
+        monitorProbeBtn.visibility = View.GONE
+        renderDynamicMonitorChips()
     }
 
     private fun sendQuickProbeOnTcpTap() {
-        val port = activeTcpTapPort ?: return
-        if (!tcpTapClient.isConnected()) return
+        val targetPort = focusedTcpTapPort ?: tcpTapClients.keys.firstOrNull() ?: return
+        val client = tcpTapClients[targetPort] ?: return
+        sendProbeToPort(selectedDeviceIp, targetPort, client)
+    }
+
+    private fun sendProbeToPort(ip: String, port: Int, client: DeviceConsoleClient) {
+        if (!client.isConnected()) return
         val probe = if (PortRegistry.isHttpLike(port)) {
-            "GET / HTTP/1.0\r\nHost: $selectedDeviceIp\r\n\r\n".toByteArray(Charsets.US_ASCII)
+            "GET / HTTP/1.0\r\nHost: $ip\r\n\r\n".toByteArray(Charsets.US_ASCII)
         } else {
             "\r\n".toByteArray(Charsets.US_ASCII)
         }
-        tcpTapClient.send(probe) { ok, _ ->
+        client.send(probe) { ok, _ ->
             if (ok) {
                 handler.post {
                     val label = if (PortRegistry.isHttpLike(port)) "GET / HTTP/1.0" else "\\r\\n 프로브"
-                    appendMonitorLine("TCP:$port", "[${timeFmt.format(Date())}] TX 프로브 → $label")
+                    appendMonitorEvent("TCP:$port", ip, "[${timeFmt.format(Date())}] TX 프로브(:$port) → $label")
                 }
             }
         }
     }
 
-    private fun toggleAutoUdpSniffer() {
-        if (udpSniffer.isRunning()) {
+    private fun toggleAutoTcpUdpSniffer() {
+        if (udpSniffer.isRunning() || tcpServerSniffer.isRunning()) {
             udpSniffer.stop()
-            autoUdpToggleBtn.text = "자동 UDP 전송 포트 감지 시작 (14개 포트 동시)"
-            if (activeTcpTapPort == null) {
-                monitorStatsText.text = "자동 UDP 감지 중지됨 · 포착된 채널 ${liveUdpChannels.size}개"
+            tcpServerSniffer.stop()
+            autoSniffToggleBtn.text = "자동 TCP + UDP 동시 감지 시작 (28개 포트)"
+            if (focusedTcpTapPort == null) {
+                monitorStatsText.text = "자동 감지 중지됨 · 포착된 채널 ${liveInboundChannels.size}개"
                 monitorStatsText.setTextColor(UiStyle.MUTED)
             }
             return
         }
-        autoUdpToggleBtn.text = "자동 UDP 감지 중지"
-        if (activeTcpTapPort == null) {
-            monitorStatsText.text = "주요 14개 UDP 포트 동시 감시 시작 중..."
+        autoSniffToggleBtn.text = "자동 TCP + UDP 감지 중지"
+        if (focusedTcpTapPort == null) {
+            monitorStatsText.text = "TCP 14개 + UDP 14개 포트 동시 바인딩 중..."
             monitorStatsText.setTextColor(UiStyle.CYAN)
         }
+        var boundTcp = 0
+        var boundUdp = 0
+        fun reportBound() {
+            handler.post {
+                if (focusedTcpTapPort == null && (udpSniffer.isRunning() || tcpServerSniffer.isRunning())) {
+                    monitorStatsText.text = "● 자동 감지 중 (TCP ${boundTcp}개 + UDP ${boundUdp}개 포트) · 패킷 수신 시 상단 자동 표시"
+                    monitorStatsText.setTextColor(UiStyle.ACCENT)
+                }
+            }
+        }
+        tcpServerSniffer.start(
+            ports = PortRegistry.AUTO_TCP_SERVER_PORTS,
+            onBound = { ports -> boundTcp = ports.size; reportBound() },
+            onPacket = ::handleInboundPacket,
+            onStopped = {}
+        )
         udpSniffer.start(
             ports = PortRegistry.AUTO_UDP_PORTS,
-            onBound = { bound ->
-                handler.post {
-                    if (activeTcpTapPort == null) {
-                        monitorStatsText.text = "● 자동 감지 중 (${bound.size}개 UDP 포트) · 패킷 수신 시 상단에 자동 표시"
-                        monitorStatsText.setTextColor(UiStyle.ACCENT)
-                    }
-                }
-            },
-            onPacket = { pkt ->
-                handler.post {
-                    monitorEventCount++
-                    monitorTotalBytes += pkt.data.size
-                    val key = "UDP:${pkt.localPort}:${pkt.sourceIp}"
-                    val ch = liveUdpChannels.getOrPut(key) {
-                        LiveUdpChannel(pkt.localPort, pkt.sourceIp, pkt.sourcePort)
-                    }
-                    ch.count += 1
-                    ch.bytes += pkt.data.size
-                    ch.lastSeenMs = pkt.timestampMs
-                    renderDynamicMonitorChips()
-
-                    val line = formatPacketLine(
-                        timeFmt.format(Date(pkt.timestampMs)),
-                        "UDP :${pkt.localPort} ← ${pkt.sourceIp}:${pkt.sourcePort} (${pkt.data.size}B)",
-                        pkt.data
-                    )
-                    appendMonitorLine(key, line)
-                    if (activeTcpTapPort == null && (selectedUdpFilterKey == null || selectedUdpFilterKey == key)) {
-                        monitorStatsText.text = "● UDP 감지 중 · ${monitorEventCount}건 · ${UiStyle.formatSize(monitorTotalBytes)} · 채널 ${liveUdpChannels.size}개"
-                        monitorStatsText.setTextColor(UiStyle.ACCENT)
-                    }
-                }
-            },
+            onBound = { ports -> boundUdp = ports.size; reportBound() },
+            onPacket = ::handleInboundPacket,
             onStopped = {
                 handler.post {
-                    autoUdpToggleBtn.text = "자동 UDP 전송 포트 감지 시작 (14개 포트 동시)"
+                    if (!tcpServerSniffer.isRunning()) {
+                        autoSniffToggleBtn.text = "자동 TCP + UDP 동시 감지 시작 (28개 포트)"
+                    }
                 }
             }
         )
     }
 
-    private fun addCustomUdpPort() {
-        val port = extraUdpPortField.text.toString().trim().toIntOrNull()
+    private fun handleInboundPacket(pkt: CapturedPacket) {
+        handler.post {
+            monitorEventCount++
+            monitorTotalBytes += pkt.data.size
+            val key = "${pkt.protocol}:${pkt.localPort}:${pkt.sourceIp}"
+            val ch = liveInboundChannels.getOrPut(key) {
+                LiveInboundChannel(pkt.protocol, pkt.localPort, pkt.sourceIp, pkt.sourcePort)
+            }
+            ch.count += 1
+            ch.bytes += pkt.data.size
+            ch.lastSeenMs = pkt.timestampMs
+            renderDynamicMonitorChips()
+
+            val tag = if (pkt.protocol == "TCP-IN") "TCP" else "UDP"
+            val line = formatPacketLine(
+                timeFmt.format(Date(pkt.timestampMs)),
+                "$tag :${pkt.localPort} ← ${pkt.sourceIp}:${pkt.sourcePort} (${pkt.data.size}B)",
+                pkt.data
+            )
+            appendMonitorEvent(key, pkt.sourceIp, line)
+            if (focusedTcpTapPort == null && (selectedInboundFilterKey == null || selectedInboundFilterKey == key)) {
+                monitorStatsText.text = "● TCP+UDP 감지 중 · ${monitorEventCount}건 · ${UiStyle.formatSize(monitorTotalBytes)} · 채널 ${liveInboundChannels.size}개"
+                monitorStatsText.setTextColor(UiStyle.ACCENT)
+            }
+        }
+    }
+
+    private fun addCustomSniffPort() {
+        val port = extraPortField.text.toString().trim().toIntOrNull()
         if (port == null || port !in 1..65535) {
             Toast.makeText(context, "포트 번호를 1~65535 사이로 입력하세요", Toast.LENGTH_SHORT).show()
             return
         }
-        if (!udpSniffer.isRunning()) {
-            toggleAutoUdpSniffer()
-            handler.postDelayed({
-                addCustomUdpPortInternal(port)
-            }, 250)
+        if (!udpSniffer.isRunning() && !tcpServerSniffer.isRunning()) {
+            toggleAutoTcpUdpSniffer()
+            handler.postDelayed({ addCustomSniffPortInternal(port) }, 300)
         } else {
-            addCustomUdpPortInternal(port)
+            addCustomSniffPortInternal(port)
         }
     }
 
-    private fun addCustomUdpPortInternal(port: Int) {
+    private fun addCustomSniffPortInternal(port: Int) {
         Thread({
-            val added = udpSniffer.addPort(port) { pkt ->
-                handler.post {
-                    monitorEventCount++
-                    monitorTotalBytes += pkt.data.size
-                    val key = "UDP:${pkt.localPort}:${pkt.sourceIp}"
-                    val ch = liveUdpChannels.getOrPut(key) {
-                        LiveUdpChannel(pkt.localPort, pkt.sourceIp, pkt.sourcePort)
-                    }
-                    ch.count += 1
-                    ch.bytes += pkt.data.size
-                    ch.lastSeenMs = pkt.timestampMs
-                    renderDynamicMonitorChips()
-                    val line = formatPacketLine(
-                        timeFmt.format(Date(pkt.timestampMs)),
-                        "UDP :${pkt.localPort} ← ${pkt.sourceIp}:${pkt.sourcePort} (${pkt.data.size}B)",
-                        pkt.data
-                    )
-                    appendMonitorLine(key, line)
-                }
-            }
+            val tcpOk = if (port >= 1024) tcpServerSniffer.addPort(port, ::handleInboundPacket) else false
+            val udpOk = udpSniffer.addPort(port, ::handleInboundPacket)
             handler.post {
-                if (added) {
-                    extraUdpPortField.setText("")
-                    Toast.makeText(context, "UDP :$port 감시 목록에 추가됨", Toast.LENGTH_SHORT).show()
+                if (tcpOk || udpOk) {
+                    extraPortField.setText("")
+                    val label = buildList {
+                        if (tcpOk) add("TCP")
+                        if (udpOk) add("UDP")
+                    }.joinToString("+")
+                    Toast.makeText(context, "$label :$port 감시 목록에 추가됨", Toast.LENGTH_SHORT).show()
                 } else {
-                    Toast.makeText(context, "UDP :$port 바인딩 실패 (이미 사용 중일 수 있음)", Toast.LENGTH_SHORT).show()
+                    val hint = if (port < 1024) " (1024 미만은 비루트 서버 바인딩 불가)" else ""
+                    Toast.makeText(context, "포트 :$port 바인딩 실패$hint", Toast.LENGTH_LONG).show()
                 }
             }
-        }, "netlab-add-udp").start()
+        }, "netlab-add-port").start()
     }
 
     private fun formatPacketLine(ts: String, header: String, data: ByteArray): String {
@@ -1117,41 +1236,51 @@ internal class NetToolsView(
         return "[$ts] $header\n  $body"
     }
 
-    private fun appendMonitorLine(channelKey: String, line: String) {
-        monitorAllEvents.addFirst(channelKey to line)
-        while (monitorAllEvents.size > 100) monitorAllEvents.removeLast()
+    private fun appendMonitorEvent(channelKey: String, peerIp: String, line: String) {
+        monitorAllEvents.addFirst(MonitorEvent(channelKey, peerIp, line))
+        while (monitorAllEvents.size > 120) monitorAllEvents.removeLast()
         refreshMonitorLogDisplay()
     }
 
     private fun refreshMonitorLogDisplay() {
-        val activeTcp = activeTcpTapPort
-        val filterKey = when {
+        val activeTcp = focusedTcpTapPort
+        val channelFilter = when {
             activeTcp != null -> "TCP:$activeTcp"
-            selectedUdpFilterKey != null -> selectedUdpFilterKey
+            selectedInboundFilterKey != null -> selectedInboundFilterKey
             else -> null
         }
-        val visible = if (filterKey == null) {
-            monitorAllEvents.map { it.second }
-        } else {
-            monitorAllEvents.filter { it.first == filterKey }.map { it.second }
-        }
+        val visible = monitorAllEvents.asSequence()
+            .filter { ev -> channelFilter == null || ev.channelKey == channelFilter }
+            .filter { ev -> !filterSelectedDeviceOnly || selectedDeviceIp.isEmpty() || ev.peerIp == selectedDeviceIp }
+            .map { it.formattedLine }
+            .take(50)
+            .toList()
         monitorLogView.text = if (visible.isEmpty()) {
-            "데이터 수신 대기 중..."
+            if (filterSelectedDeviceOnly && selectedDeviceIp.isNotEmpty()) {
+                "$selectedDeviceIp 의 패킷 수신 대기 중..."
+            } else {
+                "데이터 수신 대기 중..."
+            }
         } else {
-            visible.take(50).joinToString("\n\n")
+            visible.joinToString("\n\n")
         }
     }
 
     private fun jumpCurrentMonitorToConsole() {
-        val activeTcp = activeTcpTapPort
+        val activeTcp = focusedTcpTapPort ?: tcpTapClients.keys.firstOrNull()
         if (activeTcp != null && selectedDeviceIp.isNotEmpty()) {
-            stopTcpLiveTap()
+            stopAllTcpTaps()
             openInConsole(tcp = true, ip = selectedDeviceIp, port = activeTcp, autoConnect = true)
             return
         }
-        val selUdp = selectedUdpFilterKey?.let { liveUdpChannels[it] }
-        if (selUdp != null) {
-            openInConsole(tcp = false, ip = selUdp.sourceIp, port = selUdp.localPort, autoConnect = true)
+        val selIn = selectedInboundFilterKey?.let { liveInboundChannels[it] }
+        if (selIn != null) {
+            openInConsole(
+                tcp = (selIn.protocol == "TCP-IN"),
+                ip = selIn.sourceIp,
+                port = selIn.localPort,
+                autoConnect = true
+            )
         }
     }
 

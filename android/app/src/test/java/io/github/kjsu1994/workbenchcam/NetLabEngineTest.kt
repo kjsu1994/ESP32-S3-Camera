@@ -4,6 +4,7 @@ import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.ServerSocket
+import java.net.Socket
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -173,6 +174,50 @@ class NetLabEngineTest {
             client.disconnect()
             server.close()
             serverThread.join(1000)
+        }
+    }
+
+    @Test fun multiPortTcpServerSnifferDynamicallyCapturesInboundClientsAcrossMultiplePorts() {
+        val p1 = ServerSocket(0).use { it.localPort }
+        val p2 = ServerSocket(0).use { it.localPort }
+        val sniffer = MultiPortTcpServerSniffer()
+        val boundLatch = CountDownLatch(1)
+        val recvLatch = CountDownLatch(2)
+        val captured = CopyOnWriteArrayList<CapturedPacket>()
+
+        try {
+            sniffer.start(
+                ports = intArrayOf(p1, p2),
+                onBound = { ports ->
+                    if (ports.containsAll(listOf(p1, p2))) boundLatch.countDown()
+                },
+                onPacket = { pkt ->
+                    captured.add(pkt)
+                    recvLatch.countDown()
+                },
+                onStopped = {}
+            )
+            assertTrue("TCP sniffer failed to bind both ports", boundLatch.await(2, TimeUnit.SECONDS))
+
+            val payload1 = "PLC_PUSH_DATA_1".toByteArray(Charsets.US_ASCII)
+            val payload2 = byteArrayOf(0xDE.toByte(), 0xAD.toByte(), 0xBE.toByte(), 0xEF.toByte())
+            Socket("127.0.0.1", p1).use { s1 ->
+                s1.getOutputStream().write(payload1)
+                s1.getOutputStream().flush()
+                Socket("127.0.0.1", p2).use { s2 ->
+                    s2.getOutputStream().write(payload2)
+                    s2.getOutputStream().flush()
+                    assertTrue("Expected TCP packets on both ports", recvLatch.await(2, TimeUnit.SECONDS))
+                }
+            }
+            val cap1 = captured.first { it.localPort == p1 }
+            val cap2 = captured.first { it.localPort == p2 }
+            assertEquals("TCP-IN", cap1.protocol)
+            assertEquals("TCP-IN", cap2.protocol)
+            assertArrayEquals(payload1, cap1.data)
+            assertArrayEquals(payload2, cap2.data)
+        } finally {
+            sniffer.stop()
         }
     }
 }

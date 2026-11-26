@@ -118,6 +118,11 @@ internal object PortRegistry {
         1900, 5353, 5000, 5001, 6000, 7000, 8000, 8080, 8888, 9000, 9999, 12345, 30303, 47808
     )
 
+    // Common non-privileged TCP server ports (>= 1024) listened simultaneously for inbound TCP client devices
+    val AUTO_TCP_SERVER_PORTS = intArrayOf(
+        2000, 3000, 4000, 4001, 5000, 5001, 6000, 7000, 8000, 8080, 8888, 9000, 9100, 9999
+    )
+
     fun serviceName(port: Int): String = when (port) {
         21 -> "FTP"
         22 -> "SSH"
@@ -517,6 +522,123 @@ internal class MultiPortUdpSniffer {
         val copy = sockets.values.toList()
         sockets.clear()
         copy.forEach { runCatching { it.close() } }
+    }
+}
+
+/**
+ * Simultaneous Multi-Port TCP Server Sniffer (non-privileged ports >= 1024) so devices acting as
+ * TCP Clients pushing to this phone are automatically accepted and dynamically surfaced with live data.
+ */
+internal class MultiPortTcpServerSniffer {
+    @Volatile private var running = false
+    private val servers = ConcurrentHashMap<Int, ServerSocket>()
+    private val activeClients = Collections.newSetFromMap(ConcurrentHashMap<Socket, Boolean>())
+
+    fun isRunning(): Boolean = running
+
+    fun activePorts(): List<Int> = servers.keys.sorted()
+
+    fun start(
+        ports: IntArray,
+        onBound: (boundPorts: List<Int>) -> Unit,
+        onPacket: (CapturedPacket) -> Unit,
+        onStopped: () -> Unit
+    ) {
+        stop()
+        running = true
+        Thread({
+            val bound = ArrayList<Int>()
+            for (port in ports.distinct()) {
+                if (!running) break
+                if (port >= 1024 && bindSinglePort(port, onPacket)) {
+                    bound.add(port)
+                }
+            }
+            onBound(bound.sorted())
+            if (bound.isEmpty()) {
+                running = false
+                onStopped()
+            }
+        }, "netlab-multi-tcp-start").start()
+    }
+
+    fun addPort(port: Int, onPacket: (CapturedPacket) -> Unit): Boolean {
+        if (!running || port !in 1024..65535) return false
+        if (servers.containsKey(port)) return true
+        return bindSinglePort(port, onPacket)
+    }
+
+    private fun bindSinglePort(port: Int, onPacket: (CapturedPacket) -> Unit): Boolean {
+        val server = try {
+            ServerSocket().apply {
+                reuseAddress = true
+                soTimeout = 500
+                bind(InetSocketAddress(port))
+            }
+        } catch (_: Exception) {
+            return false
+        }
+        servers[port] = server
+        Thread({
+            try {
+                while (running && !server.isClosed) {
+                    val client = try {
+                        server.accept()
+                    } catch (_: SocketTimeoutException) {
+                        continue
+                    }
+                    activeClients.add(client)
+                    Thread({
+                        try {
+                            client.use { sock ->
+                                val srcIp = sock.inetAddress?.hostAddress ?: "unknown"
+                                val srcPort = sock.port
+                                sock.soTimeout = 500
+                                val buf = ByteArray(4096)
+                                val inp = sock.getInputStream()
+                                while (running && !sock.isClosed) {
+                                    val n = try {
+                                        inp.read(buf)
+                                    } catch (_: SocketTimeoutException) {
+                                        continue
+                                    } catch (_: IOException) {
+                                        break
+                                    }
+                                    if (n <= 0) break
+                                    onPacket(
+                                        CapturedPacket(
+                                            timestampMs = System.currentTimeMillis(),
+                                            protocol = "TCP-IN",
+                                            sourceIp = srcIp,
+                                            sourcePort = srcPort,
+                                            localPort = port,
+                                            data = buf.copyOf(n)
+                                        )
+                                    )
+                                }
+                            }
+                        } finally {
+                            activeClients.remove(client)
+                        }
+                    }, "netlab-tcpin-$port").start()
+                }
+            } catch (_: Exception) {
+            } finally {
+                runCatching { server.close() }
+                servers.remove(port, server)
+            }
+        }, "netlab-tcp-srv-$port").start()
+        return true
+    }
+
+    fun stop() {
+        running = false
+        val srvCopy = servers.values.toList()
+        servers.clear()
+        srvCopy.forEach { runCatching { it.close() } }
+        val cliCopy = activeClients.toList()
+        activeClients.clear()
+        cliCopy.forEach { runCatching { it.close() } }
     }
 }
 
