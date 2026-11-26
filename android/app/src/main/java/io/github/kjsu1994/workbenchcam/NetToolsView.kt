@@ -76,10 +76,30 @@ private data class LiveInboundChannel(
 }
 
 private data class MonitorEvent(
+    val seq: Int,
     val channelKey: String,
     val peerIp: String,
-    val formattedLine: String
+    val timestampMs: Long,
+    val header: String,
+    val data: ByteArray?,
+    val accentColor: Int
 )
+
+private data class ProxyPacketRecord(
+    val seq: Int,
+    val pkt: RelayedPacket
+)
+
+private data class ConsoleRecord(
+    val seq: Int,
+    val timestampMs: Long,
+    val tag: String,
+    val textBody: String,
+    val rawRxBytes: ByteArray?,
+    val accentColor: Int
+)
+
+private enum class FullscreenLogSource { MONITOR, PROXY, CONSOLE }
 
 /**
  * Water-flow Hardware Network & Port Diagnostics tab (Tab 4: 도구).
@@ -137,6 +157,7 @@ internal class NetToolsView(
     private var selectedInboundFilterKey: String? = null
     private var filterSelectedDeviceOnly = false
     private var monitorFormat = PayloadFormat.BOTH
+    private val renderMonitorFmt: (PayloadFormat) -> Unit
     private val autoSniffToggleBtn: Button
     private val extraPortField: EditText
     private val dynamicChipContainer: LinearLayout
@@ -145,11 +166,20 @@ internal class NetToolsView(
     private val monitorProbeBtn: TextView
     private val monitorToConsoleBtn: TextView
     private val monitorStatsText: TextView
-    private val monitorLogView: TextView
+    private val monitorLogPanel: LiveLogPanel
     private val liveInboundChannels = LinkedHashMap<String, LiveInboundChannel>()
     private val monitorAllEvents = ArrayDeque<MonitorEvent>()
+    private var monitorSeq = 0
     private var monitorEventCount = 0
     private var monitorTotalBytes = 0L
+    private var monitorRefreshScheduled = false
+    private var monitorPendingDelta = 0
+    private val monitorRefreshRunnable = Runnable {
+        monitorRefreshScheduled = false
+        val delta = monitorPendingDelta
+        monitorPendingDelta = 0
+        refreshMonitorLogDisplay(delta)
+    }
 
     // Sub-Tab 3: Bidirectional TCP Relay Proxy + Wireshark .pcap Export
     private val relayProxy = TcpRelayProxy()
@@ -160,15 +190,27 @@ internal class NetToolsView(
     private val proxyToggleBtn: Button
     private val proxyStatsText: TextView
     private val proxyPcapBtn: TextView
-    private val proxyLogView: TextView
+    private val renderProxyDir: (ProxyDirFilter) -> Unit
+    private val renderProxyFmt: (PayloadFormat) -> Unit
+    private val proxyLogPanel: LiveLogPanel
     private var proxyDirFilter = ProxyDirFilter.ALL
     private var proxyFormat = PayloadFormat.BOTH
-    private val proxyPackets = ArrayList<RelayedPacket>()
+    private val proxyPackets = ArrayList<ProxyPacketRecord>()
+    private var proxySeq = 0
     private var proxyC2tCount = 0
     private var proxyT2cCount = 0
     private var proxyC2tBytes = 0L
     private var proxyT2cBytes = 0L
     private var proxyActiveSessions = 0
+    private var proxyLastEventNote: String? = null
+    private var proxyRefreshScheduled = false
+    private var proxyPendingDelta = 0
+    private val proxyRefreshRunnable = Runnable {
+        proxyRefreshScheduled = false
+        val delta = proxyPendingDelta
+        proxyPendingDelta = 0
+        refreshProxyLogDisplay(delta)
+    }
 
     // Sub-Tab 4: Interactive Control Console
     private val consoleClient = DeviceConsoleClient()
@@ -180,11 +222,17 @@ internal class NetToolsView(
     private val consoleIpField: EditText
     private val consolePortField: EditText
     private val consoleConnBtn: Button
+    private val consoleRxFmtBtn: Button
     private val consoleStatusBadge: TextView
-    private val consoleLogView: TextView
+    private val consoleLogPanel: LiveLogPanel
     private val consoleInputField: EditText
     private val consoleEndingRow: LinearLayout
-    private val consoleLogLines = ArrayDeque<String>()
+    private val consoleRecords = ArrayDeque<ConsoleRecord>()
+    private var consoleSeq = 0
+
+    // Shared Fullscreen Live Log Viewer Dialog
+    private var fullscreenDialog: FullscreenLogDialog? = null
+    private var fullscreenSource: FullscreenLogSource? = null
 
     init {
         val wrapper = LinearLayout(context).apply {
@@ -370,11 +418,15 @@ internal class NetToolsView(
 
         // Card B: Live Data Stream Viewer
         val streamCard = UiStyle.card(context, 14)
-        val (monFmtChips, _) = UiStyle.segmentedChips(
+        val (monFmtChips, monFmtRenderer) = UiStyle.segmentedChips(
             context,
             PayloadFormat.entries.map { it to it.label },
             monitorFormat
-        ) { monitorFormat = it }
+        ) {
+            monitorFormat = it
+            refreshMonitorLogDisplay(0)
+        }
+        renderMonitorFmt = monFmtRenderer
         streamCard.addView(monFmtChips, LinearLayout.LayoutParams(-1, -2))
 
         monitorStatsText = UiStyle.label(context, "대기 중 · 포트를 탭하거나 자동 감지를 시작하면 실시간 패킷이 표시됩니다", 12f, UiStyle.CYAN).apply {
@@ -383,6 +435,9 @@ internal class NetToolsView(
         }
         streamCard.addView(monitorStatsText)
 
+        val monFullscreenBtn = UiStyle.compactChipButton(
+            context, "⛶ 전체화면", UiStyle.CYAN_SOFT, UiStyle.CYAN, UiStyle.CYAN
+        ) { openFullscreenLog(FullscreenLogSource.MONITOR) }
         monitorDeviceFilterBtn = UiStyle.compactChipButton(
             context, "전체 장비", UiStyle.SURFACE_ALT, UiStyle.SECONDARY, UiStyle.BORDER
         ) { toggleDeviceOnlyFilter() }.apply { visibility = View.GONE }
@@ -396,12 +451,13 @@ internal class NetToolsView(
             clearMonitorLog()
         }
         val monCopyBtn = UiStyle.compactChipButton(context, "복사", UiStyle.SURFACE_ALT, UiStyle.INK, UiStyle.BORDER) {
-            copyText(monitorLogView.text.toString())
+            copyText(monitorLogPanel.exportPlainText())
         }
         val monActionRow = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             val gap = UiStyle.dp(context, 6)
+            addView(monFullscreenBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
             addView(monitorDeviceFilterBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
             addView(monitorProbeBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
             addView(monitorToConsoleBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
@@ -416,8 +472,13 @@ internal class NetToolsView(
             LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = UiStyle.dp(context, 8) }
         )
 
-        monitorLogView = buildTerminalTextView("감지된 TCP/UDP 포트를 탭하거나 [자동 TCP+UDP 동시 감지 시작]을 누르면\n오가는 데이터가 실시간으로 표시됩니다.")
-        streamCard.addView(monitorLogView, LinearLayout.LayoutParams(-1, -2))
+        monitorLogPanel = LiveLogPanel(
+            context = context,
+            emptyPlaceholder = "감지된 TCP/UDP 포트를 탭하거나 [자동 TCP+UDP 동시 감지 시작]을 누르면\n오가는 데이터가 실시간으로 기록됩니다.\n\n• 위·아래 스크롤로 이전 패킷 확인 (자동스크롤 일시정지)\n• 항목 탭으로 개별 복사 · [⛶ 전체화면]으로 실시간 크게 보기",
+            inlineMode = true,
+            onCopyEntry = { copySingleEntry(it) }
+        )
+        streamCard.addView(monitorLogPanel.root, LinearLayout.LayoutParams(-1, UiStyle.dp(context, 250)))
         monitorPanel.addView(streamCard, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 12) })
 
         // ============================================================
@@ -493,31 +554,36 @@ internal class NetToolsView(
         }
         pxCard.addView(proxyStatsText)
 
-        val (pxDirChips, _) = UiStyle.segmentedChips(
+        val (pxDirChips, pxDirRenderer) = UiStyle.segmentedChips(
             context,
             ProxyDirFilter.entries.map { it to it.label },
             proxyDirFilter
         ) {
             proxyDirFilter = it
-            refreshProxyLogDisplay()
+            refreshProxyLogDisplay(0)
         }
+        renderProxyDir = pxDirRenderer
         pxCard.addView(pxDirChips, LinearLayout.LayoutParams(-1, -2))
 
-        val (pxFmtChips, _) = UiStyle.segmentedChips(
+        val (pxFmtChips, pxFmtRenderer) = UiStyle.segmentedChips(
             context,
             PayloadFormat.entries.map { it to it.label },
             proxyFormat
         ) {
             proxyFormat = it
-            refreshProxyLogDisplay()
+            refreshProxyLogDisplay(0)
         }
+        renderProxyFmt = pxFmtRenderer
         pxCard.addView(pxFmtChips, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 6) })
 
+        val pxFullscreenBtn = UiStyle.compactChipButton(
+            context, "⛶ 전체화면", UiStyle.CYAN_SOFT, UiStyle.CYAN, UiStyle.CYAN
+        ) { openFullscreenLog(FullscreenLogSource.PROXY) }
         proxyPcapBtn = UiStyle.compactChipButton(
             context, "Wireshark .pcap 저장", UiStyle.ACCENT_SOFT, UiStyle.ACCENT, UiStyle.ACCENT
         ) { exportProxyPcap() }
         val pxCopyBtn = UiStyle.compactChipButton(context, "로그 복사", UiStyle.SURFACE_ALT, UiStyle.INK, UiStyle.BORDER) {
-            copyText(proxyLogView.text.toString())
+            copyText(proxyLogPanel.exportPlainText())
         }
         val pxClearBtn = UiStyle.compactChipButton(context, "지우기", UiStyle.SURFACE_ALT, UiStyle.SECONDARY, UiStyle.BORDER) {
             clearProxyLog()
@@ -528,6 +594,7 @@ internal class NetToolsView(
                 addView(LinearLayout(context).apply {
                     orientation = LinearLayout.HORIZONTAL
                     val gap = UiStyle.dp(context, 6)
+                    addView(pxFullscreenBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
                     addView(proxyPcapBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
                     addView(pxCopyBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
                     addView(pxClearBtn)
@@ -539,8 +606,13 @@ internal class NetToolsView(
             }
         )
 
-        proxyLogView = buildTerminalTextView("중계 시작 후 클라이언트→대상(C→T) 및 대상→클라이언트(T→C)\n양방향 모든 TCP 데이터가 여기에 실시간으로 기록됩니다.")
-        pxCard.addView(proxyLogView, LinearLayout.LayoutParams(-1, -2))
+        proxyLogPanel = LiveLogPanel(
+            context = context,
+            emptyPlaceholder = "중계 시작 후 클라이언트→대상(C→T) 및 대상→클라이언트(T→C)\n양방향 모든 TCP 데이터가 여기에 실시간으로 기록됩니다.\n\n• 위·아래 스크롤로 이전 패킷 확인 (최대 3,000건 보관)\n• 항목 탭으로 개별 복사 · [⛶ 전체화면]으로 실시간 크게 보기",
+            inlineMode = true,
+            onCopyEntry = { copySingleEntry(it) }
+        )
+        pxCard.addView(proxyLogPanel.root, LinearLayout.LayoutParams(-1, UiStyle.dp(context, 280)))
         proxyPanel.addView(pxCard, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 12) })
 
         // ============================================================
@@ -575,25 +647,42 @@ internal class NetToolsView(
         }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 8) })
 
         consoleConnBtn = UiStyle.primaryButton(context, "연결") { toggleConsoleConnection() }
-        val conRxFmtBtn = UiStyle.secondaryButton(context, "RX: TEXT") {}
-        conRxFmtBtn.setOnClickListener {
-            consoleShowHex = !consoleShowHex
-            conRxFmtBtn.text = if (consoleShowHex) "RX: HEX" else "RX: TEXT"
-        }
-        val conClearBtn = UiStyle.secondaryButton(context, "지우기") {
-            consoleLogLines.clear()
-            consoleLogView.text = "연결 후 명령어를 보내면 송수신 로그가 여기에 표시됩니다."
-        }
+        consoleRxFmtBtn = UiStyle.secondaryButton(context, "RX: TEXT") { toggleConsoleRxFormat() }
+        val conClearBtn = UiStyle.secondaryButton(context, "지우기") { clearConsoleLog() }
         conCard.addView(LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             val gap = UiStyle.dp(context, 6)
             addView(consoleConnBtn, LinearLayout.LayoutParams(0, -2, 1.2f).apply { marginEnd = gap })
-            addView(conRxFmtBtn, LinearLayout.LayoutParams(0, -2, 0.9f).apply { marginEnd = gap })
+            addView(consoleRxFmtBtn, LinearLayout.LayoutParams(0, -2, 0.9f).apply { marginEnd = gap })
             addView(conClearBtn, LinearLayout.LayoutParams(0, -2, 0.7f))
         }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 8) })
 
-        consoleLogView = buildTerminalTextView("연결 후 명령어를 보내면 송수신 로그가 여기에 표시됩니다.")
-        conCard.addView(consoleLogView, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 10) })
+        val conFullscreenBtn = UiStyle.compactChipButton(
+            context, "⛶ 전체화면", UiStyle.CYAN_SOFT, UiStyle.CYAN, UiStyle.CYAN
+        ) { openFullscreenLog(FullscreenLogSource.CONSOLE) }
+        val conCopyBtn = UiStyle.compactChipButton(context, "로그 복사", UiStyle.SURFACE_ALT, UiStyle.INK, UiStyle.BORDER) {
+            copyText(consoleLogPanel.exportPlainText())
+        }
+        conCard.addView(
+            HorizontalScrollView(context).apply {
+                isHorizontalScrollBarEnabled = false
+                addView(LinearLayout(context).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    val gap = UiStyle.dp(context, 6)
+                    addView(conFullscreenBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
+                    addView(conCopyBtn)
+                })
+            },
+            LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 8) }
+        )
+
+        consoleLogPanel = LiveLogPanel(
+            context = context,
+            emptyPlaceholder = "연결 후 명령어를 보내면 송수신 로그가 여기에 실시간으로 기록됩니다.\n\n• 위·아래 스크롤로 이전 로그 확인 · 항목 탭으로 개별 복사",
+            inlineMode = true,
+            onCopyEntry = { copySingleEntry(it) }
+        )
+        conCard.addView(consoleLogPanel.root, LinearLayout.LayoutParams(-1, UiStyle.dp(context, 240)).apply { topMargin = UiStyle.dp(context, 8) })
 
         // 1-tap quick test command chips
         val quickCmdBar = LinearLayout(context).apply {
@@ -734,6 +823,11 @@ internal class NetToolsView(
     }
 
     fun stopAll() {
+        handler.removeCallbacks(monitorRefreshRunnable)
+        handler.removeCallbacks(proxyRefreshRunnable)
+        fullscreenDialog?.dismiss()
+        fullscreenDialog = null
+        fullscreenSource = null
         hostScanCancel?.set(true)
         portScanCancel?.set(true)
         udpSniffer.stop()
@@ -1234,7 +1328,7 @@ internal class NetToolsView(
                         monitorStatsText.text = "● $msg · 실시간 수신 대기 중"
                         monitorStatsText.setTextColor(UiStyle.ACCENT)
                     }
-                    appendMonitorEvent("TCP:$port", ip, "[${timeFmt.format(Date())}] $msg")
+                    appendMonitorEvent("TCP:$port", ip, System.currentTimeMillis(), msg, null, UiStyle.ACCENT)
                     renderDynamicMonitorChips()
                     if (PortRegistry.isHttpLike(port)) {
                         sendProbeToPort(ip, port, client)
@@ -1252,8 +1346,7 @@ internal class NetToolsView(
                         monitorStatsText.text = "● TCP $ip:$port · ${tapCount}건 · ${UiStyle.formatSize(tapBytes)}"
                         monitorStatsText.setTextColor(UiStyle.ACCENT)
                     }
-                    val formatted = formatPacketLine(timeFmt.format(Date()), "TCP $from (${data.size}B)", data)
-                    appendMonitorEvent("TCP:$port", ip, formatted)
+                    appendMonitorEvent("TCP:$port", ip, System.currentTimeMillis(), "TCP $from (${data.size}B)", data, UiStyle.ACCENT)
                 }
             },
             onDisconnected = { reason ->
@@ -1267,6 +1360,7 @@ internal class NetToolsView(
                         }
                         if (tcpTapClients.isEmpty()) monitorProbeBtn.visibility = View.GONE
                         renderDynamicMonitorChips()
+                        syncFullscreenMonitorHeader()
                     }
                 }
             }
@@ -1306,7 +1400,7 @@ internal class NetToolsView(
             if (ok) {
                 handler.post {
                     val label = if (PortRegistry.isHttpLike(port)) "GET / HTTP/1.0" else "\\r\\n 프로브"
-                    appendMonitorEvent("TCP:$port", ip, "[${timeFmt.format(Date())}] TX 프로브(:$port) → $label")
+                    appendMonitorEvent("TCP:$port", ip, System.currentTimeMillis(), "TX 프로브(:$port) → $label", null, UiStyle.AMBER)
                 }
             }
         }
@@ -1321,6 +1415,7 @@ internal class NetToolsView(
                 monitorStatsText.text = "자동 감지 중지됨 · 포착된 채널 ${liveInboundChannels.size}개"
                 monitorStatsText.setTextColor(UiStyle.MUTED)
             }
+            syncFullscreenMonitorHeader()
             return
         }
         autoSniffToggleBtn.text = "자동 TCP + UDP 감지 중지"
@@ -1328,6 +1423,7 @@ internal class NetToolsView(
             monitorStatsText.text = "TCP 14개 + UDP 14개 포트 동시 바인딩 중..."
             monitorStatsText.setTextColor(UiStyle.CYAN)
         }
+        syncFullscreenMonitorHeader()
         var boundTcp = 0
         var boundUdp = 0
         fun reportBound() {
@@ -1335,6 +1431,7 @@ internal class NetToolsView(
                 if (focusedTcpTapPort == null && (udpSniffer.isRunning() || tcpServerSniffer.isRunning())) {
                     monitorStatsText.text = "● 자동 감지 중 (TCP ${boundTcp}개 + UDP ${boundUdp}개 포트) · 패킷 수신 시 상단 자동 표시"
                     monitorStatsText.setTextColor(UiStyle.ACCENT)
+                    syncFullscreenMonitorHeader()
                 }
             }
         }
@@ -1372,15 +1469,19 @@ internal class NetToolsView(
             renderDynamicMonitorChips()
 
             val tag = if (pkt.protocol == "TCP-IN") "TCP" else "UDP"
-            val line = formatPacketLine(
-                timeFmt.format(Date(pkt.timestampMs)),
-                "$tag :${pkt.localPort} ← ${pkt.sourceIp}:${pkt.sourcePort} (${pkt.data.size}B)",
-                pkt.data
+            val color = if (pkt.protocol == "TCP-IN") UiStyle.AMBER else UiStyle.CYAN
+            appendMonitorEvent(
+                channelKey = key,
+                peerIp = pkt.sourceIp,
+                timestampMs = pkt.timestampMs,
+                header = "$tag :${pkt.localPort} ← ${pkt.sourceIp}:${pkt.sourcePort} (${pkt.data.size}B)",
+                data = pkt.data,
+                accentColor = color
             )
-            appendMonitorEvent(key, pkt.sourceIp, line)
             if (focusedTcpTapPort == null && (selectedInboundFilterKey == null || selectedInboundFilterKey == key)) {
                 monitorStatsText.text = "● TCP+UDP 감지 중 · ${monitorEventCount}건 · ${UiStyle.formatSize(monitorTotalBytes)} · 채널 ${liveInboundChannels.size}개"
                 monitorStatsText.setTextColor(UiStyle.ACCENT)
+                syncFullscreenMonitorHeader()
             }
         }
     }
@@ -1419,43 +1520,94 @@ internal class NetToolsView(
         }, "netlab-add-port").start()
     }
 
-    private fun formatPacketLine(ts: String, header: String, data: ByteArray): String {
-        val body = when (monitorFormat) {
-            PayloadFormat.ASCII -> HexCodec.bytesToAscii(data, 220)
-            PayloadFormat.HEX -> HexCodec.bytesToHex(data, 96)
-            PayloadFormat.BOTH -> "${HexCodec.bytesToHex(data, 48)}\n  TXT: ${HexCodec.bytesToAscii(data, 120)}"
+    private fun formatPayloadBody(data: ByteArray, fmt: PayloadFormat): String = when (fmt) {
+        PayloadFormat.ASCII -> HexCodec.bytesToAscii(data, 260)
+        PayloadFormat.HEX -> HexCodec.bytesToHex(data, 128)
+        PayloadFormat.BOTH -> "${HexCodec.bytesToHex(data, 64)}\nTXT: ${HexCodec.bytesToAscii(data, 160)}"
+    }
+
+    private fun appendMonitorEvent(
+        channelKey: String,
+        peerIp: String,
+        timestampMs: Long,
+        header: String,
+        data: ByteArray?,
+        accentColor: Int
+    ) {
+        monitorSeq++
+        monitorAllEvents.addLast(
+            MonitorEvent(
+                seq = monitorSeq,
+                channelKey = channelKey,
+                peerIp = peerIp,
+                timestampMs = timestampMs,
+                header = header,
+                data = data,
+                accentColor = accentColor
+            )
+        )
+        while (monitorAllEvents.size > 1500) monitorAllEvents.removeFirst()
+        scheduleMonitorLogRefresh(1)
+    }
+
+    private fun scheduleMonitorLogRefresh(delta: Int) {
+        monitorPendingDelta += delta
+        if (!monitorRefreshScheduled) {
+            monitorRefreshScheduled = true
+            handler.postDelayed(monitorRefreshRunnable, 60L)
         }
-        return "[$ts] $header\n  $body"
     }
 
-    private fun appendMonitorEvent(channelKey: String, peerIp: String, line: String) {
-        monitorAllEvents.addFirst(MonitorEvent(channelKey, peerIp, line))
-        while (monitorAllEvents.size > 120) monitorAllEvents.removeLast()
-        refreshMonitorLogDisplay()
-    }
-
-    private fun refreshMonitorLogDisplay() {
+    private fun buildMonitorLogEntries(): List<LogEntry> {
         val activeTcp = focusedTcpTapPort
         val channelFilter = when {
             activeTcp != null -> "TCP:$activeTcp"
             selectedInboundFilterKey != null -> selectedInboundFilterKey
             else -> null
         }
-        val visible = monitorAllEvents.asSequence()
+        return monitorAllEvents.asSequence()
             .filter { ev -> channelFilter == null || ev.channelKey == channelFilter }
             .filter { ev -> !filterSelectedDeviceOnly || selectedDeviceIp.isEmpty() || ev.peerIp == selectedDeviceIp }
-            .map { it.formattedLine }
-            .take(50)
-            .toList()
-        monitorLogView.text = if (visible.isEmpty()) {
-            if (filterSelectedDeviceOnly && selectedDeviceIp.isNotEmpty()) {
-                "$selectedDeviceIp 의 패킷 수신 대기 중..."
-            } else {
-                "데이터 수신 대기 중..."
+            .map { ev ->
+                val ts = timeFmt.format(Date(ev.timestampMs))
+                LogEntry(
+                    seq = ev.seq,
+                    header = "[$ts] ${ev.header}",
+                    body = ev.data?.let { formatPayloadBody(it, monitorFormat) } ?: "",
+                    accentColor = ev.accentColor
+                )
             }
-        } else {
-            visible.joinToString("\n\n")
+            .toList()
+    }
+
+    private fun refreshMonitorLogDisplay(addedDelta: Int = 0) {
+        val entries = buildMonitorLogEntries()
+        if (entries.isEmpty()) {
+            monitorLogPanel.setEmptyText(
+                if (filterSelectedDeviceOnly && selectedDeviceIp.isNotEmpty()) {
+                    "$selectedDeviceIp 의 패킷 수신 대기 중..."
+                } else {
+                    "데이터 수신 대기 중..."
+                }
+            )
         }
+        monitorLogPanel.submitEntries(entries, addedDelta = addedDelta)
+        if (fullscreenSource == FullscreenLogSource.MONITOR) {
+            fullscreenDialog?.updateEntries(entries, addedDelta = addedDelta)
+            syncFullscreenMonitorHeader()
+        }
+    }
+
+    private fun syncFullscreenMonitorHeader() {
+        if (fullscreenSource != FullscreenLogSource.MONITOR) return
+        val running = udpSniffer.isRunning() || tcpServerSniffer.isRunning() || tcpTapClients.isNotEmpty()
+        fullscreenDialog?.updateHeader(
+            statusText = monitorStatsText.text.toString(),
+            statusColor = monitorStatsText.currentTextColor,
+            running = running,
+            runLabel = if (udpSniffer.isRunning() || tcpServerSniffer.isRunning()) "■ 감지 중지" else "▶ 자동 감지",
+            formatLabel = "표시: ${monitorFormat.label}"
+        )
     }
 
     private fun jumpCurrentMonitorToConsole() {
@@ -1478,9 +1630,11 @@ internal class NetToolsView(
 
     private fun clearMonitorLog() {
         monitorAllEvents.clear()
+        monitorSeq = 0
         monitorEventCount = 0
         monitorTotalBytes = 0L
-        monitorLogView.text = "로그를 비웠습니다."
+        monitorLogPanel.setEmptyText("로그를 비웠습니다.")
+        refreshMonitorLogDisplay(0)
     }
 
     // =========================================================================
@@ -1542,35 +1696,42 @@ internal class NetToolsView(
                     val myIp = localNet?.ip ?: "내 폰IP"
                     proxyStatsText.text = "● 중계 대기 중: PC에서 $myIp:$actualPort 로 접속하세요"
                     proxyStatsText.setTextColor(UiStyle.ACCENT)
+                    syncFullscreenProxyHeader()
                 }
             },
             onSessionChanged = { active, info ->
                 handler.post {
                     proxyActiveSessions = active
+                    proxyLastEventNote = info
                     updateProxyStatsLine(info)
+                    syncFullscreenProxyHeader()
                 }
             },
             onPacket = { pkt ->
                 handler.post {
-                    synchronized(proxyPackets) {
-                        proxyPackets.add(pkt)
-                        if (proxyPackets.size > 1500) proxyPackets.removeAt(0)
+                    val rec = synchronized(proxyPackets) {
+                        proxySeq++
+                        val item = ProxyPacketRecord(proxySeq, pkt)
+                        proxyPackets.add(item)
+                        if (proxyPackets.size > 3000) proxyPackets.removeAt(0)
+                        item
                     }
-                    if (pkt.direction == RelayDirection.CLIENT_TO_TARGET) {
+                    if (rec.pkt.direction == RelayDirection.CLIENT_TO_TARGET) {
                         proxyC2tCount++
-                        proxyC2tBytes += pkt.data.size
+                        proxyC2tBytes += rec.pkt.data.size
                     } else {
                         proxyT2cCount++
-                        proxyT2cBytes += pkt.data.size
+                        proxyT2cBytes += rec.pkt.data.size
                     }
                     updateProxyStatsLine(null)
-                    refreshProxyLogDisplay()
+                    scheduleProxyLogRefresh(1)
                 }
             },
             onError = { err ->
                 handler.post {
                     proxyStatsText.text = "오류: $err"
                     proxyStatsText.setTextColor(UiStyle.DANGER)
+                    syncFullscreenProxyHeader()
                     Toast.makeText(context, err, Toast.LENGTH_LONG).show()
                 }
             },
@@ -1582,6 +1743,7 @@ internal class NetToolsView(
                         proxyStatsText.text = "중계 중지됨 · C→T ${proxyC2tCount}건 / T→C ${proxyT2cCount}건 기록됨"
                         proxyStatsText.setTextColor(UiStyle.MUTED)
                     }
+                    syncFullscreenProxyHeader()
                 }
             }
         )
@@ -1593,50 +1755,90 @@ internal class NetToolsView(
         proxyStatsText.setTextColor(UiStyle.ACCENT)
     }
 
-    private fun refreshProxyLogDisplay() {
+    private fun scheduleProxyLogRefresh(delta: Int) {
+        proxyPendingDelta += delta
+        if (!proxyRefreshScheduled) {
+            proxyRefreshScheduled = true
+            handler.postDelayed(proxyRefreshRunnable, 60L)
+        }
+    }
+
+    private fun buildProxyLogEntries(): List<LogEntry> {
         val snapshot = synchronized(proxyPackets) { proxyPackets.toList() }
-        val filtered = snapshot.asReversed().asSequence()
-            .filter { pkt ->
+        return snapshot.asSequence()
+            .filter { rec ->
                 when (proxyDirFilter) {
                     ProxyDirFilter.ALL -> true
-                    ProxyDirFilter.C2T -> pkt.direction == RelayDirection.CLIENT_TO_TARGET
-                    ProxyDirFilter.T2C -> pkt.direction == RelayDirection.TARGET_TO_CLIENT
+                    ProxyDirFilter.C2T -> rec.pkt.direction == RelayDirection.CLIENT_TO_TARGET
+                    ProxyDirFilter.T2C -> rec.pkt.direction == RelayDirection.TARGET_TO_CLIENT
                 }
             }
-            .take(50)
-            .map { pkt ->
+            .map { rec ->
+                val pkt = rec.pkt
                 val ts = timeFmt.format(Date(pkt.timestampMs))
-                val dirLabel = if (pkt.direction == RelayDirection.CLIENT_TO_TARGET) {
+                val isC2t = pkt.direction == RelayDirection.CLIENT_TO_TARGET
+                val dirLabel = if (isC2t) {
                     "C→T  ${pkt.srcIp}:${pkt.srcPort} → ${pkt.dstIp}:${pkt.dstPort} (${pkt.data.size}B)"
                 } else {
                     "T→C  ${pkt.srcIp}:${pkt.srcPort} → ${pkt.dstIp}:${pkt.dstPort} (${pkt.data.size}B)"
                 }
-                val body = when (proxyFormat) {
-                    PayloadFormat.ASCII -> HexCodec.bytesToAscii(pkt.data, 220)
-                    PayloadFormat.HEX -> HexCodec.bytesToHex(pkt.data, 96)
-                    PayloadFormat.BOTH -> "${HexCodec.bytesToHex(pkt.data, 48)}\n  TXT: ${HexCodec.bytesToAscii(pkt.data, 120)}"
-                }
-                "[$ts] $dirLabel\n  $body"
+                LogEntry(
+                    seq = rec.seq,
+                    header = "[$ts] $dirLabel",
+                    body = formatPayloadBody(pkt.data, proxyFormat),
+                    accentColor = if (isC2t) UiStyle.ACCENT else UiStyle.AMBER
+                )
             }
             .toList()
-        proxyLogView.text = if (filtered.isEmpty()) {
-            "기록된 중계 패킷이 없습니다."
-        } else {
-            filtered.joinToString("\n\n")
+    }
+
+    private fun refreshProxyLogDisplay(addedDelta: Int = 0) {
+        val entries = buildProxyLogEntries()
+        if (entries.isEmpty()) {
+            proxyLogPanel.setEmptyText(
+                if (proxyPackets.isEmpty()) "기록된 중계 패킷이 없습니다." else "선택한 방향 필터에 해당하는 패킷이 없습니다."
+            )
         }
+        proxyLogPanel.submitEntries(entries, addedDelta = addedDelta)
+        if (fullscreenSource == FullscreenLogSource.PROXY) {
+            fullscreenDialog?.updateEntries(entries, addedDelta = addedDelta)
+            syncFullscreenProxyHeader()
+        }
+    }
+
+    private fun syncFullscreenProxyHeader() {
+        if (fullscreenSource != FullscreenLogSource.PROXY) return
+        val running = relayProxy.isRunning()
+        val note = proxyLastEventNote?.let { " · $it" } ?: ""
+        val status = if (running) {
+            "연결 ${proxyActiveSessions} · C→T ${proxyC2tCount}건(${UiStyle.formatSize(proxyC2tBytes)}) · T→C ${proxyT2cCount}건(${UiStyle.formatSize(proxyT2cBytes)})$note"
+        } else {
+            proxyStatsText.text.toString().replace('\n', ' ')
+        }
+        fullscreenDialog?.updateHeader(
+            statusText = status,
+            statusColor = proxyStatsText.currentTextColor,
+            running = running,
+            runLabel = if (running) "■ 중계 중지" else "▶ 중계 시작",
+            filterLabel = "방향: ${proxyDirFilter.label}",
+            formatLabel = "표시: ${proxyFormat.label}"
+        )
     }
 
     private fun clearProxyLog() {
         synchronized(proxyPackets) { proxyPackets.clear() }
+        proxySeq = 0
         proxyC2tCount = 0
         proxyT2cCount = 0
         proxyC2tBytes = 0L
         proxyT2cBytes = 0L
-        proxyLogView.text = "중계 로그를 비웠습니다."
+        proxyLastEventNote = null
+        proxyLogPanel.setEmptyText("중계 로그를 비웠습니다.")
+        refreshProxyLogDisplay(0)
     }
 
     private fun exportProxyPcap() {
-        val snapshot = synchronized(proxyPackets) { proxyPackets.toList() }
+        val snapshot = synchronized(proxyPackets) { proxyPackets.map { it.pkt } }
         if (snapshot.isEmpty()) {
             Toast.makeText(context, "저장할 중계 패킷이 없습니다", Toast.LENGTH_SHORT).show()
             return
@@ -1725,20 +1927,19 @@ internal class NetToolsView(
                 handler.post {
                     consoleConnBtn.isEnabled = true
                     updateConsoleBadge(true, msg)
-                    appendConsoleLog("SYS", msg)
+                    appendConsoleLog("SYS", msg, null, UiStyle.MUTED)
                 }
             },
             onReceive = { data, from ->
                 handler.post {
-                    val rendered = if (consoleShowHex) HexCodec.bytesToHex(data, 128) else HexCodec.bytesToAscii(data, 300)
-                    appendConsoleLog("RX ← $from (${data.size}B)", rendered)
+                    appendConsoleLog("RX ← $from (${data.size}B)", "", data, UiStyle.ACCENT)
                 }
             },
             onDisconnected = { reason ->
                 handler.post {
                     consoleConnBtn.isEnabled = true
                     updateConsoleBadge(false, reason)
-                    appendConsoleLog("SYS", reason)
+                    appendConsoleLog("SYS", reason, null, UiStyle.MUTED)
                 }
             }
         )
@@ -1753,14 +1954,28 @@ internal class NetToolsView(
             99
         )
         consoleStatusBadge.setTextColor(if (connected) UiStyle.ACCENT else UiStyle.MUTED)
+        syncFullscreenConsoleHeader()
         if (!connected && statusMsg.isNotEmpty()) {
             Toast.makeText(context, statusMsg, Toast.LENGTH_SHORT).show()
         }
     }
 
+    private fun toggleConsoleRxFormat() {
+        consoleShowHex = !consoleShowHex
+        consoleRxFmtBtn.text = if (consoleShowHex) "RX: HEX" else "RX: TEXT"
+        refreshConsoleLogDisplay(0)
+        syncFullscreenConsoleHeader()
+    }
+
     private fun sendConsoleCommand() {
         val raw = consoleInputField.text.toString()
-        if (raw.isEmpty()) return
+        if (sendConsoleRaw(raw)) {
+            consoleInputField.setText("")
+        }
+    }
+
+    private fun sendConsoleRaw(raw: String): Boolean {
+        if (raw.isEmpty()) return false
         val bytes = try {
             if (consoleHexTx) {
                 HexCodec.parseHexString(raw)
@@ -1769,40 +1984,194 @@ internal class NetToolsView(
             }
         } catch (e: IllegalArgumentException) {
             Toast.makeText(context, e.message ?: "입력 오류", Toast.LENGTH_LONG).show()
-            return
+            return false
         }
-        if (bytes.isEmpty()) return
+        if (bytes.isEmpty()) return false
         consoleClient.send(bytes) { ok, err ->
             handler.post {
                 if (ok) {
-                    val preview = if (consoleHexTx) HexCodec.bytesToHex(bytes, 128) else raw
-                    appendConsoleLog("TX → (${bytes.size}B)", preview)
-                    consoleInputField.setText("")
+                    val preview = if (consoleHexTx) HexCodec.bytesToHex(bytes, 160) else raw
+                    appendConsoleLog("TX → (${bytes.size}B)", preview, null, UiStyle.CYAN)
                 } else {
                     Toast.makeText(context, err ?: "전송 실패", Toast.LENGTH_SHORT).show()
                 }
             }
         }
+        return true
     }
 
-    private fun appendConsoleLog(tag: String, body: String) {
-        val ts = timeFmt.format(Date())
-        consoleLogLines.addFirst("[$ts] $tag\n  $body")
-        while (consoleLogLines.size > 100) consoleLogLines.removeLast()
-        consoleLogView.text = consoleLogLines.joinToString("\n")
+    private fun appendConsoleLog(tag: String, body: String, rawRxBytes: ByteArray?, accentColor: Int) {
+        consoleSeq++
+        consoleRecords.addLast(
+            ConsoleRecord(
+                seq = consoleSeq,
+                timestampMs = System.currentTimeMillis(),
+                tag = tag,
+                textBody = body,
+                rawRxBytes = rawRxBytes,
+                accentColor = accentColor
+            )
+        )
+        while (consoleRecords.size > 1000) consoleRecords.removeFirst()
+        refreshConsoleLogDisplay(1)
     }
 
-    private fun buildTerminalTextView(placeholder: String): TextView = TextView(context).apply {
-        text = placeholder
-        textSize = 11.5f
-        typeface = Typeface.MONOSPACE
-        setTextColor(UiStyle.INK)
-        setTextIsSelectable(true)
-        minLines = 5
-        maxLines = 12
-        background = UiStyle.rounded(context, 0xff060908.toInt(), 12, UiStyle.BORDER)
-        val p = UiStyle.dp(context, 12)
-        setPadding(p, p, p, p)
+    private fun buildConsoleLogEntries(): List<LogEntry> = consoleRecords.map { rec ->
+        val ts = timeFmt.format(Date(rec.timestampMs))
+        val body = if (rec.rawRxBytes != null) {
+            if (consoleShowHex) HexCodec.bytesToHex(rec.rawRxBytes, 160) else HexCodec.bytesToAscii(rec.rawRxBytes, 320)
+        } else {
+            rec.textBody
+        }
+        LogEntry(
+            seq = rec.seq,
+            header = "[$ts] ${rec.tag}",
+            body = body,
+            accentColor = rec.accentColor
+        )
+    }
+
+    private fun refreshConsoleLogDisplay(addedDelta: Int = 0) {
+        val entries = buildConsoleLogEntries()
+        consoleLogPanel.submitEntries(entries, addedDelta = addedDelta)
+        if (fullscreenSource == FullscreenLogSource.CONSOLE) {
+            fullscreenDialog?.updateEntries(entries, addedDelta = addedDelta)
+            syncFullscreenConsoleHeader()
+        }
+    }
+
+    private fun clearConsoleLog() {
+        consoleRecords.clear()
+        consoleSeq = 0
+        consoleLogPanel.setEmptyText("연결 후 명령어를 보내면 송수신 로그가 여기에 실시간으로 기록됩니다.")
+        refreshConsoleLogDisplay(0)
+    }
+
+    private fun syncFullscreenConsoleHeader() {
+        if (fullscreenSource != FullscreenLogSource.CONSOLE) return
+        val connected = consoleClient.isConnected()
+        val ip = consoleIpField.text.toString().trim()
+        val port = consolePortField.text.toString().trim()
+        val proto = if (consoleTcp) "TCP" else "UDP"
+        val status = if (connected) "$proto $ip:$port 연결됨 · ${consoleRecords.size}건" else "미연결 · ${consoleRecords.size}건"
+        fullscreenDialog?.updateHeader(
+            statusText = status,
+            statusColor = if (connected) UiStyle.ACCENT else UiStyle.MUTED,
+            running = connected,
+            runLabel = if (connected) "■ 끊기" else "▶ 연결",
+            formatLabel = if (consoleShowHex) "RX: HEX" else "RX: TEXT"
+        )
+        fullscreenDialog?.setConsoleInputHint(
+            if (consoleHexTx) "HEX 바이트 전송 (예: AA 55 01 FF)" else "명령어 입력 후 전송"
+        )
+    }
+
+    // =========================================================================
+    // Shared Fullscreen Live Log Viewer
+    // =========================================================================
+
+    private fun openFullscreenLog(source: FullscreenLogSource) {
+        hideKeyboard()
+        fullscreenDialog?.dismiss()
+        fullscreenSource = source
+
+        val dlg = when (source) {
+            FullscreenLogSource.PROXY -> FullscreenLogDialog(
+                context = context,
+                title = "실시간 TCP 양방향 중계 로그",
+                defaultEmptyText = "기록된 중계 패킷이 없습니다.\n상단 [▶ 중계 시작] 후 PC/클라이언트를 폰 주소로 연결하세요.",
+                actions = FullscreenLogActions(
+                    onToggleRun = { toggleTcpProxy() },
+                    onCycleFilter = {
+                        val all = ProxyDirFilter.entries
+                        proxyDirFilter = all[(proxyDirFilter.ordinal + 1) % all.size]
+                        renderProxyDir(proxyDirFilter)
+                        refreshProxyLogDisplay(0)
+                    },
+                    onCycleFormat = {
+                        val all = PayloadFormat.entries
+                        proxyFormat = all[(proxyFormat.ordinal + 1) % all.size]
+                        renderProxyFmt(proxyFormat)
+                        refreshProxyLogDisplay(0)
+                    },
+                    onExportPcap = { exportProxyPcap() },
+                    onCopyAll = { copyText(proxyLogPanel.exportPlainText()) },
+                    onClear = { clearProxyLog() }
+                ),
+                onCopyEntry = { copySingleEntry(it) },
+                onDismissed = {
+                    if (fullscreenSource == FullscreenLogSource.PROXY) {
+                        fullscreenDialog = null
+                        fullscreenSource = null
+                    }
+                }
+            )
+            FullscreenLogSource.MONITOR -> FullscreenLogDialog(
+                context = context,
+                title = "실시간 TCP · UDP 모니터 로그",
+                defaultEmptyText = "수신된 패킷이 없습니다.\n상단 [▶ 자동 감지]를 시작하거나 탐색 탭에서 포트를 탭하세요.",
+                actions = FullscreenLogActions(
+                    onToggleRun = { toggleAutoTcpUdpSniffer() },
+                    onCycleFormat = {
+                        val all = PayloadFormat.entries
+                        monitorFormat = all[(monitorFormat.ordinal + 1) % all.size]
+                        renderMonitorFmt(monitorFormat)
+                        refreshMonitorLogDisplay(0)
+                    },
+                    onCopyAll = { copyText(monitorLogPanel.exportPlainText()) },
+                    onClear = { clearMonitorLog() }
+                ),
+                onCopyEntry = { copySingleEntry(it) },
+                onDismissed = {
+                    if (fullscreenSource == FullscreenLogSource.MONITOR) {
+                        fullscreenDialog = null
+                        fullscreenSource = null
+                    }
+                }
+            )
+            FullscreenLogSource.CONSOLE -> FullscreenLogDialog(
+                context = context,
+                title = "제어 콘솔 실시간 로그",
+                defaultEmptyText = "송수신 로그가 없습니다.\n연결 후 하단 입력창에서 명령어를 전송하세요.",
+                actions = FullscreenLogActions(
+                    onToggleRun = { toggleConsoleConnection() },
+                    onCycleFormat = { toggleConsoleRxFormat() },
+                    onCopyAll = { copyText(consoleLogPanel.exportPlainText()) },
+                    onClear = { clearConsoleLog() },
+                    onSendConsoleCommand = { raw -> sendConsoleRaw(raw) }
+                ),
+                onCopyEntry = { copySingleEntry(it) },
+                onDismissed = {
+                    if (fullscreenSource == FullscreenLogSource.CONSOLE) {
+                        fullscreenDialog = null
+                        fullscreenSource = null
+                    }
+                }
+            )
+        }
+
+        fullscreenDialog = dlg
+        dlg.show()
+        when (source) {
+            FullscreenLogSource.PROXY -> {
+                dlg.updateEntries(buildProxyLogEntries(), addedDelta = 0)
+                syncFullscreenProxyHeader()
+            }
+            FullscreenLogSource.MONITOR -> {
+                dlg.updateEntries(buildMonitorLogEntries(), addedDelta = 0)
+                syncFullscreenMonitorHeader()
+            }
+            FullscreenLogSource.CONSOLE -> {
+                dlg.updateEntries(buildConsoleLogEntries(), addedDelta = 0)
+                syncFullscreenConsoleHeader()
+            }
+        }
+    }
+
+    private fun copySingleEntry(entry: LogEntry) {
+        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+        cm?.setPrimaryClip(ClipData.newPlainText("DockyCam Packet #${entry.seq}", entry.toClipboardText()))
+        Toast.makeText(context, "#${entry.seq} 항목을 복사했습니다", Toast.LENGTH_SHORT).show()
     }
 
     private fun styledInput(hintText: String, value: String, numeric: Boolean): EditText = EditText(context).apply {
@@ -1821,7 +2190,10 @@ internal class NetToolsView(
     }
 
     private fun copyText(text: String) {
-        if (text.isEmpty()) return
+        if (text.isEmpty()) {
+            Toast.makeText(context, "복사할 로그가 없습니다", Toast.LENGTH_SHORT).show()
+            return
+        }
         val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
         cm?.setPrimaryClip(ClipData.newPlainText("DockyCam NetLab", text))
         Toast.makeText(context, "로그를 클립보드에 복사했습니다", Toast.LENGTH_SHORT).show()

@@ -339,4 +339,22 @@ class NetLabEngineTest {
         val payload = raw.copyOfRange(tcpOff + 20, tcpOff + 20 + 6)
         assertArrayEquals(packets[0].data, payload)
     }
+
+    @Test fun liveLogFilterSupportsMultiTokenCaseInsensitiveMatchingAndFontClamp() {
+        val entries = listOf(
+            LogEntry(1, "[17:20:01.001] C→T  192.168.0.10:50123 → 192.168.0.50:502 (6B)", "01 03 00 00 00 02\nTXT: ......", 0),
+            LogEntry(2, "[17:20:01.015] T→C  192.168.0.50:502 → 192.168.0.10:50123 (5B)", "01 03 02 00 64\nTXT: ....d", 0),
+            LogEntry(3, "[17:20:02.100] C→T  192.168.0.10:50123 → 192.168.0.50:80 (14B)", "GET /status HTTP/1.0", 0)
+        )
+
+        assertEquals(3, LogFilter.filterEntries(entries, "   ").size)
+        assertEquals(listOf(1), LogFilter.filterEntries(entries, "c→t 01 03").map { it.seq })
+        assertEquals(listOf(2), LogFilter.filterEntries(entries, "t→c 64").map { it.seq })
+        assertEquals(listOf(3), LogFilter.filterEntries(entries, "get /status").map { it.seq })
+        assertTrue(LogFilter.filterEntries(entries, "NON_EXISTENT").isEmpty())
+
+        assertEquals(LogFilter.MIN_FONT_SP, LogFilter.clampFontSize(4f), 0.001f)
+        assertEquals(LogFilter.MAX_FONT_SP, LogFilter.clampFontSize(28f), 0.001f)
+        assertEquals(12.5f, LogFilter.clampFontSize(12.5f), 0.001f)
+    }
 }
