@@ -149,8 +149,8 @@ details summary::-webkit-details-marker{display:none}
     <div class="card" style="margin-bottom:0">
       <h2>간이 클라우드 업로드 <span class="meta" id="upPathTag" style="margin:0;font-weight:400">/dockycam/shared</span></h2>
       <div class="drop" id="dropZone" onclick="$('filePick').click()">
-        <div style="font-weight:700;font-size:13.5px">파일을 끌어다 놓거나 클릭해서 선택</div>
-        <div class="meta" style="margin-top:4px">전송 중 영상이 자동 정지되어 최대 속도로 저장됩니다.<br>공유함 파일은 블랙박스 순환 삭제에서 보호됩니다.</div>
+        <div style="font-weight:700;font-size:13.5px">파일 끌어다 놓기 · 클릭 선택 · 스크린샷 Ctrl+V</div>
+        <div class="meta" style="margin-top:4px">PC 캡처 이미지를 Ctrl+V로 붙여넣으면 즉시 공유함에 저장됩니다.<br>전송 중 영상이 자동 정지되어 최대 속도로 저장되며, 공유함은 순환 삭제에서 보호됩니다.</div>
       </div>
       <input id="filePick" type="file" multiple style="display:none" onchange="uploadFiles(this.files);this.value=''">
       <div id="upBox" style="display:none;margin-top:10px">
@@ -460,6 +460,27 @@ const dz=$('dropZone');
 ['dragenter','dragover'].forEach(ev=>dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.add('over');}));
 ['dragleave','drop'].forEach(ev=>dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.remove('over');}));
 dz.addEventListener('drop',e=>{if(e.dataTransfer&&e.dataTransfer.files)uploadFiles(e.dataTransfer.files);});
+document.addEventListener('paste',e=>{
+  const cd=e.clipboardData;
+  if(!cd || !cd.items) return;
+  const imgs=[];
+  const now=new Date(), pad=n=>String(n).padStart(2,'0');
+  const stamp=`${now.getFullYear()}${pad(now.getMonth()+1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+  for(const it of cd.items){
+    if(it.kind==='file' && it.type && it.type.startsWith('image/')){
+      const blob=it.getAsFile();
+      if(!blob) continue;
+      const ext=it.type.includes('jpeg')?'jpg':it.type.includes('webp')?'webp':it.type.includes('gif')?'gif':'png';
+      const suffix=imgs.length?`_${imgs.length+1}`:'';
+      imgs.push(new File([blob],`clip_${stamp}${suffix}.${ext}`,{type:it.type}));
+    }
+  }
+  if(!imgs.length) return;
+  e.preventDefault();
+  dz.classList.add('over');
+  setTimeout(()=>dz.classList.remove('over'),350);
+  uploadFiles(imgs);
+});
 
 function startOta(file){
   if(!file) return;

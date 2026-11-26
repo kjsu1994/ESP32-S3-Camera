@@ -469,6 +469,52 @@ internal class BoardApi(private val target: BoardTarget) {
         }
     }
 
+    fun uploadOtaFirmware(
+        contentLength: Long,
+        input: InputStream,
+        onProgress: (Long, Long) -> Unit = { _, _ -> }
+    ) {
+        if (contentLength < 65536L || contentLength > 6L * 1024L * 1024L) {
+            throw IOException("펌웨어 크기가 올바르지 않습니다 (64KB~6MB)")
+        }
+        val firstChunk = ByteArray(16384)
+        val firstRead = input.read(firstChunk)
+        if (firstRead <= 0 || firstChunk[0] != 0xE9.toByte()) {
+            throw IOException("올바른 ESP32 펌웨어(.bin) 이미지가 아닙니다")
+        }
+        val connection = open("/ota/upload", readTimeoutMs = 60000, connectTimeoutMs = 5000)
+        try {
+            connection.requestMethod = "POST"
+            connection.doOutput = true
+            connection.setFixedLengthStreamingMode(contentLength)
+            connection.setRequestProperty("Content-Type", "application/octet-stream")
+            var sent = 0L
+            var lastReport = 0L
+            connection.outputStream.use { out ->
+                out.write(firstChunk, 0, firstRead)
+                sent += firstRead
+                onProgress(sent, contentLength)
+                while (true) {
+                    val n = input.read(firstChunk)
+                    if (n <= 0) break
+                    out.write(firstChunk, 0, n)
+                    sent += n
+                    val now = System.currentTimeMillis()
+                    if (now - lastReport >= 150 || sent >= contentLength) {
+                        lastReport = now
+                        onProgress(sent, contentLength)
+                    }
+                }
+                out.flush()
+            }
+            if (connection.responseCode != 200) {
+                throw IOException("OTA 실패 (HTTP ${connection.responseCode})")
+            }
+        } finally {
+            connection.disconnect()
+        }
+    }
+
     fun listNotes(): List<SharedNote> {
         val connection = open("/sd/notes", 4000)
         try {

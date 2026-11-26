@@ -1,6 +1,7 @@
 package io.github.kjsu1994.workbenchcam
 
 import android.content.Context
+import android.graphics.Typeface
 import android.text.InputType
 import android.view.Gravity
 import android.view.View
@@ -11,6 +12,13 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Switch
 import android.widget.TextView
+
+internal enum class SettingsTab(val label: String) {
+    CONNECT("연결"),
+    CAMERA("카메라"),
+    STORAGE("저장소"),
+    DEVICE("기기")
+}
 
 internal class SettingsScreen(
     private val context: Context,
@@ -34,6 +42,7 @@ internal class SettingsScreen(
     private val onScanHomeWifi: () -> Unit,
     private val onSaveHomeWifi: (staEnabled: Boolean, ssid: String, pass: String?) -> Unit,
     private val onToggleBoardLed: (Boolean) -> Unit,
+    private val onPickOtaFile: () -> Unit,
     private val onRebootBoard: () -> Unit,
     private val onClearSdCategory: (String) -> Unit
 ) {
@@ -42,14 +51,18 @@ internal class SettingsScreen(
         setBackgroundColor(UiStyle.BG)
     }
 
+    private val headerConnBadge: TextView
+    private val scrollView: ScrollView
+    private val tabPanels = LinkedHashMap<SettingsTab, LinearLayout>()
+    private val renderSettingsTab: (SettingsTab) -> Unit
+    private var activeTab = SettingsTab.CONNECT
+
+    // Tab 1: Connection & STA
     private val passwordField: EditText
     private val passwordError: TextView
     private val rememberSwitch: Switch
     private val manualIpField: EditText
     private val disconnectBtn: Button
-
-    // Home Router (STA) section (visible when connected to board)
-    private val staSectionContainer: LinearLayout
     private val staCurrentBadge: TextView
     private val staWebUrlText: TextView
     private val staScanBtn: Button
@@ -61,7 +74,7 @@ internal class SettingsScreen(
     private val staBackToApBtn: Button
     private var currentWifiStatus: WifiStatus? = null
 
-    // Board Camera & LED section
+    // Tab 2: Camera & Display
     private val boardDisconnectedHint: TextView
     private val boardControlsContainer: LinearLayout
     private val boardApplyBtn: Button
@@ -72,32 +85,59 @@ internal class SettingsScreen(
     private val renderResolution: (VideoResolution) -> Unit
     private var selectedResolution: VideoResolution = VideoResolution.VGA
 
-    // SD Management section
-    private val sdSectionContainer: LinearLayout
+    // Tab 3: Storage
+    private val sdDisconnectedHint: TextView
+    private val sdControlsContainer: LinearLayout
     private val sdSummaryText: TextView
+
+    // Tab 4: Device (OTA + Reboot + App Info)
+    private val otaFwBadge: TextView
+    private val otaPickBtn: Button
+    private val otaProgressWrap: LinearLayout
+    private val otaProgressFill: View
+    private val otaStatusText: TextView
+    private val rebootBtn: Button
+    private val deviceInfoMeta: TextView
 
     init {
         val backBtn = UiStyle.iconCircleButton(context, R.drawable.ic_back, "뒤로", UiStyle.SURFACE_ALT, UiStyle.INK, 40) {
             onBack()
         }
         val title = UiStyle.label(context, "설정", 19f, UiStyle.INK, bold = true)
+        headerConnBadge = UiStyle.badge(context, "미연결", UiStyle.SURFACE_ALT, UiStyle.MUTED)
         val topBar = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(UiStyle.dp(context, 16), UiStyle.dp(context, 12), UiStyle.dp(context, 16), UiStyle.dp(context, 12))
+            setPadding(UiStyle.dp(context, 16), UiStyle.dp(context, 12), UiStyle.dp(context, 16), UiStyle.dp(context, 10))
             addView(backBtn)
             addView(title, LinearLayout.LayoutParams(0, -2, 1f).apply { marginStart = UiStyle.dp(context, 14) })
+            addView(headerConnBadge)
+        }
+
+        // Sticky segmented tab bar for effortless 1-thumb category switching
+        val (tabStrip, tabRenderer) = UiStyle.segmentedChips(
+            context,
+            SettingsTab.entries.map { it to it.label },
+            activeTab
+        ) { selectTab(it) }
+        renderSettingsTab = tabRenderer
+        val tabBarWrap = FrameLayout(context).apply {
+            setPadding(UiStyle.dp(context, 16), 0, UiStyle.dp(context, 16), UiStyle.dp(context, 10))
+            addView(tabStrip, FrameLayout.LayoutParams(-1, -2))
         }
         val divider = View(context).apply { setBackgroundColor(UiStyle.BORDER) }
 
-        val content = LinearLayout(context).apply {
-            orientation = LinearLayout.VERTICAL
+        val panelHost = FrameLayout(context).apply {
             val p = UiStyle.dp(context, 16)
             setPadding(p, UiStyle.dp(context, 12), p, UiStyle.dp(context, 28))
         }
 
-        // --- Section 1: App Connection & AP Credentials ---
-        content.addView(UiStyle.sectionTitle(context, "앱 연결 방식 · 직결 AP 비밀번호"))
+        // ============================================================
+        // TAB 1: 연결 (App Connection + Home Router STA)
+        // ============================================================
+        val connectPanel = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
+
+        connectPanel.addView(UiStyle.sectionTitle(context, "앱 연결 방식 · 직결 AP"))
         val wifiCard = UiStyle.card(context)
         wifiCard.addView(UiStyle.label(context, "연결 우선순위", 13.5f, UiStyle.INK, bold = true))
         wifiCard.addView(UiStyle.label(
@@ -178,13 +218,10 @@ internal class SettingsScreen(
         }
         wifiCard.addView(saveWifiBtn, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 12) })
         wifiCard.addView(disconnectBtn, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 8) })
-        content.addView(wifiCard)
+        connectPanel.addView(wifiCard)
 
-        // --- Section 2: Home Router (STA) Setup with Nearby Wi-Fi Scanner ---
-        staSectionContainer = LinearLayout(context).apply {
-            orientation = LinearLayout.VERTICAL
-        }
-        staSectionContainer.addView(UiStyle.sectionTitle(context, "집 공유기(STA) 연동 · PC 웹 접속").apply {
+        // Home Router STA Card
+        connectPanel.addView(UiStyle.sectionTitle(context, "집 공유기(STA) 연동 · PC 웹 접속").apply {
             setPadding(UiStyle.dp(context, 4), UiStyle.dp(context, 18), 0, UiStyle.dp(context, 8))
         })
         val staCard = UiStyle.card(context)
@@ -233,7 +270,7 @@ internal class SettingsScreen(
 
         staCard.addView(UiStyle.label(
             context,
-            "최초 1회만 공유기 비밀번호를 보드에 저장하면 이후 폰에서는 추가 인증 없이 집 Wi-Fi로 바로 연결됩니다. 12초간 연결 실패 시 자동으로 DockyCam AP로 복귀합니다. (보드 BOOT 버튼 5초 길게 눌러도 초기화)",
+            "최초 1회만 저장하면 이후 폰에서는 집 Wi-Fi로 바로 연결됩니다. 12초간 연결 실패 시 자동 AP 복귀. (보드 BOOT 버튼 5초 길게 눌러도 초기화)",
             11.5f,
             UiStyle.MUTED
         ).apply { setPadding(0, UiStyle.dp(context, 2), 0, UiStyle.dp(context, 10)) })
@@ -255,13 +292,14 @@ internal class SettingsScreen(
 
         staCard.addView(staSaveBtn, LinearLayout.LayoutParams(-1, -2))
         staCard.addView(staBackToApBtn, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 8) })
-        staSectionContainer.addView(staCard)
-        content.addView(staSectionContainer)
+        connectPanel.addView(staCard)
 
-        // --- Section 3: Board Camera & LED Settings ---
-        content.addView(UiStyle.sectionTitle(context, "보드 · 카메라 · 상태 LED").apply {
-            setPadding(UiStyle.dp(context, 4), UiStyle.dp(context, 18), 0, UiStyle.dp(context, 8))
-        })
+        // ============================================================
+        // TAB 2: 카메라 (Camera Sensor Options + LED + Display HUD)
+        // ============================================================
+        val cameraPanel = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
+
+        cameraPanel.addView(UiStyle.sectionTitle(context, "보드 카메라 · 상태 LED"))
         val boardCard = UiStyle.card(context)
         boardDisconnectedHint = UiStyle.label(
             context,
@@ -329,15 +367,10 @@ internal class SettingsScreen(
             UiStyle.MUTED
         ).apply { setPadding(0, UiStyle.dp(context, 4), 0, UiStyle.dp(context, 8)) })
         boardControlsContainer.addView(boardApplyBtn, LinearLayout.LayoutParams(-1, -2))
-        boardControlsContainer.addView(
-            UiStyle.secondaryButton(context, "보드 원격 재부팅", onRebootBoard),
-            LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 8) }
-        )
         boardCard.addView(boardControlsContainer)
-        content.addView(boardCard)
+        cameraPanel.addView(boardCard)
 
-        // --- Section 4: Display & Monitoring ---
-        content.addView(UiStyle.sectionTitle(context, "화면 · 모니터링").apply {
+        cameraPanel.addView(UiStyle.sectionTitle(context, "화면 · 모니터링").apply {
             setPadding(UiStyle.dp(context, 4), UiStyle.dp(context, 18), 0, UiStyle.dp(context, 8))
         })
         val displayCard = UiStyle.card(context)
@@ -365,25 +398,35 @@ internal class SettingsScreen(
             onToggleTelemetry
         )
         displayCard.addView(telRow)
-        content.addView(displayCard)
+        cameraPanel.addView(displayCard)
 
-        // --- Section 5: SD Card Management ---
-        sdSectionContainer = LinearLayout(context).apply {
+        // ============================================================
+        // TAB 3: 저장소 (SD Card Storage Management)
+        // ============================================================
+        val storagePanel = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
+
+        storagePanel.addView(UiStyle.sectionTitle(context, "microSD 저장소 관리"))
+        val sdCard = UiStyle.card(context)
+        sdDisconnectedHint = UiStyle.label(
+            context,
+            "보드에 연결하면 SD카드 용량 확인 및 녹화 파일 정리를 할 수 있습니다.",
+            13f,
+            UiStyle.SECONDARY
+        )
+        sdCard.addView(sdDisconnectedHint)
+
+        sdControlsContainer = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
         }
-        sdSectionContainer.addView(UiStyle.sectionTitle(context, "SD카드 저장소 관리").apply {
-            setPadding(UiStyle.dp(context, 4), UiStyle.dp(context, 18), 0, UiStyle.dp(context, 8))
-        })
-        val sdCard = UiStyle.card(context)
-        sdSummaryText = UiStyle.label(context, "SD카드 상태 확인 중...", 13f, UiStyle.SECONDARY)
-        sdCard.addView(sdSummaryText)
-        sdCard.addView(UiStyle.label(
+        sdSummaryText = UiStyle.label(context, "SD카드 상태 확인 중...", 13.5f, UiStyle.INK, bold = true)
+        sdControlsContainer.addView(sdSummaryText)
+        sdControlsContainer.addView(UiStyle.label(
             context,
-            "DockyCam 전용 폴더(/dockycam) 내 파일만 삭제되며 기존 다른 파일은 건드리지 않습니다.",
+            "DockyCam 전용 폴더(/dockycam) 내 파일만 삭제되며 공유함 파일과 외부 파일은 안전하게 유지됩니다.",
             12f,
             UiStyle.MUTED
-        ).apply { setPadding(0, UiStyle.dp(context, 4), 0, UiStyle.dp(context, 12)) })
+        ).apply { setPadding(0, UiStyle.dp(context, 6), 0, UiStyle.dp(context, 14)) })
         val clearRow = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(UiStyle.dangerButton(context, "블랙박스 비우기") { onClearSdCategory("blackbox") },
@@ -391,34 +434,115 @@ internal class SettingsScreen(
             addView(UiStyle.secondaryButton(context, "타임랩스 비우기") { onClearSdCategory("timelapse") },
                 LinearLayout.LayoutParams(0, -2, 1f))
         }
-        sdCard.addView(clearRow)
-        sdSectionContainer.addView(sdCard)
-        content.addView(sdSectionContainer)
+        sdControlsContainer.addView(clearRow)
+        sdCard.addView(sdControlsContainer)
+        storagePanel.addView(sdCard)
 
-        // --- Section 6: App Info ---
-        content.addView(UiStyle.sectionTitle(context, "앱 정보").apply {
+        // ============================================================
+        // TAB 4: 기기 (Wireless OTA + Reboot + App Info)
+        // ============================================================
+        val devicePanel = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
+
+        devicePanel.addView(UiStyle.sectionTitle(context, "무선 펌웨어 업데이트 (OTA)"))
+        val otaCard = UiStyle.card(context)
+        otaFwBadge = UiStyle.badge(context, "미연결", UiStyle.SURFACE_ALT, UiStyle.MUTED)
+        otaCard.addView(LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(UiStyle.label(context, "보드 펌웨어", 15f, UiStyle.INK, bold = true),
+                LinearLayout.LayoutParams(0, -2, 1f))
+            addView(otaFwBadge)
+        })
+        otaCard.addView(UiStyle.label(
+            context,
+            "USB 연결 없이 휴대폰에서 dockycam-firmware-*.bin 파일을 선택해 무선으로 보드를 업데이트합니다. 이미지 헤더(0xE9)를 먼저 검증하며 실패 시 기존 펌웨어가 유지됩니다.",
+            12.5f,
+            UiStyle.SECONDARY
+        ).apply { setPadding(0, UiStyle.dp(context, 6), 0, UiStyle.dp(context, 12)) })
+
+        otaPickBtn = UiStyle.primaryButton(context, "펌웨어(.bin) 선택 및 무선 업데이트", onPickOtaFile)
+        otaCard.addView(otaPickBtn, LinearLayout.LayoutParams(-1, -2))
+
+        val otaBarTrack = FrameLayout(context).apply {
+            background = UiStyle.rounded(context, UiStyle.BG, 99, UiStyle.BORDER)
+        }
+        otaProgressFill = View(context).apply {
+            background = UiStyle.rounded(context, UiStyle.ACCENT, 99)
+        }
+        otaBarTrack.addView(otaProgressFill, FrameLayout.LayoutParams(0, UiStyle.dp(context, 8)))
+        otaStatusText = UiStyle.label(context, "", 12.5f, UiStyle.CYAN, bold = true).apply {
+            typeface = Typeface.MONOSPACE
+        }
+        otaProgressWrap = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            addView(otaStatusText, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 12) })
+            addView(otaBarTrack, LinearLayout.LayoutParams(-1, UiStyle.dp(context, 8)).apply { topMargin = UiStyle.dp(context, 6) })
+        }
+        otaCard.addView(otaProgressWrap)
+        devicePanel.addView(otaCard)
+
+        devicePanel.addView(UiStyle.sectionTitle(context, "보드 전원 · 제어").apply {
+            setPadding(UiStyle.dp(context, 4), UiStyle.dp(context, 18), 0, UiStyle.dp(context, 8))
+        })
+        val powerCard = UiStyle.card(context)
+        powerCard.addView(UiStyle.label(
+            context,
+            "네트워크가 불안정하거나 설정을 새로 반영하고 싶을 때 보드를 원격으로 재부팅합니다.",
+            12.5f,
+            UiStyle.SECONDARY
+        ).apply { setPadding(0, 0, 0, UiStyle.dp(context, 12)) })
+        rebootBtn = UiStyle.secondaryButton(context, "보드 원격 재부팅", onRebootBoard)
+        powerCard.addView(rebootBtn, LinearLayout.LayoutParams(-1, -2))
+        devicePanel.addView(powerCard)
+
+        devicePanel.addView(UiStyle.sectionTitle(context, "앱 정보").apply {
             setPadding(UiStyle.dp(context, 4), UiStyle.dp(context, 18), 0, UiStyle.dp(context, 8))
         })
         val infoCard = UiStyle.card(context)
         val appVersion = runCatching {
             context.packageManager.getPackageInfo(context.packageName, 0).versionName
-        }.getOrNull().orEmpty().ifEmpty { "0.3.3" }
-        infoCard.addView(UiStyle.label(context, "DockyCam v$appVersion", 14.5f, UiStyle.INK, bold = true))
+        }.getOrNull().orEmpty().ifEmpty { "0.3.4" }
+        infoCard.addView(UiStyle.label(context, "DockyCam v$appVersion", 15f, UiStyle.INK, bold = true))
         infoCard.addView(UiStyle.label(
             context,
-            "ESP32-S3 · OV5640 작업대 카메라 · 단독 SD 블랙박스 · 집 공유기(STA) & PC 웹 매니저",
+            "ESP32-S3 · OV5640 작업대 카메라 · 단독 SD 블랙박스 · 간이 클라우드 & 무선 OTA",
             12.5f,
             UiStyle.SECONDARY
         ).apply { setPadding(0, UiStyle.dp(context, 4), 0, 0) })
-        content.addView(infoCard)
+        deviceInfoMeta = UiStyle.label(context, "", 12f, UiStyle.MUTED).apply {
+            typeface = Typeface.MONOSPACE
+            visibility = View.GONE
+            setPadding(0, UiStyle.dp(context, 8), 0, 0)
+        }
+        infoCard.addView(deviceInfoMeta)
+        devicePanel.addView(infoCard)
 
-        val scroll = ScrollView(context).apply {
+        tabPanels[SettingsTab.CONNECT] = connectPanel
+        tabPanels[SettingsTab.CAMERA] = cameraPanel
+        tabPanels[SettingsTab.STORAGE] = storagePanel
+        tabPanels[SettingsTab.DEVICE] = devicePanel
+        tabPanels.values.forEach { panelHost.addView(it, FrameLayout.LayoutParams(-1, -2)) }
+
+        scrollView = ScrollView(context).apply {
             isFillViewport = true
-            addView(content, FrameLayout.LayoutParams(-1, -2))
+            addView(panelHost, FrameLayout.LayoutParams(-1, -2))
         }
         root.addView(topBar, LinearLayout.LayoutParams(-1, -2))
+        root.addView(tabBarWrap, LinearLayout.LayoutParams(-1, -2))
         root.addView(divider, LinearLayout.LayoutParams(-1, UiStyle.dp(context, 1)))
-        root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
+        root.addView(scrollView, LinearLayout.LayoutParams(-1, 0, 1f))
+
+        selectTab(SettingsTab.CONNECT)
+    }
+
+    fun selectTab(tab: SettingsTab) {
+        activeTab = tab
+        renderSettingsTab(tab)
+        tabPanels.forEach { (key, panel) ->
+            panel.visibility = if (key == tab) View.VISIBLE else View.GONE
+        }
+        scrollView.scrollTo(0, 0)
     }
 
     private fun styledInput(hintText: String, value: String, password: Boolean): EditText = EditText(context).apply {
@@ -451,15 +575,22 @@ internal class SettingsScreen(
 
     fun setConnected(connected: Boolean) {
         disconnectBtn.visibility = if (connected) View.VISIBLE else View.GONE
-        staSectionContainer.visibility = View.VISIBLE
-        sdSectionContainer.visibility = if (connected) View.VISIBLE else View.GONE
+        sdDisconnectedHint.visibility = if (connected) View.GONE else View.VISIBLE
+        sdControlsContainer.visibility = if (connected) View.VISIBLE else View.GONE
         staScanBtn.isEnabled = connected
         staScanBtn.alpha = if (connected) 1f else 0.45f
         staSaveBtn.isEnabled = connected
         staSaveBtn.alpha = if (connected) 1f else 0.45f
         staBackToApBtn.isEnabled = connected
         staBackToApBtn.alpha = if (connected) 1f else 0.45f
+        otaPickBtn.isEnabled = connected
+        otaPickBtn.alpha = if (connected) 1f else 0.45f
+        rebootBtn.isEnabled = connected
+        rebootBtn.alpha = if (connected) 1f else 0.45f
         if (!connected) {
+            headerConnBadge.text = "미연결"
+            headerConnBadge.background = UiStyle.rounded(context, UiStyle.SURFACE_ALT, 99)
+            headerConnBadge.setTextColor(UiStyle.MUTED)
             staCurrentBadge.text = "미연결"
             staCurrentBadge.background = UiStyle.rounded(context, UiStyle.SURFACE_ALT, 99)
             staCurrentBadge.setTextColor(UiStyle.MUTED)
@@ -467,7 +598,14 @@ internal class SettingsScreen(
             boardDisconnectedHint.visibility = View.VISIBLE
             boardDisconnectedHint.text = "보드에 연결되면 해상도·회전·절전·상태 LED 설정을 바꿀 수 있습니다."
             boardControlsContainer.visibility = View.GONE
+            otaFwBadge.text = "미연결"
+            otaFwBadge.background = UiStyle.rounded(context, UiStyle.SURFACE_ALT, 99)
+            otaFwBadge.setTextColor(UiStyle.MUTED)
+            deviceInfoMeta.visibility = View.GONE
         } else {
+            headerConnBadge.text = "연결됨"
+            headerConnBadge.background = UiStyle.rounded(context, UiStyle.ACCENT_SOFT, 99)
+            headerConnBadge.setTextColor(UiStyle.ACCENT)
             boardDisconnectedHint.visibility = View.VISIBLE
             boardDisconnectedHint.text = "보드 설정을 불러오는 중입니다..."
         }
@@ -477,12 +615,16 @@ internal class SettingsScreen(
         currentWifiStatus = status
         if (status == null) return
         val isSta = status.mode == "sta"
-        staCurrentBadge.text = if (isSta) "공유기 연결 · ${status.ssid}" else "직결 AP · ${status.ssid}"
+        headerConnBadge.text = if (isSta) "공유기" else "직결 AP"
+        headerConnBadge.background = UiStyle.rounded(context, UiStyle.ACCENT_SOFT, 99)
+        headerConnBadge.setTextColor(UiStyle.ACCENT)
+
+        staCurrentBadge.text = if (isSta) "공유기 · ${status.ssid}" else "직결 AP · ${status.ssid}"
         staCurrentBadge.background = UiStyle.rounded(context, if (isSta) UiStyle.ACCENT_SOFT else UiStyle.SURFACE_ALT, 99)
         staCurrentBadge.setTextColor(if (isSta) UiStyle.ACCENT else UiStyle.SECONDARY)
         val fwTag = if (status.fwVersion.isNotEmpty()) "  ·  FW v${status.fwVersion}" else ""
-        staWebUrlText.text = "PC 웹 파일매니저: http://${status.host}/  또는  http://${status.ip}/" +
-            (if (isSta) "  (신호 ${status.rssi} dBm · ch${status.channel})" else "  (ch${status.channel})") + fwTag
+        staWebUrlText.text = "PC 웹: http://${status.host}/  또는  http://${status.ip}/" +
+            (if (isSta) "  (${status.rssi} dBm · ch${status.channel})" else "  (ch${status.channel})") + fwTag
         if (staSsidField.text.isEmpty() && status.staSsid.isNotEmpty()) {
             staSsidField.setText(status.staSsid)
         }
@@ -491,6 +633,46 @@ internal class SettingsScreen(
         suppressLedCallback = true
         boardLedSwitch.isChecked = status.ledEnabled
         suppressLedCallback = false
+
+        val fwLabel = if (status.fwVersion.isNotEmpty()) "현재 FW v${status.fwVersion}" else "연결됨"
+        otaFwBadge.text = fwLabel
+        otaFwBadge.background = UiStyle.rounded(context, UiStyle.ACCENT_SOFT, 99)
+        otaFwBadge.setTextColor(UiStyle.ACCENT)
+
+        val upMin = status.uptimeSeconds / 60L
+        deviceInfoMeta.text = "보드 ${status.ip} · $fwLabel · 가동 ${upMin}분"
+        deviceInfoMeta.visibility = View.VISIBLE
+    }
+
+    fun showOtaProgress(percent: Int?, statusText: String?, isError: Boolean = false) {
+        if (statusText.isNullOrEmpty()) {
+            otaProgressWrap.visibility = View.GONE
+            otaPickBtn.isEnabled = true
+            otaPickBtn.alpha = 1f
+            return
+        }
+        otaProgressWrap.visibility = View.VISIBLE
+        otaStatusText.text = statusText
+        otaStatusText.setTextColor(when {
+            isError -> UiStyle.DANGER
+            percent == 100 -> UiStyle.ACCENT
+            else -> UiStyle.CYAN
+        })
+        val inProgress = percent != null && percent in 0..99 && !isError
+        otaPickBtn.isEnabled = !inProgress
+        otaPickBtn.alpha = if (inProgress) 0.45f else 1f
+        val pVal = (percent ?: 0).coerceIn(0, 100)
+        otaProgressFill.post {
+            val parentW = (otaProgressFill.parent as? View)?.width ?: return@post
+            val lp = otaProgressFill.layoutParams ?: return@post
+            lp.width = (parentW * pVal / 100).coerceAtLeast(if (pVal > 0) UiStyle.dp(context, 6) else 0)
+            otaProgressFill.layoutParams = lp
+            otaProgressFill.background = UiStyle.rounded(
+                context,
+                if (isError) UiStyle.DANGER else UiStyle.ACCENT,
+                99
+            )
+        }
     }
 
     fun setScanning(scanning: Boolean) {

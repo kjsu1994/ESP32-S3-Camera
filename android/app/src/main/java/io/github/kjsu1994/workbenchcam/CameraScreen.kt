@@ -74,6 +74,8 @@ internal class CameraScreen(
     // Shared Live views
     private val statusText = UiStyle.label(context, "", 13f, UiStyle.INK, bold = true)
     private val statusDot = View(context)
+    private var lastStatusDotColor: Int = 0
+    private var pendingShareBanner: TextView? = null
     private val statusPill = LinearLayout(context).apply {
         orientation = LinearLayout.HORIZONTAL
         gravity = Gravity.CENTER_VERTICAL
@@ -353,6 +355,16 @@ internal class CameraScreen(
         }
         shell.addView(topBar, LinearLayout.LayoutParams(-1, -2))
 
+        val shareBanner = UiStyle.label(context, "", 12.5f, UiStyle.CYAN, bold = true).apply {
+            visibility = View.GONE
+            background = UiStyle.rounded(context, UiStyle.CYAN_SOFT, 12, UiStyle.BORDER)
+            setPadding(UiStyle.dp(context, 14), UiStyle.dp(context, 9), UiStyle.dp(context, 14), UiStyle.dp(context, 9))
+        }
+        pendingShareBanner = shareBanner
+        shell.addView(shareBanner, LinearLayout.LayoutParams(-1, -2).apply {
+            setMargins(UiStyle.dp(context, 16), 0, UiStyle.dp(context, 16), UiStyle.dp(context, 8))
+        })
+
         // --- Center Tab Host ---
         val host = FrameLayout(context)
         val liveView = buildLiveTab(config)
@@ -456,11 +468,11 @@ internal class CameraScreen(
         liveHudToggleBtn = hudPillBtn
         styleLiveHudToggle()
 
-        val videoStage = VideoFrame(context).apply {
-            background = UiStyle.rounded(context, 0xff060908.toInt(), 18, UiStyle.BORDER)
-            clipToOutline = true
+        val videoCanvas = FrameLayout(context).apply {
             addView(image, FrameLayout.LayoutParams(-1, -1))
             addView(idleText, FrameLayout.LayoutParams(-1, -1))
+        }
+        val hudOverlayLayer = FrameLayout(context).apply {
             addView(zoomBadge, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START).apply {
                 setMargins(UiStyle.dp(context, 10), UiStyle.dp(context, 10), 0, 0)
             })
@@ -473,6 +485,12 @@ internal class CameraScreen(
             addView(fsIconBtn, FrameLayout.LayoutParams(UiStyle.dp(context, 38), UiStyle.dp(context, 38), Gravity.BOTTOM or Gravity.END).apply {
                 setMargins(0, 0, UiStyle.dp(context, 10), UiStyle.dp(context, 10))
             })
+        }
+        val videoStage = VideoFrame(context).apply {
+            background = UiStyle.rounded(context, 0xff060908.toInt(), 18, UiStyle.BORDER)
+            clipToOutline = true
+            addView(videoCanvas, FrameLayout.LayoutParams(-1, -1))
+            addView(hudOverlayLayer, FrameLayout.LayoutParams(-1, -1))
         }
 
         primaryCtaBtn = UiStyle.primaryButton(context, "연결 및 보기", start)
@@ -952,6 +970,12 @@ internal class CameraScreen(
         }
     }
 
+    fun selectCategory(cat: String) {
+        selectedCategory = cat
+        renderCategoryChips?.invoke(cat)
+        updateSharedControlsVisibility()
+    }
+
     fun selectTab(tab: AppTab) {
         activeTab = tab
         tabContainers.forEach { (key, view) ->
@@ -986,9 +1010,23 @@ internal class CameraScreen(
 
     fun showStatus(message: String, countdown: String, dotColor: Int = UiStyle.MUTED) {
         if (statusText.text != message) statusText.text = message
-        statusDot.background = UiStyle.rounded(context, dotColor, 99)
+        if (lastStatusDotColor != dotColor) {
+            lastStatusDotColor = dotColor
+            statusDot.background = UiStyle.rounded(context, dotColor, 99)
+        }
         if (timerText.text != countdown) timerText.text = countdown
-        timerText.visibility = if (countdown.isEmpty()) View.GONE else View.VISIBLE
+        val nextVis = if (countdown.isEmpty()) View.GONE else View.VISIBLE
+        if (timerText.visibility != nextVis) timerText.visibility = nextVis
+    }
+
+    fun showPendingShareBanner(message: String?) {
+        val banner = pendingShareBanner ?: return
+        if (message.isNullOrEmpty()) {
+            banner.visibility = View.GONE
+        } else {
+            banner.text = message
+            banner.visibility = View.VISIBLE
+        }
     }
 
     fun showTelemetry(value: String?) {

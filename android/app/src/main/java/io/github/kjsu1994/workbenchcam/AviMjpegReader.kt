@@ -3,8 +3,86 @@ package io.github.kjsu1994.workbenchcam
 import java.io.BufferedInputStream
 import java.io.DataInputStream
 import java.io.EOFException
+import java.io.File
 import java.io.IOException
 import java.io.InputStream
+import java.io.RandomAccessFile
+
+internal data class AviFrameEntry(val offset: Long, val size: Int)
+internal data class AviFrameIndex(val fpsHint: Int, val frames: List<AviFrameEntry>)
+
+/**
+ * Indexes `00dc`/`00db` JPEG frame byte offsets in a local AVI file for instant O(1) random-access seek
+ * with minimal RAM usage (only 16 bytes per frame instead of buffering every JPEG in memory).
+ */
+internal object AviMjpegIndexer {
+    private const val MAX_CHUNK = 512 * 1024
+
+    fun indexFile(file: File): AviFrameIndex {
+        RandomAccessFile(file, "r").use { raf ->
+            val totalLen = raf.length()
+            if (totalLen < 16L) throw EOFException("Empty AVI file")
+            val hdr = ByteArray(12)
+            raf.readFully(hdr)
+            if (fourCc(hdr, 0) != "RIFF" || fourCc(hdr, 8) != "AVI ") {
+                throw IOException("Not a RIFF AVI file")
+            }
+
+            var fpsHint = 8
+            val scanLen = minOf(totalLen - 12L, 4096L).toInt()
+            val scanBuf = ByteArray(scanLen)
+            raf.readFully(scanBuf)
+            var moviPos = -1L
+            var i = 0
+            while (i + 8 <= scanLen) {
+                val tag = fourCc(scanBuf, i)
+                if (tag == "avih" && i + 12 <= scanLen) {
+                    val usPerFrame = leInt(scanBuf, i + 8)
+                    if (usPerFrame in 10_000..1_000_000) {
+                        fpsHint = (1_000_000 / usPerFrame).coerceIn(1, 30)
+                    }
+                    i += 4
+                } else if (tag == "movi") {
+                    moviPos = 12L + i + 4L
+                    break
+                } else {
+                    i += 1
+                }
+            }
+            if (moviPos < 0L) throw IOException("Missing movi list")
+
+            val frames = ArrayList<AviFrameEntry>(256)
+            val chunkHdr = ByteArray(8)
+            var pos = moviPos
+            while (pos + 8L <= totalLen) {
+                raf.seek(pos)
+                raf.readFully(chunkHdr)
+                val id = fourCc(chunkHdr, 0)
+                val size = leInt(chunkHdr, 4)
+                val dataOffset = pos + 8L
+                if (size < 0 || size > MAX_CHUNK || dataOffset + size > totalLen) break
+                if (id == "00dc" || id == "00db") {
+                    if (size >= 4) {
+                        frames.add(AviFrameEntry(dataOffset, size))
+                    }
+                } else if (id == "idx1") {
+                    break
+                }
+                pos = dataOffset + size.toLong() + (size and 1).toLong()
+            }
+            return AviFrameIndex(fpsHint, frames)
+        }
+    }
+
+    private fun fourCc(buf: ByteArray, offset: Int): String =
+        String(buf, offset, 4, Charsets.US_ASCII)
+
+    private fun leInt(buf: ByteArray, offset: Int): Int =
+        (buf[offset].toInt() and 0xFF) or
+            ((buf[offset + 1].toInt() and 0xFF) shl 8) or
+            ((buf[offset + 2].toInt() and 0xFF) shl 16) or
+            ((buf[offset + 3].toInt() and 0xFF) shl 24)
+}
 
 /**
  * Streaming RIFF AVI MJPEG chunk reader (`00dc` frames) with zero full-file RAM buffering.

@@ -1,6 +1,8 @@
 package io.github.kjsu1994.workbenchcam
 
 import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.RandomAccessFile
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -82,5 +84,53 @@ class AviMjpegReaderTest {
         assertArrayEquals(frame, reader.nextFrame())
         assertEquals(8, reader.fpsHint)
         assertNull(reader.nextFrame())
+    }
+
+    @Test fun indexesMultipleFramesForRandomAccessSeek() {
+        val frame1 = byteArrayOf(0xff.toByte(), 0xd8.toByte(), 0x01, 0xff.toByte(), 0xd9.toByte()) // odd 5 bytes
+        val frame2 = byteArrayOf(0xff.toByte(), 0xd8.toByte(), 0x02, 0x03, 0xff.toByte(), 0xd9.toByte()) // even 6 bytes
+        val frame3 = byteArrayOf(0xff.toByte(), 0xd8.toByte(), 0x04, 0x05, 0x06, 0xff.toByte(), 0xd9.toByte()) // odd 7 bytes
+
+        val out = ByteArrayOutputStream()
+        out.write("RIFF".toByteArray())
+        le32(out, 200)
+        out.write("AVI ".toByteArray())
+        out.write("LIST".toByteArray())
+        le32(out, 4 + 8 + 8)
+        out.write("hdrl".toByteArray())
+        out.write("avih".toByteArray())
+        le32(out, 8)
+        le32(out, 100_000) // 10 fps
+        le32(out, 0)
+        out.write("LIST".toByteArray())
+        le32(out, 4 + (8 + 6) + (8 + 6) + (8 + 8))
+        out.write("movi".toByteArray())
+        listOf(frame1, frame2, frame3).forEach { f ->
+            out.write("00dc".toByteArray())
+            le32(out, f.size)
+            out.write(f)
+            if ((f.size and 1) != 0) out.write(0)
+        }
+
+        val tmp = File.createTempFile("avi_indexer_test_", ".avi")
+        try {
+            tmp.writeBytes(out.toByteArray())
+            val indexed = AviMjpegIndexer.indexFile(tmp)
+            assertEquals(10, indexed.fpsHint)
+            assertEquals(3, indexed.frames.size)
+            RandomAccessFile(tmp, "r").use { raf ->
+                val expected = listOf(frame1, frame2, frame3)
+                // Verify random reverse-order seeking
+                for (i in 2 downTo 0) {
+                    val e = indexed.frames[i]
+                    val buf = ByteArray(e.size)
+                    raf.seek(e.offset)
+                    raf.readFully(buf)
+                    assertArrayEquals(expected[i], buf)
+                }
+            }
+        } finally {
+            tmp.delete()
+        }
     }
 }

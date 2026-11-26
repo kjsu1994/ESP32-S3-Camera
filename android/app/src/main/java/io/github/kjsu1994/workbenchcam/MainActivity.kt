@@ -4,11 +4,14 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
+import android.app.Dialog
 import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.content.res.Configuration
+import android.graphics.Color
+import android.graphics.drawable.ColorDrawable
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -24,12 +27,15 @@ import android.os.Looper
 import android.os.SystemClock
 import android.provider.MediaStore
 import android.provider.OpenableColumns
+import android.view.Gravity
 import android.view.View
+import android.view.Window
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.WindowManager
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.LinearLayout
 import android.widget.Toast
 import android.window.OnBackInvokedCallback
 import android.window.OnBackInvokedDispatcher
@@ -90,6 +96,13 @@ class MainActivity : Activity() {
     private var currentSharedDir = ""
     private var lastSdListing: SdListing? = null
     private var cachedBoardOptions: BoardOptions? = null
+    private var pendingShare: PendingShare? = null
+    private var otaInProgress = false
+
+    private sealed class PendingShare {
+        data class Text(val title: String, val text: String) : PendingShare()
+        data class Files(val uris: List<Uri>) : PendingShare()
+    }
 
     private val framePending = AtomicBoolean(false)
     private val handler = Handler(Looper.getMainLooper())
@@ -136,9 +149,13 @@ class MainActivity : Activity() {
                 if (telemetryEnabled && !telemetryPending && now >= nextTelemetryAt) {
                     refreshTelemetry(connected, now)
                 }
-                val sdPollInterval = if (activeTab == AppTab.RECORD || settingsOpen) 2500L else 6000L
-                if (!sdStatusPending && now >= nextSdPollAt) {
-                    refreshSdStatus(connected, now + sdPollInterval)
+                // Pause port-80 /sd/status polling during active live view so Core 1 & SD_MMC stay 100% idle.
+                val liveViewing = preview != null && activeTab == AppTab.LIVE && !settingsOpen
+                if (!liveViewing) {
+                    val sdPollInterval = if (activeTab == AppTab.RECORD || settingsOpen) 2500L else 6000L
+                    if (!sdStatusPending && now >= nextSdPollAt) {
+                        refreshSdStatus(connected, now + sdPollInterval)
+                    }
                 }
             }
             val current = preview
@@ -185,6 +202,13 @@ class MainActivity : Activity() {
         manualLanIp = prefs.getString("manual_lan_ip", "").orEmpty()
         lastLanIp = prefs.getString("last_lan_ip", "").orEmpty()
         createScreen(resources.configuration)
+        handleIncomingShareIntent(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIncomingShareIntent(intent)
     }
 
     @Deprecated("Fallback for API 29-32; API 33+ uses OnBackInvokedCallback")
@@ -383,6 +407,7 @@ class MainActivity : Activity() {
             onScanHomeWifi = ::scanNearbyWifiFromBoard,
             onSaveHomeWifi = ::saveHomeWifiToBoard,
             onToggleBoardLed = ::updateBoardLedMode,
+            onPickOtaFile = ::pickOtaFirmwareFile,
             onRebootBoard = ::confirmRebootBoard,
             onClearSdCategory = ::confirmClearSdCategory
         )
@@ -801,6 +826,16 @@ class MainActivity : Activity() {
                 loadBoardOptionsForSettings(target, page)
             }
         }
+        val queuedShare = pendingShare
+        if (queuedShare != null) {
+            pendingShare = null
+            screen.showPendingShareBanner(null)
+            setStatus(if (target.viaLan) "공유기 연결됨" else "AP 연결됨")
+            updateControls()
+            if (activeTab == AppTab.LIBRARY) refreshSdFiles()
+            presentShareDialog(target, queuedShare)
+            return
+        }
         if (activeTab == AppTab.LIVE) {
             if (visible) startPreview(target) else previewOnReturn = true
         } else {
@@ -1108,17 +1143,294 @@ class MainActivity : Activity() {
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = "*/*"
+            putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
         }
         runCatching { startActivityForResult(intent, REQ_PICK_UPLOAD_FILE) }
             .onFailure { Toast.makeText(this, "파일 선택기를 열 수 없습니다", Toast.LENGTH_SHORT).show() }
     }
 
     @Suppress("DEPRECATION")
+    private fun pickOtaFirmwareFile() {
+        if (boardTarget == null) {
+            Toast.makeText(this, "먼저 보드에 연결해 주세요", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (otaInProgress) return
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+        }
+        runCatching { startActivityForResult(intent, REQ_PICK_OTA_FILE) }
+            .onFailure { Toast.makeText(this, "파일 선택기를 열 수 없습니다", Toast.LENGTH_SHORT).show() }
+    }
+
+    @Suppress("DEPRECATION")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == REQ_PICK_UPLOAD_FILE && resultCode == RESULT_OK) {
-            data?.data?.let(::uploadUriToShared)
+        if (resultCode != RESULT_OK || data == null) return
+        when (requestCode) {
+            REQ_PICK_UPLOAD_FILE -> {
+                val uris = buildList {
+                    val clip = data.clipData
+                    if (clip != null && clip.itemCount > 0) {
+                        for (i in 0 until clip.itemCount) {
+                            clip.getItemAt(i).uri?.let(::add)
+                        }
+                    } else {
+                        data.data?.let(::add)
+                    }
+                }
+                if (uris.isNotEmpty()) uploadUrisToShared(uris)
+            }
+            REQ_PICK_OTA_FILE -> {
+                data.data?.let(::confirmAndUploadOta)
+            }
         }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun handleIncomingShareIntent(incoming: Intent?) {
+        if (incoming == null) return
+        val action = incoming.action ?: return
+        if (action != Intent.ACTION_SEND && action != Intent.ACTION_SEND_MULTIPLE) return
+
+        val uris = ArrayList<Uri>()
+        if (action == Intent.ACTION_SEND) {
+            val streamUri = if (Build.VERSION.SDK_INT >= 33) {
+                incoming.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+            } else {
+                incoming.getParcelableExtra(Intent.EXTRA_STREAM)
+            }
+            if (streamUri != null) uris.add(streamUri)
+        } else {
+            val list = if (Build.VERSION.SDK_INT >= 33) {
+                incoming.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri::class.java)
+            } else {
+                incoming.getParcelableArrayListExtra(Intent.EXTRA_STREAM)
+            }
+            if (list != null) uris.addAll(list)
+        }
+
+        val sharedText = incoming.getStringExtra(Intent.EXTRA_TEXT)?.trim().orEmpty()
+        val sharedSubject = incoming.getStringExtra(Intent.EXTRA_SUBJECT)?.trim().orEmpty()
+        incoming.action = Intent.ACTION_MAIN
+
+        val share: PendingShare = when {
+            uris.isNotEmpty() -> PendingShare.Files(uris)
+            sharedText.isNotEmpty() -> PendingShare.Text(sharedSubject, sharedText)
+            else -> return
+        }
+
+        if (fullscreen) exitFullscreen()
+        if (settingsOpen) closeSettingsPage()
+        activeTab = AppTab.LIBRARY
+        selectedLibraryCategory = "shared"
+        screen.selectCategory("shared")
+        screen.selectTab(AppTab.LIBRARY)
+        updateBackCallbackRegistration()
+
+        val connected = boardTarget
+        if (connected != null) {
+            presentShareDialog(connected, share)
+        } else {
+            pendingShare = share
+            val desc = when (share) {
+                is PendingShare.Files -> "파일 ${share.uris.size}개 공유 대기 중 · 보드에 자동 연결합니다..."
+                is PendingShare.Text -> "메모 공유 대기 중 · 보드에 자동 연결합니다..."
+            }
+            screen.showPendingShareBanner(desc)
+            requestStart()
+        }
+    }
+
+    private fun presentShareDialog(connected: BoardTarget, share: PendingShare) {
+        val d = Dialog(this)
+        d.requestWindowFeature(Window.FEATURE_NO_TITLE)
+        d.window?.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+
+        val card = UiStyle.card(this, 18)
+        when (share) {
+            is PendingShare.Text -> {
+                card.addView(UiStyle.label(this, "DockyCam 빠른 메모장 저장", 16.5f, UiStyle.INK, bold = true))
+                card.addView(UiStyle.label(
+                    this,
+                    "공유받은 텍스트·링크를 보드 메모장에 저장합니다. PC 웹과 실시간으로 공유됩니다.",
+                    12.5f,
+                    UiStyle.SECONDARY
+                ).apply { setPadding(0, UiStyle.dp(this@MainActivity, 4), 0, UiStyle.dp(this@MainActivity, 12)) })
+
+                val titleField = EditText(this).apply {
+                    hint = "제목 (선택)"
+                    setText(share.title)
+                    setTextColor(UiStyle.INK)
+                    setHintTextColor(UiStyle.MUTED)
+                    setSingleLine(true)
+                    background = UiStyle.rounded(this@MainActivity, UiStyle.BG, 12, UiStyle.BORDER)
+                    val p = UiStyle.dp(this@MainActivity, 12)
+                    setPadding(p, p, p, p)
+                }
+                val bodyField = EditText(this).apply {
+                    hint = "내용"
+                    setText(share.text)
+                    setTextColor(UiStyle.INK)
+                    setHintTextColor(UiStyle.MUTED)
+                    minLines = 3
+                    maxLines = 7
+                    gravity = Gravity.TOP or Gravity.START
+                    background = UiStyle.rounded(this@MainActivity, UiStyle.BG, 12, UiStyle.BORDER)
+                    val p = UiStyle.dp(this@MainActivity, 12)
+                    setPadding(p, p, p, p)
+                }
+                card.addView(titleField, LinearLayout.LayoutParams(-1, -2))
+                card.addView(bodyField, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(this@MainActivity, 8) })
+
+                val btnRow = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    val gap = UiStyle.dp(this@MainActivity, 8)
+                    addView(UiStyle.secondaryButton(this@MainActivity, "취소") { d.dismiss() },
+                        LinearLayout.LayoutParams(0, -2, 0.85f).apply { marginEnd = gap })
+                    addView(UiStyle.primaryButton(this@MainActivity, "메모장에 저장") {
+                        val t = titleField.text.toString().trim()
+                        val b = bodyField.text.toString().trim()
+                        if (t.isEmpty() && b.isEmpty()) return@primaryButton
+                        d.dismiss()
+                        Thread({
+                            val ok = runCatching { BoardApi(connected).addNote(t, b) }.isSuccess
+                            runOnUiThread {
+                                if (!isDestroyed) {
+                                    Toast.makeText(
+                                        this@MainActivity,
+                                        if (ok) "빠른 메모장에 저장했습니다" else "메모 저장에 실패했습니다",
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                }
+                            }
+                        }, "share-note-save").start()
+                    }, LinearLayout.LayoutParams(0, -2, 1.3f))
+                }
+                card.addView(btnRow, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(this@MainActivity, 14) })
+            }
+            is PendingShare.Files -> {
+                val metas = share.uris.map(::resolvePickedMeta)
+                val totalBytes = metas.sumOf { it.second.coerceAtLeast(0L) }
+                val destPath = if (currentSharedDir.isNotEmpty()) "/dockycam/shared/$currentSharedDir" else "/dockycam/shared"
+                card.addView(UiStyle.label(this, "공유함으로 파일 전송", 16.5f, UiStyle.INK, bold = true))
+                card.addView(UiStyle.label(
+                    this,
+                    "저장 경로: $destPath",
+                    12.5f,
+                    UiStyle.CYAN,
+                    bold = true
+                ).apply { setPadding(0, UiStyle.dp(this@MainActivity, 4), 0, UiStyle.dp(this@MainActivity, 10)) })
+
+                val previewLines = metas.take(4).joinToString("\n") { (n, sz) ->
+                    "• $n (${if (sz > 0L) UiStyle.formatSize(sz) else "크기 확인 중"})"
+                } + if (metas.size > 4) "\n외 ${metas.size - 4}개 파일" else ""
+                card.addView(UiStyle.label(this, previewLines, 13f, UiStyle.SECONDARY).apply {
+                    background = UiStyle.rounded(this@MainActivity, UiStyle.BG, 12, UiStyle.BORDER)
+                    val p = UiStyle.dp(this@MainActivity, 12)
+                    setPadding(p, p, p, p)
+                })
+                card.addView(UiStyle.label(
+                    this,
+                    "총 ${metas.size}개 파일 · ${UiStyle.formatSize(totalBytes)}",
+                    12.5f,
+                    UiStyle.MUTED
+                ).apply { setPadding(0, UiStyle.dp(this@MainActivity, 8), 0, 0) })
+
+                val btnRow = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    val gap = UiStyle.dp(this@MainActivity, 8)
+                    addView(UiStyle.secondaryButton(this@MainActivity, "취소") { d.dismiss() },
+                        LinearLayout.LayoutParams(0, -2, 0.85f).apply { marginEnd = gap })
+                    addView(UiStyle.primaryButton(this@MainActivity, "지금 업로드") {
+                        d.dismiss()
+                        uploadUrisToShared(share.uris)
+                    }, LinearLayout.LayoutParams(0, -2, 1.3f))
+                }
+                card.addView(btnRow, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(this@MainActivity, 14) })
+            }
+        }
+
+        val wrap = FrameLayout(this).apply {
+            val m = UiStyle.dp(this@MainActivity, 20)
+            setPadding(m, m, m, m)
+            addView(card, FrameLayout.LayoutParams(-1, -2))
+        }
+        d.setContentView(wrap)
+        d.window?.setLayout(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.WRAP_CONTENT)
+        d.show()
+    }
+
+    private fun confirmAndUploadOta(uri: Uri) {
+        val connected = boardTarget ?: return
+        val (name, size) = resolvePickedMeta(uri)
+        if (!name.endsWith(".bin", ignoreCase = true)) {
+            Toast.makeText(this, ".bin 펌웨어 파일만 선택할 수 있습니다", Toast.LENGTH_LONG).show()
+            return
+        }
+        if (size < 65536L || size > 6L * 1024L * 1024L) {
+            Toast.makeText(this, "올바른 펌웨어 크기가 아닙니다 (64KB~6MB)", Toast.LENGTH_LONG).show()
+            return
+        }
+        val magicOk = runCatching {
+            contentResolver.openInputStream(uri)?.use { it.read() == 0xE9 } ?: false
+        }.getOrDefault(false)
+        if (!magicOk) {
+            Toast.makeText(this, "ESP32 펌웨어 이미지(0xE9)가 아닙니다", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        AlertDialog.Builder(this)
+            .setTitle("무선 펌웨어 업데이트 (OTA)")
+            .setMessage("'$name' (${UiStyle.formatSize(size)})로 보드를 무선 업데이트할까요?\n\n전송 중 보드 전원을 끄지 마세요. 완료 후 보드가 자동 재부팅됩니다.")
+            .setNegativeButton("취소", null)
+            .setPositiveButton("업데이트 시작") { _, _ ->
+                startOtaUpload(connected, uri, name, size)
+            }
+            .show()
+    }
+
+    private fun startOtaUpload(connected: BoardTarget, uri: Uri, name: String, size: Long) {
+        if (preview != null) stopPreview()
+        otaInProgress = true
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        settingsScreen?.selectTab(SettingsTab.DEVICE)
+        settingsScreen?.showOtaProgress(0, "전송 준비 중: $name (${UiStyle.formatSize(size)})")
+        Thread({
+            val result = runCatching {
+                checkNotNull(contentResolver.openInputStream(uri)).use { input ->
+                    BoardApi(connected).uploadOtaFirmware(size, input) { sent, total ->
+                        val pct = if (total > 0L) ((sent * 100L) / total).toInt().coerceIn(0, 100) else 0
+                        runOnUiThread {
+                            if (!isDestroyed) {
+                                settingsScreen?.showOtaProgress(
+                                    pct,
+                                    "플래싱 중 · $pct% (${UiStyle.formatSize(sent)} / ${UiStyle.formatSize(total)})"
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+            runOnUiThread {
+                otaInProgress = false
+                if (preview == null) window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                if (isDestroyed) return@runOnUiThread
+                result.onSuccess {
+                    settingsScreen?.showOtaProgress(100, "업데이트 완료! 보드가 재부팅 중입니다 (약 8초 후 다시 연결하세요)")
+                    Toast.makeText(this, "무선 펌웨어 업데이트 완료! 보드가 재부팅됩니다", Toast.LENGTH_LONG).show()
+                    handler.postDelayed({
+                        if (!isDestroyed && boardTarget == connected) {
+                            releaseNetwork()
+                        }
+                    }, 1200)
+                }.onFailure { err ->
+                    settingsScreen?.showOtaProgress(0, "업데이트 실패: ${err.message ?: "연결 확인"}", isError = true)
+                    Toast.makeText(this, "OTA 실패: ${err.message ?: "연결 확인"}", Toast.LENGTH_LONG).show()
+                }
+            }
+        }, "board-ota-upload").start()
     }
 
     private fun resolvePickedMeta(uri: Uri): Pair<String, Long> {
@@ -1140,42 +1452,62 @@ class MainActivity : Activity() {
         return name to size
     }
 
-    private fun uploadUriToShared(uri: Uri) {
+    private fun uploadUrisToShared(uris: List<Uri>) {
         val connected = boardTarget ?: return
+        if (uris.isEmpty()) return
         // Stop live video so 100% Wi-Fi/SD bandwidth goes to file upload.
         if (preview != null) stopPreview()
-        val (name, size) = resolvePickedMeta(uri)
-        if (size <= 0L) {
-            Toast.makeText(this, "파일 크기를 확인할 수 없습니다", Toast.LENGTH_SHORT).show()
-            return
-        }
         val targetDir = if (selectedLibraryCategory == "shared") currentSharedDir else ""
-        screen.showUploadProgress("업로드 준비 중: $name (${UiStyle.formatSize(size)})")
+        val totalCount = uris.size
+        screen.showUploadProgress("업로드 준비 중 (총 ${totalCount}개 파일)...")
         Thread({
-            val started = SystemClock.elapsedRealtime()
-            val result = runCatching {
-                checkNotNull(contentResolver.openInputStream(uri)).use { input ->
-                    BoardApi(connected).uploadSharedFile(name, size, input, dir = targetDir) { sent, total ->
-                        val pct = if (total > 0L) ((sent * 100L) / total).toInt().coerceIn(0, 100) else 0
-                        val sec = ((SystemClock.elapsedRealtime() - started).coerceAtLeast(200L)) / 1000.0
-                        val speed = UiStyle.formatSize((sent / sec).toLong()) + "/s"
-                        runOnUiThread {
-                            if (!isDestroyed) {
-                                screen.showUploadProgress("업로드 중: $name · $pct% ($speed)")
+            var uploadedCount = 0
+            var lastError: String? = null
+            for ((idx, uri) in uris.withIndex()) {
+                val (name, size) = resolvePickedMeta(uri)
+                if (size <= 0L) {
+                    lastError = "$name 크기 확인 불가"
+                    continue
+                }
+                val prefix = if (totalCount > 1) "[${idx + 1}/$totalCount] " else ""
+                runOnUiThread {
+                    if (!isDestroyed) {
+                        screen.showUploadProgress("${prefix}업로드 준비 중: $name (${UiStyle.formatSize(size)})")
+                    }
+                }
+                val started = SystemClock.elapsedRealtime()
+                val res = runCatching {
+                    checkNotNull(contentResolver.openInputStream(uri)).use { input ->
+                        BoardApi(connected).uploadSharedFile(name, size, input, dir = targetDir) { sent, total ->
+                            val pct = if (total > 0L) ((sent * 100L) / total).toInt().coerceIn(0, 100) else 0
+                            val sec = ((SystemClock.elapsedRealtime() - started).coerceAtLeast(200L)) / 1000.0
+                            val speed = UiStyle.formatSize((sent / sec).toLong()) + "/s"
+                            runOnUiThread {
+                                if (!isDestroyed) {
+                                    screen.showUploadProgress("${prefix}업로드 중: $name · $pct% ($speed)")
+                                }
                             }
                         }
                     }
                 }
+                res.onSuccess { uploadedCount += 1 }
+                    .onFailure { lastError = it.message ?: "연결 확인" }
+                if (res.isFailure) break
             }
             runOnUiThread {
                 if (isDestroyed) return@runOnUiThread
                 screen.showUploadProgress(null)
-                result.onSuccess { item ->
-                    Toast.makeText(this, "공유함에 업로드 완료: ${item.name}", Toast.LENGTH_SHORT).show()
+                if (uploadedCount > 0) {
+                    val msg = if (lastError == null) {
+                        if (uploadedCount == 1) "공유함에 업로드 완료" else "공유함에 ${uploadedCount}개 파일 업로드 완료"
+                    } else {
+                        "${uploadedCount}/${totalCount}개 업로드 완료 (일부 실패: $lastError)"
+                    }
+                    Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
                     refreshSdFiles()
                     refreshSdStatus(connected, SystemClock.elapsedRealtime() + 2500L)
-                }.onFailure { err ->
-                    Toast.makeText(this, "업로드 실패: ${err.message ?: "연결 확인"}", Toast.LENGTH_LONG).show()
+                } else {
+                    Toast.makeText(this, "업로드 실패: ${lastError ?: "연결 확인"}", Toast.LENGTH_LONG).show()
                 }
             }
         }, "sd-cloud-upload").start()
@@ -1615,5 +1947,6 @@ class MainActivity : Activity() {
 
     companion object {
         private const val REQ_PICK_UPLOAD_FILE = 41
+        private const val REQ_PICK_OTA_FILE = 42
     }
 }
