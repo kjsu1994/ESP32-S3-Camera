@@ -24,14 +24,14 @@ import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 
 internal enum class NetToolSubTab(val label: String) {
-    SCAN("탐색 · 포트"),
-    MONITOR("수신 모니터"),
-    CONSOLE("제어 콘솔")
+    SCAN("1. 자동 탐색"),
+    MONITOR("2. 실시간 모니터"),
+    CONSOLE("3. 제어 콘솔")
 }
 
 private enum class PortPreset(val label: String) {
-    CONTROL("주요 제어 (29)"),
-    WELL_KNOWN("1 ~ 1024"),
+    CONTROL("주요 36개"),
+    WELL_KNOWN("1~1024"),
     CUSTOM("직접 범위")
 }
 
@@ -47,9 +47,25 @@ private enum class LineEnding(val label: String, val suffix: String) {
     CRLF("\\r\\n", "\r\n")
 }
 
+private data class LiveUdpChannel(
+    val localPort: Int,
+    val sourceIp: String,
+    val sourcePort: Int,
+    var count: Int = 0,
+    var bytes: Long = 0L,
+    var lastSeenMs: Long = 0L
+) {
+    val key: String get() = "UDP:$localPort:$sourceIp"
+}
+
 /**
- * Self-contained Hardware Network & Port Diagnostics view (Tab 4: 도구).
- * Works independently of DockyCam board connection (supports Wi-Fi and USB-C Ethernet direct-connect).
+ * Water-flow Hardware Network & Port Diagnostics tab (Tab 4: 도구).
+ *
+ * Designed so users do NOT need to know ports beforehand:
+ * 1) Tap "주변 장비 자동 탐색" -> tap any discovered device -> ports auto-scan immediately with active-stream detection.
+ * 2) Switch to "실시간 모니터" (or tap any open port) -> discovered TCP ports AND dynamically captured UDP broadcast ports
+ *    appear as live clickable chips; tapping any chip immediately streams its live HEX/TEXT data.
+ * 3) Tap "제어 콘솔" -> IP/port/protocol auto-filled & connected for 1-tap command testing.
  */
 internal class NetToolsView(
     private val context: Context,
@@ -63,16 +79,20 @@ internal class NetToolsView(
     private val renderSubTab: (NetToolSubTab) -> Unit
     private var activeSubTab = NetToolSubTab.SCAN
 
+    // Shared selected device state across all 3 sub-tabs
+    private var selectedDeviceIp: String = ""
+    private var localNet: LocalNetInfo? = null
+
     // Network Header Card
     private val netBadge: TextView
     private val netIpText: TextView
     private val netSubText: TextView
-    private var localNet: LocalNetInfo? = null
 
-    // Sub-Tab 1: Host Discovery & Port Scanner
+    // Sub-Tab 1: Auto Discovery + Auto Port Scan
     private val hostScanBtn: Button
     private val hostProgressText: TextView
     private val hostListContainer: LinearLayout
+    private val selectedDeviceBanner: TextView
     private val targetIpField: EditText
     private val customRangeRow: LinearLayout
     private val startPortField: EditText
@@ -86,18 +106,23 @@ internal class NetToolsView(
     private val discoveredHosts = ArrayList<DiscoveredHost>()
     private val openPorts = ArrayList<OpenPortResult>()
 
-    // Sub-Tab 2: Passive Packet Monitor
-    private val listener = PacketListener()
-    private var monitorUdp = true
+    // Sub-Tab 2: Live Dynamic Monitor (Discovered TCP Tap + Multi-Port Auto UDP Sniffer)
+    private val udpSniffer = MultiPortUdpSniffer()
+    private val tcpTapClient = DeviceConsoleClient()
+    private var activeTcpTapPort: Int? = null
+    private var selectedUdpFilterKey: String? = null // null = show all UDP when not in TCP tap
     private var monitorFormat = PayloadFormat.BOTH
-    private val monitorPortField: EditText
-    private val monitorToggleBtn: Button
+    private val autoUdpToggleBtn: Button
+    private val extraUdpPortField: EditText
+    private val dynamicChipContainer: LinearLayout
+    private val dynamicEmptyHint: TextView
+    private val monitorProbeBtn: TextView
+    private val monitorToConsoleBtn: TextView
     private val monitorStatsText: TextView
-    private val monitorSenderRow: LinearLayout
     private val monitorLogView: TextView
-    private val monitorLogLines = ArrayDeque<String>()
-    private val monitorSenders = LinkedHashMap<String, Int>()
-    private var monitorPacketCount = 0
+    private val liveUdpChannels = LinkedHashMap<String, LiveUdpChannel>()
+    private val monitorAllEvents = ArrayDeque<Pair<String, String>>() // (channelKey, formattedLine)
+    private var monitorEventCount = 0
     private var monitorTotalBytes = 0L
 
     // Sub-Tab 3: Interactive Control Console
@@ -125,10 +150,10 @@ internal class NetToolsView(
 
         // --- Compact Local Network Info Card ---
         netBadge = UiStyle.badge(context, "확인 중", UiStyle.SURFACE_ALT, UiStyle.MUTED)
-        netIpText = UiStyle.label(context, "네트워크 확인 중...", 14.5f, UiStyle.INK, bold = true).apply {
+        netIpText = UiStyle.label(context, "네트워크 확인 중...", 14f, UiStyle.INK, bold = true).apply {
             typeface = Typeface.MONOSPACE
         }
-        netSubText = UiStyle.label(context, "Wi-Fi 또는 USB-C 랜 어댑터 직결 자동 감지", 12f, UiStyle.MUTED)
+        netSubText = UiStyle.label(context, "Wi-Fi 또는 USB-C 랜 직결 자동 감지", 11.5f, UiStyle.MUTED)
         val refreshNetBtn = UiStyle.iconCircleButton(
             context, R.drawable.ic_refresh, "네트워크 새로고침", UiStyle.SURFACE_ALT, UiStyle.ACCENT, 36
         ) { refreshNetworkInfo() }
@@ -147,7 +172,7 @@ internal class NetToolsView(
         }
         wrapper.addView(netCard)
 
-        // --- 3-Mode Sub-Tab Switcher ---
+        // --- 3-Step Flow Sub-Tab Bar ---
         val (subStrip, subRenderer) = UiStyle.segmentedChips(
             context,
             NetToolSubTab.entries.map { it to it.label },
@@ -159,20 +184,36 @@ internal class NetToolsView(
         val panelHost = FrameLayout(context)
 
         // ============================================================
-        // SUB-TAB 1: 탐색 · 포트 (Subnet Host Discovery + Port Scanner)
+        // SUB-TAB 1: 1. 자동 탐색 (Host Discovery -> Instant Auto Port Scan)
         // ============================================================
         val scanPanel = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
 
-        // Host Discovery Card
         val hostCard = UiStyle.card(context, 14)
-        hostCard.addView(UiStyle.label(context, "1. 연결된 장비 IP 자동 탐색", 15f, UiStyle.INK, bold = true))
+        val useBoardChip = UiStyle.compactChipButton(
+            context, "현재 보드 분석", UiStyle.ACCENT_SOFT, UiStyle.ACCENT, UiStyle.BORDER
+        ) {
+            val bip = getConnectedBoardIp()
+            if (!bip.isNullOrEmpty()) {
+                selectDeviceAndAutoScan(bip)
+            } else {
+                Toast.makeText(context, "연결된 DockyCam 보드가 없습니다", Toast.LENGTH_SHORT).show()
+            }
+        }
+        hostCard.addView(LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(UiStyle.label(context, "주변 장비 자동 탐색", 15f, UiStyle.INK, bold = true),
+                LinearLayout.LayoutParams(0, -2, 1f))
+            addView(useBoardChip)
+        })
         hostCard.addView(UiStyle.label(
             context,
-            "같은 Wi-Fi나 유선 직결 대역(.1~.254)에서 응답하는 PC·장비를 찾습니다. 찾은 IP를 탭하면 아래 포트 스캐너에 자동 입력됩니다.",
+            "장비를 찾은 뒤 IP를 탭하면 열린 포트와 데이터 전송 상태를 자동으로 분석합니다.",
             12f,
             UiStyle.SECONDARY
         ).apply { setPadding(0, UiStyle.dp(context, 4), 0, UiStyle.dp(context, 10)) })
-        hostScanBtn = UiStyle.primaryButton(context, "주변 장비 IP 탐색") { toggleHostScan() }
+
+        hostScanBtn = UiStyle.primaryButton(context, "주변 장비 자동 탐색 시작") { toggleHostScan() }
         hostCard.addView(hostScanBtn, LinearLayout.LayoutParams(-1, -2))
         hostProgressText = UiStyle.label(context, "", 12f, UiStyle.CYAN).apply {
             typeface = Typeface.MONOSPACE
@@ -184,27 +225,21 @@ internal class NetToolsView(
         hostCard.addView(hostListContainer, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 8) })
         scanPanel.addView(hostCard, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 12) })
 
-        // Port Scanner Card
+        // Selected Device & Auto Port Result Card
         val portCard = UiStyle.card(context, 14)
-        val useBoardChip = UiStyle.compactChipButton(
-            context, "보드 IP", UiStyle.ACCENT_SOFT, UiStyle.ACCENT, UiStyle.BORDER
-        ) {
-            val bip = getConnectedBoardIp()
-            if (!bip.isNullOrEmpty()) {
-                targetIpField.setText(bip)
-            } else {
-                Toast.makeText(context, "연결된 DockyCam 보드가 없습니다", Toast.LENGTH_SHORT).show()
-            }
+        selectedDeviceBanner = UiStyle.label(context, "선택된 장비 없음 · 위에서 장비를 탭하거나 IP 입력", 13f, UiStyle.ACCENT, bold = true).apply {
+            typeface = Typeface.MONOSPACE
         }
+        portCard.addView(selectedDeviceBanner)
+
+        targetIpField = styledInput("대상 IP 직접 입력 (예: 192.168.0.50)", "", numeric = false)
+        portScanBtn = UiStyle.secondaryButton(context, "재스캔") { togglePortScan() }
         portCard.addView(LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            addView(UiStyle.label(context, "2. 열린 포트 · 프로토콜 스캔", 15f, UiStyle.INK, bold = true),
-                LinearLayout.LayoutParams(0, -2, 1f))
-            addView(useBoardChip)
-        })
-        targetIpField = styledInput("대상 장비 IP (예: 192.168.0.50)", "", numeric = false)
-        portCard.addView(targetIpField, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 10) })
+            addView(targetIpField, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = UiStyle.dp(context, 8) })
+            addView(portScanBtn, LinearLayout.LayoutParams(-2, -2))
+        }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 8) })
 
         val (presetChips, _) = UiStyle.segmentedChips(
             context,
@@ -213,6 +248,9 @@ internal class NetToolsView(
         ) { preset ->
             selectedPreset = preset
             customRangeRow.visibility = if (preset == PortPreset.CUSTOM) View.VISIBLE else View.GONE
+            if (preset != PortPreset.CUSTOM && isValidIpv4(targetIpField.text.toString().trim())) {
+                startPortScanFor(targetIpField.text.toString().trim())
+            }
         }
         portCard.addView(presetChips, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 8) })
 
@@ -228,9 +266,6 @@ internal class NetToolsView(
         }
         portCard.addView(customRangeRow, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 8) })
 
-        portScanBtn = UiStyle.primaryButton(context, "열린 포트 스캔 시작") { togglePortScan() }
-        portCard.addView(portScanBtn, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 10) })
-
         portProgressText = UiStyle.label(context, "", 12f, UiStyle.CYAN).apply {
             typeface = Typeface.MONOSPACE
             visibility = View.GONE
@@ -242,87 +277,102 @@ internal class NetToolsView(
         scanPanel.addView(portCard, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 12) })
 
         // ============================================================
-        // SUB-TAB 2: 수신 모니터 (Passive UDP / TCP Port Listener)
+        // SUB-TAB 2: 2. 실시간 모니터 (Dynamic Active Ports + Live Data Tap)
         // ============================================================
         val monitorPanel = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
-        val monCard = UiStyle.card(context, 14)
-        monCard.addView(UiStyle.label(context, "실시간 패킷 수신 모니터", 15f, UiStyle.INK, bold = true))
-        monCard.addView(UiStyle.label(
+
+        // Card A: Dynamic Port Chips (Discovered TCP Ports + Auto-Captured UDP Ports)
+        val livePortCard = UiStyle.card(context, 14)
+        livePortCard.addView(UiStyle.label(context, "감지된 · 열려있는 포트 (탭하여 실시간 데이터 보기)", 14.5f, UiStyle.INK, bold = true))
+        livePortCard.addView(UiStyle.label(
             context,
-            "장비가 브로드캐스트하거나 특정 포트로 전송 중인 데이터를 실시간 포착해 송신 IP·포트·HEX/텍스트를 확인합니다.",
+            "탐색에서 찾은 TCP 포트와 아래 자동 UDP 감지로 포착된 전송 포트가 실시간으로 표시됩니다.",
             12f,
             UiStyle.SECONDARY
-        ).apply { setPadding(0, UiStyle.dp(context, 4), 0, UiStyle.dp(context, 10)) })
+        ).apply { setPadding(0, UiStyle.dp(context, 3), 0, UiStyle.dp(context, 10)) })
 
-        val (monProtoChips, _) = UiStyle.segmentedChips(
+        dynamicEmptyHint = UiStyle.label(
             context,
-            listOf(true to "UDP 수신 (브로드캐스트)", false to "TCP 서버 수신"),
-            monitorUdp
-        ) { monitorUdp = it }
-        monCard.addView(monProtoChips, LinearLayout.LayoutParams(-1, -2))
-
-        monitorPortField = styledInput("수신 포트 (1~65535)", "5000", numeric = true)
-        monCard.addView(monitorPortField, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 8) })
-
-        val quickPortBar = LinearLayout(context).apply {
-            orientation = LinearLayout.HORIZONTAL
-            val gap = UiStyle.dp(context, 6)
-            listOf(5000, 8080, 8888, 9000, 1900).forEach { p ->
-                addView(
-                    UiStyle.compactChipButton(context, ":$p", UiStyle.BG, UiStyle.SECONDARY, UiStyle.BORDER) {
-                        monitorPortField.setText(p.toString())
-                    },
-                    LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap }
-                )
-            }
+            "아직 감지된 포트가 없습니다. [1. 자동 탐색]에서 장비를 선택하거나 아래 [자동 UDP 감지 시작]을 눌러보세요.",
+            12f,
+            UiStyle.MUTED
+        ).apply {
+            background = UiStyle.rounded(context, UiStyle.BG, 10, UiStyle.BORDER)
+            val p = UiStyle.dp(context, 10)
+            setPadding(p, p, p, p)
         }
-        monCard.addView(
-            HorizontalScrollView(context).apply {
-                isHorizontalScrollBarEnabled = false
-                addView(quickPortBar)
-            },
-            LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 6) }
-        )
+        livePortCard.addView(dynamicEmptyHint)
 
+        dynamicChipContainer = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
+        livePortCard.addView(dynamicChipContainer)
+
+        // Auto Multi-Port UDP Sniffer Controls
+        autoUdpToggleBtn = UiStyle.primaryButton(context, "자동 UDP 전송 포트 감지 시작 (14개 포트 동시)") {
+            toggleAutoUdpSniffer()
+        }
+        livePortCard.addView(autoUdpToggleBtn, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 10) })
+
+        extraUdpPortField = styledInput("추가 감시할 UDP 포트 (선택)", "", numeric = true)
+        val addUdpPortBtn = UiStyle.secondaryButton(context, "+ 포트 추가") { addCustomUdpPort() }
+        livePortCard.addView(LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(extraUdpPortField, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = UiStyle.dp(context, 8) })
+            addView(addUdpPortBtn, LinearLayout.LayoutParams(-2, -2))
+        }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 8) })
+
+        monitorPanel.addView(livePortCard, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 12) })
+
+        // Card B: Live Data Stream Viewer
+        val streamCard = UiStyle.card(context, 14)
         val (monFmtChips, _) = UiStyle.segmentedChips(
             context,
             PayloadFormat.entries.map { it to it.label },
             monitorFormat
         ) { monitorFormat = it }
-        monCard.addView(monFmtChips, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 8) })
+        streamCard.addView(monFmtChips, LinearLayout.LayoutParams(-1, -2))
 
-        monitorToggleBtn = UiStyle.primaryButton(context, "수신 시작") { toggleMonitor() }
-        val monClearBtn = UiStyle.secondaryButton(context, "지우기") { clearMonitorLog() }
-        val monCopyBtn = UiStyle.secondaryButton(context, "복사") { copyText(monitorLogLines.joinToString("\n")) }
-        monCard.addView(LinearLayout(context).apply {
-            orientation = LinearLayout.HORIZONTAL
-            val gap = UiStyle.dp(context, 6)
-            addView(monitorToggleBtn, LinearLayout.LayoutParams(0, -2, 1.4f).apply { marginEnd = gap })
-            addView(monClearBtn, LinearLayout.LayoutParams(0, -2, 0.7f).apply { marginEnd = gap })
-            addView(monCopyBtn, LinearLayout.LayoutParams(0, -2, 0.7f))
-        }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 10) })
-
-        monitorStatsText = UiStyle.label(context, "대기 중 · 수신 시작을 누르면 패킷을 기록합니다", 11.5f, UiStyle.MUTED).apply {
+        monitorStatsText = UiStyle.label(context, "대기 중 · 위에서 포트를 탭하면 실시간 데이터가 표시됩니다", 12f, UiStyle.CYAN).apply {
             typeface = Typeface.MONOSPACE
-            setPadding(0, UiStyle.dp(context, 10), 0, UiStyle.dp(context, 6))
+            setPadding(0, UiStyle.dp(context, 10), 0, UiStyle.dp(context, 8))
         }
-        monCard.addView(monitorStatsText)
+        streamCard.addView(monitorStatsText)
 
-        monitorSenderRow = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
-        monCard.addView(
+        monitorProbeBtn = UiStyle.compactChipButton(
+            context, "프로브 전송", UiStyle.AMBER_SOFT, UiStyle.AMBER, 0xff594218.toInt()
+        ) { sendQuickProbeOnTcpTap() }.apply { visibility = View.GONE }
+        monitorToConsoleBtn = UiStyle.compactChipButton(
+            context, "제어 콘솔 ▶", UiStyle.ACCENT_SOFT, UiStyle.ACCENT, UiStyle.BORDER
+        ) { jumpCurrentMonitorToConsole() }.apply { visibility = View.GONE }
+        val monClearBtn = UiStyle.compactChipButton(context, "지우기", UiStyle.SURFACE_ALT, UiStyle.SECONDARY, UiStyle.BORDER) {
+            clearMonitorLog()
+        }
+        val monCopyBtn = UiStyle.compactChipButton(context, "복사", UiStyle.SURFACE_ALT, UiStyle.INK, UiStyle.BORDER) {
+            copyText(monitorLogView.text.toString())
+        }
+        val monActionRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            val gap = UiStyle.dp(context, 6)
+            addView(monitorProbeBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
+            addView(monitorToConsoleBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
+            addView(monClearBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
+            addView(monCopyBtn)
+        }
+        streamCard.addView(
             HorizontalScrollView(context).apply {
                 isHorizontalScrollBarEnabled = false
-                addView(monitorSenderRow)
+                addView(monActionRow)
             },
-            LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = UiStyle.dp(context, 6) }
+            LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = UiStyle.dp(context, 8) }
         )
 
-        monitorLogView = buildTerminalTextView("아직 수신된 패킷이 없습니다.")
-        monCard.addView(monitorLogView, LinearLayout.LayoutParams(-1, -2))
-        monitorPanel.addView(monCard, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 12) })
+        monitorLogView = buildTerminalTextView("감지된 포트를 선택하거나 자동 UDP 감지를 시작하면\n전송 중인 데이터가 실시간으로 표시됩니다.")
+        streamCard.addView(monitorLogView, LinearLayout.LayoutParams(-1, -2))
+        monitorPanel.addView(streamCard, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 12) })
 
         // ============================================================
-        // SUB-TAB 3: 제어 콘솔 (Interactive TCP / UDP Console)
+        // SUB-TAB 3: 3. 제어 콘솔 (Interactive TCP / UDP Command Tester)
         // ============================================================
         val consolePanel = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
         val conCard = UiStyle.card(context, 14)
@@ -373,17 +423,48 @@ internal class NetToolsView(
         consoleLogView = buildTerminalTextView("연결 후 명령어를 보내면 송수신 로그가 여기에 표시됩니다.")
         conCard.addView(consoleLogView, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 10) })
 
-        // Command composer
+        // 1-tap quick test command chips
+        val quickCmdBar = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            val gap = UiStyle.dp(context, 6)
+            listOf(
+                "GET /" to ("GET / HTTP/1.0\r\n\r\n" to false),
+                "PING" to ("PING" to false),
+                "STATUS" to ("STATUS" to false),
+                "AT" to ("AT" to false),
+                "HEX 01 03" to ("01 03 00 00 00 02 C4 0B" to true)
+            ).forEach { (label, pair) ->
+                addView(
+                    UiStyle.compactChipButton(context, label, UiStyle.BG, UiStyle.SECONDARY, UiStyle.BORDER) {
+                        consoleInputField.setText(pair.first)
+                        if (pair.second != consoleHexTx) {
+                            consoleHexTx = pair.second
+                            consoleEndingRow.visibility = if (consoleHexTx) View.GONE else View.VISIBLE
+                        }
+                        if (consoleClient.isConnected()) sendConsoleCommand()
+                    },
+                    LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap }
+                )
+            }
+        }
+        conCard.addView(
+            HorizontalScrollView(context).apply {
+                isHorizontalScrollBarEnabled = false
+                addView(quickCmdBar)
+            },
+            LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 8) }
+        )
+
         val (txModeChips, _) = UiStyle.segmentedChips(
             context,
-            listOf(false to "TEXT 전송", true to "HEX 바이트 전송"),
+            listOf(false to "TEXT 전송", true to "HEX 바이트"),
             consoleHexTx
         ) { hex ->
             consoleHexTx = hex
             consoleInputField.hint = if (hex) "HEX 바이트 (예: AA 55 01 00 FF)" else "전송할 명령어 입력"
             consoleEndingRow.visibility = if (hex) View.GONE else View.VISIBLE
         }
-        conCard.addView(txModeChips, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 10) })
+        conCard.addView(txModeChips, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 8) })
 
         val (endingChips, _) = UiStyle.segmentedChips(
             context,
@@ -428,6 +509,9 @@ internal class NetToolsView(
         subPanels.forEach { (key, view) ->
             view.visibility = if (key == tab) View.VISIBLE else View.GONE
         }
+        if (tab == NetToolSubTab.MONITOR) {
+            renderDynamicMonitorChips()
+        }
     }
 
     fun refreshNetworkInfo() {
@@ -446,7 +530,7 @@ internal class NetToolsView(
                     netBadge.background = UiStyle.rounded(context, UiStyle.ACCENT_SOFT, 99)
                     netBadge.setTextColor(UiStyle.ACCENT)
                     netIpText.text = "내 IP: ${info.ip}"
-                    netSubText.text = "인터페이스 ${info.ifaceName} · 대역 ${info.subnetPrefix}.0/24"
+                    netSubText.text = "${info.ifaceName} · 대역 ${info.subnetPrefix}.0/24"
                     if (targetIpField.text.isEmpty()) {
                         val fallbackIp = getConnectedBoardIp() ?: "${info.subnetPrefix}.1"
                         targetIpField.setText(fallbackIp)
@@ -459,16 +543,21 @@ internal class NetToolsView(
     fun stopAll() {
         hostScanCancel?.set(true)
         portScanCancel?.set(true)
-        listener.stop()
+        udpSniffer.stop()
+        tcpTapClient.disconnect()
         consoleClient.disconnect()
     }
+
+    // =========================================================================
+    // Flow Step 1: Host Discovery -> Tap Device -> Auto Port Scan Immediately
+    // =========================================================================
 
     private fun toggleHostScan() {
         val activeCancel = hostScanCancel
         if (activeCancel != null) {
             activeCancel.set(true)
             hostScanCancel = null
-            hostScanBtn.text = "주변 장비 IP 탐색"
+            hostScanBtn.text = "주변 장비 자동 탐색 시작"
             return
         }
         val info = localNet ?: NetLabEngine.detectLocalNetwork()?.also { localNet = it }
@@ -482,7 +571,7 @@ internal class NetToolsView(
         hostListContainer.removeAllViews()
         hostScanBtn.text = "탐색 중지"
         hostProgressText.visibility = View.VISIBLE
-        hostProgressText.text = "${info.subnetPrefix}.1 ~ .254 탐색 중..."
+        hostProgressText.text = "${info.subnetPrefix}.1 ~ .254 + SSDP 탐색 중..."
 
         Thread({
             NetLabEngine.scanSubnet(
@@ -507,25 +596,40 @@ internal class NetToolsView(
             handler.post {
                 if (hostScanCancel === cancel) {
                     hostScanCancel = null
-                    hostScanBtn.text = "주변 장비 IP 탐색"
+                    hostScanBtn.text = "주변 장비 자동 탐색 시작"
                     hostProgressText.text = if (cancel.get()) {
                         "탐색 중지됨 · ${discoveredHosts.size}대 발견"
                     } else {
-                        "탐색 완료 · 총 ${discoveredHosts.size}대 발견 (탭하여 포트 스캔)"
+                        "탐색 완료 · ${discoveredHosts.size}대 발견 — 장비를 탭하면 포트가 자동 분석됩니다"
                     }
                 }
             }
         }, "netlab-host-scan").start()
     }
 
+    private fun selectDeviceAndAutoScan(ip: String) {
+        selectedDeviceIp = ip
+        targetIpField.setText(ip)
+        consoleIpField.setText(ip)
+        selectedDeviceBanner.text = "선택된 장비: $ip"
+        renderDiscoveredHosts()
+        startPortScanFor(ip)
+    }
+
     private fun renderDiscoveredHosts() {
         hostListContainer.removeAllViews()
         discoveredHosts.forEach { host ->
+            val isSelected = host.ip == selectedDeviceIp
             val row = LinearLayout(context).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
                 isClickable = true
-                background = UiStyle.rippleRounded(context, UiStyle.BG, 12, UiStyle.BORDER)
+                background = UiStyle.rippleRounded(
+                    context,
+                    if (isSelected) UiStyle.ACCENT_SOFT else UiStyle.BG,
+                    12,
+                    if (isSelected) UiStyle.ACCENT else UiStyle.BORDER
+                )
                 setPadding(UiStyle.dp(context, 12), UiStyle.dp(context, 9), UiStyle.dp(context, 10), UiStyle.dp(context, 9))
 
                 val col = LinearLayout(context).apply {
@@ -544,7 +648,7 @@ internal class NetToolsView(
                         }
                     })
                     val portHint = if (host.quickPorts.isNotEmpty()) {
-                        "열린 포트: ${host.quickPorts.joinToString(", ") { ":$it" }} · ${host.rttMs}ms"
+                        "감지 포트: ${host.quickPorts.joinToString(", ") { ":$it" }} · ${host.rttMs}ms"
                     } else {
                         "응답 확인 · ${host.rttMs}ms"
                     }
@@ -554,12 +658,15 @@ internal class NetToolsView(
                     })
                 }
                 addView(col, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = UiStyle.dp(context, 8) })
-                addView(UiStyle.badge(context, "선택", UiStyle.ACCENT_SOFT, UiStyle.ACCENT))
-                setOnClickListener {
-                    targetIpField.setText(host.ip)
-                    consoleIpField.setText(host.ip)
-                    Toast.makeText(context, "${host.ip} 선택됨 — 아래 '열린 포트 스캔 시작'을 누르세요", Toast.LENGTH_SHORT).show()
-                }
+                addView(
+                    UiStyle.badge(
+                        context,
+                        if (isSelected) "분석 중" else "포트 분석 ▶",
+                        if (isSelected) UiStyle.ACCENT else UiStyle.SURFACE_ALT,
+                        if (isSelected) UiStyle.ON_ACCENT else UiStyle.ACCENT
+                    )
+                )
+                setOnClickListener { selectDeviceAndAutoScan(host.ip) }
             }
             hostListContainer.addView(row, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = UiStyle.dp(context, 6) })
         }
@@ -570,7 +677,7 @@ internal class NetToolsView(
         if (activeCancel != null) {
             activeCancel.set(true)
             portScanCancel = null
-            portScanBtn.text = "열린 포트 스캔 시작"
+            portScanBtn.text = "재스캔"
             return
         }
         val ip = targetIpField.text.toString().trim()
@@ -578,6 +685,13 @@ internal class NetToolsView(
             Toast.makeText(context, "올바른 IPv4 주소를 입력하세요 (예: 192.168.0.50)", Toast.LENGTH_SHORT).show()
             return
         }
+        selectedDeviceIp = ip
+        selectedDeviceBanner.text = "선택된 장비: $ip"
+        startPortScanFor(ip)
+    }
+
+    private fun startPortScanFor(ip: String) {
+        portScanCancel?.set(true)
         val ports: IntArray = when (selectedPreset) {
             PortPreset.CONTROL -> PortRegistry.CONTROL_PRESET
             PortPreset.WELL_KNOWN -> IntArray(1024) { it + 1 }
@@ -600,42 +714,46 @@ internal class NetToolsView(
         portScanCancel = cancel
         openPorts.clear()
         portResultContainer.removeAllViews()
-        portScanBtn.text = "스캔 중지"
+        portScanBtn.text = "중지"
         portProgressText.visibility = View.VISIBLE
-        portProgressText.text = "$ip · ${ports.size}개 포트 스캔 중..."
+        portProgressText.text = "$ip · ${ports.size}개 포트 자동 분석 중..."
 
         Thread({
             NetLabEngine.scanPorts(
                 ip = ip,
                 ports = ports,
-                timeoutMs = if (ports.size > 200) 150 else 240,
+                timeoutMs = if (ports.size > 200) 150 else 250,
                 cancelled = cancel,
                 onProgress = { done, total ->
                     handler.post {
                         if (portScanCancel !== cancel) return@post
-                        portProgressText.text = "$ip 스캔 중 · $done / $total · 열린 포트 ${openPorts.size}개"
+                        portProgressText.text = "$ip 분석 중 · $done / $total · 열린 포트 ${openPorts.size}개"
                     }
                 },
                 onOpenPort = { res ->
                     handler.post {
                         if (portScanCancel !== cancel) return@post
                         openPorts.add(res)
-                        openPorts.sortBy { it.port }
+                        openPorts.sortWith(compareByDescending<OpenPortResult> { it.activelySending }.thenBy { it.port })
                         renderOpenPorts(ip)
+                        renderDynamicMonitorChips()
                     }
                 }
             )
             handler.post {
                 if (portScanCancel === cancel) {
                     portScanCancel = null
-                    portScanBtn.text = "열린 포트 스캔 시작"
+                    portScanBtn.text = "재스캔"
                     portProgressText.text = if (cancel.get()) {
-                        "스캔 중지됨 · 열린 포트 ${openPorts.size}개"
+                        "분석 중지됨 · 열린 포트 ${openPorts.size}개"
                     } else if (openPorts.isEmpty()) {
-                        "스캔 완료 · 열린 TCP 포트가 없습니다 (방화벽/UDP 전용일 수 있음)"
+                        "열린 TCP 포트 없음 · [2. 실시간 모니터]에서 자동 UDP 감지를 시도해 보세요"
                     } else {
-                        "스캔 완료 · 열린 포트 ${openPorts.size}개 (탭하면 제어 콘솔로 이동)"
+                        val activeCnt = openPorts.count { it.activelySending }
+                        val activeStr = if (activeCnt > 0) " (데이터 전송 중 ${activeCnt}개)" else ""
+                        "분석 완료 · 열린 포트 ${openPorts.size}개$activeStr — 탭하면 즉시 데이터 확인"
                     }
+                    renderDynamicMonitorChips()
                 }
             }
         }, "netlab-port-scan").start()
@@ -645,128 +763,420 @@ internal class NetToolsView(
         portResultContainer.removeAllViews()
         openPorts.forEach { res ->
             val card = LinearLayout(context).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
+                orientation = LinearLayout.VERTICAL
                 isClickable = true
-                background = UiStyle.rippleRounded(context, UiStyle.BG, 12, UiStyle.BORDER)
-                setPadding(UiStyle.dp(context, 12), UiStyle.dp(context, 10), UiStyle.dp(context, 10), UiStyle.dp(context, 10))
+                background = UiStyle.rippleRounded(
+                    context,
+                    UiStyle.BG,
+                    12,
+                    if (res.activelySending) UiStyle.ACCENT else UiStyle.BORDER
+                )
+                setPadding(UiStyle.dp(context, 12), UiStyle.dp(context, 10), UiStyle.dp(context, 12), UiStyle.dp(context, 10))
 
-                addView(UiStyle.badge(context, ":${res.port}", UiStyle.ACCENT_SOFT, UiStyle.ACCENT).apply {
-                    typeface = Typeface.MONOSPACE
-                }, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = UiStyle.dp(context, 10) })
-
-                val col = LinearLayout(context).apply {
-                    orientation = LinearLayout.VERTICAL
-                    addView(UiStyle.label(context, "${res.serviceName}  ·  ${res.rttMs}ms", 13.5f, UiStyle.INK, bold = true))
-                    if (res.banner.isNotEmpty()) {
-                        addView(UiStyle.label(context, res.banner, 11.5f, UiStyle.CYAN).apply {
+                // Top row: port badge + protocol + active badge + RTT
+                addView(LinearLayout(context).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    addView(UiStyle.badge(context, ":${res.port}", UiStyle.ACCENT_SOFT, UiStyle.ACCENT).apply {
+                        typeface = Typeface.MONOSPACE
+                    }, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = UiStyle.dp(context, 8) })
+                    addView(UiStyle.label(context, res.serviceName, 13.5f, UiStyle.INK, bold = true),
+                        LinearLayout.LayoutParams(0, -2, 1f))
+                    if (res.activelySending) {
+                        addView(UiStyle.badge(context, "● 데이터 전송 중", UiStyle.ACCENT, UiStyle.ON_ACCENT))
+                    } else {
+                        addView(UiStyle.label(context, "${res.rttMs}ms", 11.5f, UiStyle.MUTED).apply {
                             typeface = Typeface.MONOSPACE
-                            maxLines = 2
-                            ellipsize = TextUtils.TruncateAt.END
-                            setPadding(0, UiStyle.dp(context, 2), 0, 0)
                         })
                     }
-                }
-                addView(col, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = UiStyle.dp(context, 8) })
-                addView(UiStyle.compactChipButton(context, "콘솔 ▶", UiStyle.SURFACE_ALT, UiStyle.ACCENT, UiStyle.BORDER) {
-                    openInConsole(tcp = true, ip = ip, port = res.port)
                 })
-                setOnClickListener { openInConsole(tcp = true, ip = ip, port = res.port) }
+
+                if (res.banner.isNotEmpty()) {
+                    addView(UiStyle.label(context, res.banner, 11.5f, UiStyle.CYAN).apply {
+                        typeface = Typeface.MONOSPACE
+                        maxLines = 2
+                        ellipsize = TextUtils.TruncateAt.END
+                        setPadding(0, UiStyle.dp(context, 5), 0, 0)
+                    })
+                }
+
+                // Direct 1-tap handoff actions
+                addView(LinearLayout(context).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.END
+                    setPadding(0, UiStyle.dp(context, 8), 0, 0)
+                    val gap = UiStyle.dp(context, 6)
+                    addView(UiStyle.compactChipButton(
+                        context, "실시간 데이터 보기 ▶", UiStyle.ACCENT_SOFT, UiStyle.ACCENT, UiStyle.ACCENT
+                    ) { openPortInLiveMonitor(ip, res.port) }, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
+                    addView(UiStyle.compactChipButton(
+                        context, "제어 콘솔 ▶", UiStyle.SURFACE_ALT, UiStyle.INK, UiStyle.BORDER
+                    ) { openInConsole(tcp = true, ip = ip, port = res.port, autoConnect = true) })
+                })
+
+                setOnClickListener { openPortInLiveMonitor(ip, res.port) }
             }
             portResultContainer.addView(card, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = UiStyle.dp(context, 6) })
         }
     }
 
-    private fun openInConsole(tcp: Boolean, ip: String, port: Int) {
+    // =========================================================================
+    // Flow Step 2: Live Dynamic Monitor (Discovered TCP Tap + Multi-Port UDP)
+    // =========================================================================
+
+    private fun openPortInLiveMonitor(ip: String, port: Int) {
+        selectedDeviceIp = ip
+        selectSubTab(NetToolSubTab.MONITOR)
+        startTcpLiveTap(ip, port)
+        root.smoothScrollTo(0, 0)
+    }
+
+    private fun renderDynamicMonitorChips() {
+        dynamicChipContainer.removeAllViews()
+        val hasTcp = selectedDeviceIp.isNotEmpty() && openPorts.isNotEmpty()
+        val hasUdp = liveUdpChannels.isNotEmpty()
+        dynamicEmptyHint.visibility = if (hasTcp || hasUdp) View.GONE else View.VISIBLE
+
+        if (hasTcp) {
+            dynamicChipContainer.addView(
+                UiStyle.label(context, "선택 장비($selectedDeviceIp) 열린 TCP 포트 — 탭하여 실시간 감시", 11.5f, UiStyle.MUTED, bold = true)
+                    .apply { setPadding(0, 0, 0, UiStyle.dp(context, 6)) }
+            )
+            val tcpRow = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
+            val gap = UiStyle.dp(context, 6)
+            openPorts.forEach { p ->
+                val active = (activeTcpTapPort == p.port && tcpTapClient.isConnected())
+                val dot = if (p.activelySending) "● " else ""
+                val chip = UiStyle.compactChipButton(
+                    context,
+                    "$dot:${p.port} ${p.serviceName}",
+                    if (active) UiStyle.ACCENT else if (p.activelySending) UiStyle.ACCENT_SOFT else UiStyle.BG,
+                    if (active) UiStyle.ON_ACCENT else if (p.activelySending) UiStyle.ACCENT else UiStyle.INK,
+                    if (active || p.activelySending) UiStyle.ACCENT else UiStyle.BORDER
+                ) {
+                    if (active) {
+                        stopTcpLiveTap()
+                    } else {
+                        startTcpLiveTap(selectedDeviceIp, p.port)
+                    }
+                }
+                tcpRow.addView(chip, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
+            }
+            dynamicChipContainer.addView(
+                HorizontalScrollView(context).apply {
+                    isHorizontalScrollBarEnabled = false
+                    addView(tcpRow)
+                },
+                LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = UiStyle.dp(context, 8) }
+            )
+        }
+
+        if (hasUdp) {
+            dynamicChipContainer.addView(
+                UiStyle.label(context, "● 실시간 UDP 전송 감지됨 — 탭하여 해당 스트림만 보기", 11.5f, UiStyle.CYAN, bold = true)
+                    .apply { setPadding(0, UiStyle.dp(context, 2), 0, UiStyle.dp(context, 6)) }
+            )
+            val udpRow = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
+            val gap = UiStyle.dp(context, 6)
+            val allSelected = (activeTcpTapPort == null && selectedUdpFilterKey == null)
+            udpRow.addView(
+                UiStyle.compactChipButton(
+                    context,
+                    "전체 (${liveUdpChannels.size})",
+                    if (allSelected) UiStyle.CYAN else UiStyle.BG,
+                    if (allSelected) UiStyle.ON_ACCENT else UiStyle.CYAN,
+                    UiStyle.CYAN
+                ) {
+                    stopTcpLiveTap()
+                    selectedUdpFilterKey = null
+                    renderDynamicMonitorChips()
+                    refreshMonitorLogDisplay()
+                },
+                LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap }
+            )
+            liveUdpChannels.values.sortedByDescending { it.lastSeenMs }.forEach { ch ->
+                val isSel = (activeTcpTapPort == null && selectedUdpFilterKey == ch.key)
+                val chip = UiStyle.compactChipButton(
+                    context,
+                    "● :${ch.localPort} · ${ch.sourceIp} (${ch.count})",
+                    if (isSel) UiStyle.CYAN else UiStyle.CYAN_SOFT,
+                    if (isSel) UiStyle.ON_ACCENT else UiStyle.CYAN,
+                    if (isSel) UiStyle.CYAN else UiStyle.BORDER
+                ) {
+                    stopTcpLiveTap()
+                    selectedUdpFilterKey = ch.key
+                    monitorToConsoleBtn.visibility = View.VISIBLE
+                    monitorProbeBtn.visibility = View.GONE
+                    monitorStatsText.text = "UDP :${ch.localPort} ← ${ch.sourceIp}:${ch.sourcePort} · ${ch.count}건 (${UiStyle.formatSize(ch.bytes)})"
+                    monitorStatsText.setTextColor(UiStyle.CYAN)
+                    renderDynamicMonitorChips()
+                    refreshMonitorLogDisplay()
+                }
+                udpRow.addView(chip, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
+            }
+            dynamicChipContainer.addView(
+                HorizontalScrollView(context).apply {
+                    isHorizontalScrollBarEnabled = false
+                    addView(udpRow)
+                }
+            )
+        }
+    }
+
+    private fun startTcpLiveTap(ip: String, port: Int) {
+        tcpTapClient.disconnect()
+        activeTcpTapPort = port
+        selectedUdpFilterKey = null
+        monitorProbeBtn.visibility = View.VISIBLE
+        monitorToConsoleBtn.visibility = View.VISIBLE
+        monitorStatsText.text = "TCP $ip:$port 실시간 데이터 연결 중..."
+        monitorStatsText.setTextColor(UiStyle.AMBER)
+        renderDynamicMonitorChips()
+
+        var tapCount = 0
+        var tapBytes = 0L
+        tcpTapClient.connect(
+            tcp = true,
+            host = ip,
+            port = port,
+            onConnected = { msg ->
+                handler.post {
+                    monitorStatsText.text = "● $msg · 실시간 수신 대기 중"
+                    monitorStatsText.setTextColor(UiStyle.ACCENT)
+                    appendMonitorLine("TCP:$port", "[${timeFmt.format(Date())}] $msg (데이터 수신 대기)")
+                    renderDynamicMonitorChips()
+                    if (PortRegistry.isHttpLike(port)) {
+                        // Automatically send a lightweight HTTP probe so HTTP/MJPEG ports immediately show headers
+                        sendQuickProbeOnTcpTap()
+                    }
+                }
+            },
+            onReceive = { data, from ->
+                handler.post {
+                    tapCount++
+                    tapBytes += data.size
+                    monitorStatsText.text = "● TCP $ip:$port · ${tapCount}건 · ${UiStyle.formatSize(tapBytes)}"
+                    monitorStatsText.setTextColor(UiStyle.ACCENT)
+                    val formatted = formatPacketLine(timeFmt.format(Date()), "$from (${data.size}B)", data)
+                    appendMonitorLine("TCP:$port", formatted)
+                }
+            },
+            onDisconnected = { reason ->
+                handler.post {
+                    if (activeTcpTapPort == port) {
+                        monitorStatsText.text = "TCP $ip:$port 종료: $reason (총 ${tapCount}건)"
+                        monitorStatsText.setTextColor(UiStyle.MUTED)
+                        activeTcpTapPort = null
+                        renderDynamicMonitorChips()
+                    }
+                }
+            }
+        )
+    }
+
+    private fun stopTcpLiveTap() {
+        if (activeTcpTapPort != null || tcpTapClient.isConnected()) {
+            activeTcpTapPort = null
+            tcpTapClient.disconnect()
+            monitorProbeBtn.visibility = View.GONE
+            renderDynamicMonitorChips()
+        }
+    }
+
+    private fun sendQuickProbeOnTcpTap() {
+        val port = activeTcpTapPort ?: return
+        if (!tcpTapClient.isConnected()) return
+        val probe = if (PortRegistry.isHttpLike(port)) {
+            "GET / HTTP/1.0\r\nHost: $selectedDeviceIp\r\n\r\n".toByteArray(Charsets.US_ASCII)
+        } else {
+            "\r\n".toByteArray(Charsets.US_ASCII)
+        }
+        tcpTapClient.send(probe) { ok, _ ->
+            if (ok) {
+                handler.post {
+                    val label = if (PortRegistry.isHttpLike(port)) "GET / HTTP/1.0" else "\\r\\n 프로브"
+                    appendMonitorLine("TCP:$port", "[${timeFmt.format(Date())}] TX 프로브 → $label")
+                }
+            }
+        }
+    }
+
+    private fun toggleAutoUdpSniffer() {
+        if (udpSniffer.isRunning()) {
+            udpSniffer.stop()
+            autoUdpToggleBtn.text = "자동 UDP 전송 포트 감지 시작 (14개 포트 동시)"
+            if (activeTcpTapPort == null) {
+                monitorStatsText.text = "자동 UDP 감지 중지됨 · 포착된 채널 ${liveUdpChannels.size}개"
+                monitorStatsText.setTextColor(UiStyle.MUTED)
+            }
+            return
+        }
+        autoUdpToggleBtn.text = "자동 UDP 감지 중지"
+        if (activeTcpTapPort == null) {
+            monitorStatsText.text = "주요 14개 UDP 포트 동시 감시 시작 중..."
+            monitorStatsText.setTextColor(UiStyle.CYAN)
+        }
+        udpSniffer.start(
+            ports = PortRegistry.AUTO_UDP_PORTS,
+            onBound = { bound ->
+                handler.post {
+                    if (activeTcpTapPort == null) {
+                        monitorStatsText.text = "● 자동 감지 중 (${bound.size}개 UDP 포트) · 패킷 수신 시 상단에 자동 표시"
+                        monitorStatsText.setTextColor(UiStyle.ACCENT)
+                    }
+                }
+            },
+            onPacket = { pkt ->
+                handler.post {
+                    monitorEventCount++
+                    monitorTotalBytes += pkt.data.size
+                    val key = "UDP:${pkt.localPort}:${pkt.sourceIp}"
+                    val ch = liveUdpChannels.getOrPut(key) {
+                        LiveUdpChannel(pkt.localPort, pkt.sourceIp, pkt.sourcePort)
+                    }
+                    ch.count += 1
+                    ch.bytes += pkt.data.size
+                    ch.lastSeenMs = pkt.timestampMs
+                    renderDynamicMonitorChips()
+
+                    val line = formatPacketLine(
+                        timeFmt.format(Date(pkt.timestampMs)),
+                        "UDP :${pkt.localPort} ← ${pkt.sourceIp}:${pkt.sourcePort} (${pkt.data.size}B)",
+                        pkt.data
+                    )
+                    appendMonitorLine(key, line)
+                    if (activeTcpTapPort == null && (selectedUdpFilterKey == null || selectedUdpFilterKey == key)) {
+                        monitorStatsText.text = "● UDP 감지 중 · ${monitorEventCount}건 · ${UiStyle.formatSize(monitorTotalBytes)} · 채널 ${liveUdpChannels.size}개"
+                        monitorStatsText.setTextColor(UiStyle.ACCENT)
+                    }
+                }
+            },
+            onStopped = {
+                handler.post {
+                    autoUdpToggleBtn.text = "자동 UDP 전송 포트 감지 시작 (14개 포트 동시)"
+                }
+            }
+        )
+    }
+
+    private fun addCustomUdpPort() {
+        val port = extraUdpPortField.text.toString().trim().toIntOrNull()
+        if (port == null || port !in 1..65535) {
+            Toast.makeText(context, "포트 번호를 1~65535 사이로 입력하세요", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (!udpSniffer.isRunning()) {
+            toggleAutoUdpSniffer()
+            handler.postDelayed({
+                addCustomUdpPortInternal(port)
+            }, 250)
+        } else {
+            addCustomUdpPortInternal(port)
+        }
+    }
+
+    private fun addCustomUdpPortInternal(port: Int) {
+        Thread({
+            val added = udpSniffer.addPort(port) { pkt ->
+                handler.post {
+                    monitorEventCount++
+                    monitorTotalBytes += pkt.data.size
+                    val key = "UDP:${pkt.localPort}:${pkt.sourceIp}"
+                    val ch = liveUdpChannels.getOrPut(key) {
+                        LiveUdpChannel(pkt.localPort, pkt.sourceIp, pkt.sourcePort)
+                    }
+                    ch.count += 1
+                    ch.bytes += pkt.data.size
+                    ch.lastSeenMs = pkt.timestampMs
+                    renderDynamicMonitorChips()
+                    val line = formatPacketLine(
+                        timeFmt.format(Date(pkt.timestampMs)),
+                        "UDP :${pkt.localPort} ← ${pkt.sourceIp}:${pkt.sourcePort} (${pkt.data.size}B)",
+                        pkt.data
+                    )
+                    appendMonitorLine(key, line)
+                }
+            }
+            handler.post {
+                if (added) {
+                    extraUdpPortField.setText("")
+                    Toast.makeText(context, "UDP :$port 감시 목록에 추가됨", Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(context, "UDP :$port 바인딩 실패 (이미 사용 중일 수 있음)", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }, "netlab-add-udp").start()
+    }
+
+    private fun formatPacketLine(ts: String, header: String, data: ByteArray): String {
+        val body = when (monitorFormat) {
+            PayloadFormat.ASCII -> HexCodec.bytesToAscii(data, 220)
+            PayloadFormat.HEX -> HexCodec.bytesToHex(data, 96)
+            PayloadFormat.BOTH -> "${HexCodec.bytesToHex(data, 48)}\n  TXT: ${HexCodec.bytesToAscii(data, 120)}"
+        }
+        return "[$ts] $header\n  $body"
+    }
+
+    private fun appendMonitorLine(channelKey: String, line: String) {
+        monitorAllEvents.addFirst(channelKey to line)
+        while (monitorAllEvents.size > 100) monitorAllEvents.removeLast()
+        refreshMonitorLogDisplay()
+    }
+
+    private fun refreshMonitorLogDisplay() {
+        val activeTcp = activeTcpTapPort
+        val filterKey = when {
+            activeTcp != null -> "TCP:$activeTcp"
+            selectedUdpFilterKey != null -> selectedUdpFilterKey
+            else -> null
+        }
+        val visible = if (filterKey == null) {
+            monitorAllEvents.map { it.second }
+        } else {
+            monitorAllEvents.filter { it.first == filterKey }.map { it.second }
+        }
+        monitorLogView.text = if (visible.isEmpty()) {
+            "데이터 수신 대기 중..."
+        } else {
+            visible.take(50).joinToString("\n\n")
+        }
+    }
+
+    private fun jumpCurrentMonitorToConsole() {
+        val activeTcp = activeTcpTapPort
+        if (activeTcp != null && selectedDeviceIp.isNotEmpty()) {
+            stopTcpLiveTap()
+            openInConsole(tcp = true, ip = selectedDeviceIp, port = activeTcp, autoConnect = true)
+            return
+        }
+        val selUdp = selectedUdpFilterKey?.let { liveUdpChannels[it] }
+        if (selUdp != null) {
+            openInConsole(tcp = false, ip = selUdp.sourceIp, port = selUdp.localPort, autoConnect = true)
+        }
+    }
+
+    private fun clearMonitorLog() {
+        monitorAllEvents.clear()
+        monitorEventCount = 0
+        monitorTotalBytes = 0L
+        monitorLogView.text = "로그를 비웠습니다."
+    }
+
+    // =========================================================================
+    // Flow Step 3: Interactive Control Console (Auto-Bound + Auto-Connect)
+    // =========================================================================
+
+    private fun openInConsole(tcp: Boolean, ip: String, port: Int, autoConnect: Boolean) {
         consoleTcp = tcp
         renderConsoleProto(tcp)
         consoleIpField.setText(ip)
         consolePortField.setText(port.toString())
         selectSubTab(NetToolSubTab.CONSOLE)
         root.smoothScrollTo(0, 0)
-    }
-
-    private fun toggleMonitor() {
-        if (listener.isRunning()) {
-            listener.stop()
-            return
+        if (autoConnect) {
+            if (consoleClient.isConnected()) consoleClient.disconnect()
+            toggleConsoleConnection()
         }
-        val port = monitorPortField.text.toString().trim().toIntOrNull()
-        if (port == null || port !in 1..65535) {
-            Toast.makeText(context, "수신 포트를 1~65535 사이로 입력하세요", Toast.LENGTH_SHORT).show()
-            return
-        }
-        monitorToggleBtn.text = "수신 중지"
-        val protoLabel = if (monitorUdp) "UDP" else "TCP"
-        monitorStatsText.text = "$protoLabel :$port 수신 대기 중..."
-        monitorStatsText.setTextColor(UiStyle.ACCENT)
-
-        val onPacket: (CapturedPacket) -> Unit = { pkt ->
-            handler.post {
-                monitorPacketCount++
-                monitorTotalBytes += pkt.data.size
-                val senderKey = "${pkt.sourceIp}:${pkt.sourcePort}"
-                monitorSenders[senderKey] = (monitorSenders[senderKey] ?: 0) + 1
-                monitorStatsText.text = "$protoLabel :$port · 수신 ${monitorPacketCount}건 · ${UiStyle.formatSize(monitorTotalBytes)} · 송신원 ${monitorSenders.size}개"
-                renderMonitorSenders(pkt.protocol == "TCP")
-
-                val ts = timeFmt.format(Date(pkt.timestampMs))
-                val body = when (monitorFormat) {
-                    PayloadFormat.ASCII -> HexCodec.bytesToAscii(pkt.data, 200)
-                    PayloadFormat.HEX -> HexCodec.bytesToHex(pkt.data, 96)
-                    PayloadFormat.BOTH -> "${HexCodec.bytesToHex(pkt.data, 48)}\n  TXT: ${HexCodec.bytesToAscii(pkt.data, 120)}"
-                }
-                val entry = "[$ts] $senderKey (${pkt.data.size}B)\n  $body"
-                monitorLogLines.addFirst(entry)
-                while (monitorLogLines.size > 80) monitorLogLines.removeLast()
-                monitorLogView.text = monitorLogLines.joinToString("\n\n")
-            }
-        }
-        val onError: (String) -> Unit = { msg ->
-            handler.post {
-                monitorStatsText.text = "오류: $msg"
-                monitorStatsText.setTextColor(UiStyle.DANGER)
-                Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
-            }
-        }
-        val onStopped: () -> Unit = {
-            handler.post {
-                monitorToggleBtn.text = "수신 시작"
-                if (monitorStatsText.currentTextColor != UiStyle.DANGER) {
-                    monitorStatsText.setTextColor(UiStyle.MUTED)
-                    monitorStatsText.text = "수신 중지됨 · 총 ${monitorPacketCount}건 (${UiStyle.formatSize(monitorTotalBytes)})"
-                }
-            }
-        }
-        if (monitorUdp) {
-            listener.startUdp(port, onPacket, onError, onStopped)
-        } else {
-            listener.startTcpServer(port, onPacket, onError, onStopped)
-        }
-    }
-
-    private fun renderMonitorSenders(isTcp: Boolean) {
-        monitorSenderRow.removeAllViews()
-        val gap = UiStyle.dp(context, 6)
-        monitorSenders.entries.forEach { (sender, count) ->
-            val chip = UiStyle.compactChipButton(
-                context, "$sender ($count)", UiStyle.CYAN_SOFT, UiStyle.CYAN, UiStyle.BORDER
-            ) {
-                val ip = sender.substringBefore(':')
-                val port = sender.substringAfter(':').toIntOrNull() ?: 5000
-                openInConsole(tcp = isTcp, ip = ip, port = port)
-            }
-            monitorSenderRow.addView(chip, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
-        }
-    }
-
-    private fun clearMonitorLog() {
-        monitorLogLines.clear()
-        monitorSenders.clear()
-        monitorPacketCount = 0
-        monitorTotalBytes = 0L
-        monitorSenderRow.removeAllViews()
-        monitorLogView.text = "아직 수신된 패킷이 없습니다."
     }
 
     private fun toggleConsoleConnection() {

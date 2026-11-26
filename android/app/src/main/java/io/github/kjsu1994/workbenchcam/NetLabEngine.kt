@@ -6,12 +6,14 @@ import java.net.DatagramSocket
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.net.MulticastSocket
 import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketTimeoutException
 import java.util.Collections
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -35,7 +37,8 @@ internal data class OpenPortResult(
     val port: Int,
     val serviceName: String,
     val rttMs: Int,
-    val banner: String
+    val banner: String,
+    val activelySending: Boolean = false
 )
 
 internal data class CapturedPacket(
@@ -43,6 +46,7 @@ internal data class CapturedPacket(
     val protocol: String,
     val sourceIp: String,
     val sourcePort: Int,
+    val localPort: Int,
     val data: ByteArray
 )
 
@@ -99,13 +103,20 @@ internal object HexCodec {
 }
 
 internal object PortRegistry {
+    // 36 common industrial / embedded / PC control & streaming ports
     val CONTROL_PRESET = intArrayOf(
-        21, 22, 23, 53, 80, 81, 102, 443, 502, 554,
-        1883, 1900, 2000, 2323, 3000, 3306, 3389, 4000, 4840, 5000,
-        5001, 5002, 5900, 8000, 8080, 8081, 8883, 9000, 9100
+        21, 22, 23, 53, 80, 81, 102, 139, 443, 445,
+        502, 554, 1883, 1900, 2000, 2323, 3000, 3306, 3389, 4000,
+        4001, 4840, 5000, 5001, 5002, 5555, 5900, 6000, 7000, 8000,
+        8080, 8081, 8883, 8888, 9000, 9100
     )
 
-    val QUICK_HOST_PROBES = intArrayOf(80, 443, 22, 23, 502, 554, 1883, 8080, 5000, 9100)
+    val QUICK_HOST_PROBES = intArrayOf(80, 443, 22, 23, 502, 554, 1883, 8080, 5000, 9100, 81, 3389)
+
+    // Common UDP broadcast / telemetry / discovery ports listened simultaneously in Auto Monitor mode
+    val AUTO_UDP_PORTS = intArrayOf(
+        1900, 5353, 5000, 5001, 6000, 7000, 8000, 8080, 8888, 9000, 9999, 12345, 30303, 47808
+    )
 
     fun serviceName(port: Int): String = when (port) {
         21 -> "FTP"
@@ -128,18 +139,26 @@ internal object PortRegistry {
         3000 -> "Web / Dev API"
         3306 -> "MySQL"
         3389 -> "RDP"
-        4000 -> "Serial / Ctrl"
+        4000, 4001 -> "Serial / Ctrl"
         4840 -> "OPC-UA"
         5000, 5001, 5002 -> "Custom / Ctrl"
+        5353 -> "mDNS"
         5432 -> "PostgreSQL"
+        5555 -> "ADB / Debug"
         5900 -> "VNC"
+        6000, 7000 -> "Telemetry / Ctrl"
         6379 -> "Redis"
         8000, 8080, 8081 -> "HTTP Alt / API"
         8883 -> "MQTT TLS"
-        9000 -> "Control / Stream"
+        8888, 9000, 9999 -> "Control / Stream"
         9100 -> "Raw Print / JetDirect"
-        else -> "TCP"
+        12345 -> "Custom Telemetry"
+        30303 -> "Microchip Discovery"
+        47808 -> "BACnet"
+        else -> "TCP/UDP"
     }
+
+    fun isHttpLike(port: Int): Boolean = port in setOf(80, 81, 3000, 8000, 8080, 8081)
 }
 
 internal object NetLabEngine {
@@ -170,6 +189,45 @@ internal object NetLabEngine {
         return candidates.minByOrNull { it.first }?.second
     }
 
+    /**
+     * Quick SSDP M-SEARCH multicast discovery to pick up friendly server/device hints on the LAN.
+     */
+    fun discoverSsdpHints(timeoutMs: Int = 700): Map<String, String> {
+        val hints = ConcurrentHashMap<String, String>()
+        runCatching {
+            val req = (
+                "M-SEARCH * HTTP/1.1\r\n" +
+                    "HOST: 239.255.255.250:1900\r\n" +
+                    "MAN: \"ssdp:discover\"\r\n" +
+                    "MX: 1\r\n" +
+                    "ST: ssdp:all\r\n\r\n"
+                ).toByteArray(Charsets.US_ASCII)
+            DatagramSocket().use { sock ->
+                sock.soTimeout = 180
+                val group = InetAddress.getByName("239.255.255.250")
+                sock.send(DatagramPacket(req, req.size, group, 1900))
+                val buf = ByteArray(1024)
+                val pkt = DatagramPacket(buf, buf.size)
+                val deadline = System.currentTimeMillis() + timeoutMs
+                while (System.currentTimeMillis() < deadline) {
+                    try {
+                        sock.receive(pkt)
+                        val ip = pkt.address?.hostAddress ?: continue
+                        val text = String(buf, 0, pkt.length, Charsets.UTF_8)
+                        val server = text.lineSequence()
+                            .firstOrNull { it.startsWith("SERVER:", ignoreCase = true) }
+                            ?.substringAfter(':')?.trim().orEmpty()
+                        if (server.isNotEmpty()) {
+                            hints.putIfAbsent(ip, server.take(36))
+                        }
+                    } catch (_: SocketTimeoutException) {
+                    }
+                }
+            }
+        }
+        return hints
+    }
+
     fun scanSubnet(
         subnetPrefix: String,
         selfIp: String?,
@@ -177,7 +235,8 @@ internal object NetLabEngine {
         onProgress: (done: Int, total: Int) -> Unit,
         onHostFound: (DiscoveredHost) -> Unit
     ) {
-        val pool = Executors.newFixedThreadPool(32)
+        val ssdpHints = if (!cancelled.get()) discoverSsdpHints(500) else emptyMap()
+        val pool = Executors.newFixedThreadPool(36)
         val completed = AtomicInteger(0)
         val total = 254
         try {
@@ -186,27 +245,26 @@ internal object NetLabEngine {
                 pool.execute {
                     try {
                         if (cancelled.get()) return@execute
-                        val foundPorts = ArrayList<Int>(3)
+                        val foundPorts = ArrayList<Int>(4)
                         val t0 = System.nanoTime()
-                        var alive = false
-                        // Probe fast TCP ports first (reliable even when Windows/PLC blocks ICMP ping)
+                        var alive = ssdpHints.containsKey(ip)
                         for (p in PortRegistry.QUICK_HOST_PROBES) {
                             if (cancelled.get()) return@execute
-                            if (tcpConnectCheck(ip, p, timeoutMs = 110)) {
+                            if (tcpConnectCheck(ip, p, timeoutMs = 100)) {
                                 alive = true
                                 foundPorts.add(p)
-                                if (foundPorts.size >= 3) break
+                                if (foundPorts.size >= 4) break
                             }
                         }
                         if (!alive && !cancelled.get()) {
-                            alive = runCatching { InetAddress.getByName(ip).isReachable(160) }.getOrDefault(false)
+                            alive = runCatching { InetAddress.getByName(ip).isReachable(150) }.getOrDefault(false)
                         }
                         if (alive && !cancelled.get()) {
                             val rtt = ((System.nanoTime() - t0) / 1_000_000L).toInt().coerceAtLeast(1)
-                            val hostLabel = if (ip == selfIp) {
-                                "이 휴대폰"
-                            } else {
-                                runCatching {
+                            val hostLabel = when {
+                                ip == selfIp -> "이 휴대폰"
+                                !ssdpHints[ip].isNullOrEmpty() -> ssdpHints[ip]!!
+                                else -> runCatching {
                                     val resolved = InetAddress.getByName(ip).canonicalHostName
                                     if (resolved != ip) resolved else ""
                                 }.getOrDefault("")
@@ -250,21 +308,22 @@ internal object NetLabEngine {
                     try {
                         if (cancelled.get()) return@execute
                         val t0 = System.nanoTime()
-                        val banner = probePortAndBanner(ip, port, timeoutMs)
-                        if (banner != null && !cancelled.get()) {
+                        val probe = probePortAndBanner(ip, port, timeoutMs)
+                        if (probe != null && !cancelled.get()) {
                             val rtt = ((System.nanoTime() - t0) / 1_000_000L).toInt().coerceAtLeast(1)
                             onOpenPort(
                                 OpenPortResult(
                                     port = port,
                                     serviceName = PortRegistry.serviceName(port),
                                     rttMs = rtt,
-                                    banner = banner
+                                    banner = probe.first,
+                                    activelySending = probe.second
                                 )
                             )
                         }
                     } finally {
                         val done = completed.incrementAndGet()
-                        if (done % 5 == 0 || done == total) {
+                        if (done % 4 == 0 || done == total) {
                             onProgress(done, total)
                         }
                     }
@@ -288,44 +347,181 @@ internal object NetLabEngine {
         }
     }
 
-    private fun probePortAndBanner(ip: String, port: Int, timeoutMs: Int): String? {
+    /**
+     * Connects to `ip:port` and checks:
+     * 1) Does the endpoint immediately push data/banner without any request? (`activelySending = true`)
+     * 2) Otherwise on HTTP-like ports, probes `HEAD /` to capture server header/status.
+     * Returns Pair(bannerText, activelySending), or null if port is closed.
+     */
+    private fun probePortAndBanner(ip: String, port: Int, timeoutMs: Int): Pair<String, Boolean>? {
         return try {
             Socket().use { sock ->
                 sock.connect(InetSocketAddress(ip, port), timeoutMs)
-                sock.soTimeout = 240
-                val isHttpLike = port in setOf(80, 81, 3000, 8000, 8080, 8081)
-                if (isHttpLike) {
-                    runCatching {
-                        sock.getOutputStream().write("HEAD / HTTP/1.0\r\nHost: $ip\r\n\r\n".toByteArray(Charsets.US_ASCII))
-                        sock.getOutputStream().flush()
-                    }
-                }
-                val buf = ByteArray(160)
-                val n = try {
-                    sock.getInputStream().read(buf)
+                sock.soTimeout = 260
+                val buf = ByteArray(192)
+                val inp = sock.getInputStream()
+
+                // Phase 1: listen briefly to detect active push/streaming/greeting ports
+                val passiveRead = try {
+                    inp.read(buf)
                 } catch (_: SocketTimeoutException) {
                     0
                 } catch (_: IOException) {
                     0
                 }
-                if (n > 0) {
-                    HexCodec.bytesToAscii(buf.copyOf(n), 120)
-                        .lineSequence()
-                        .map { it.trim() }
-                        .firstOrNull { it.isNotEmpty() }
-                        .orEmpty()
-                } else {
-                    ""
+                if (passiveRead > 0) {
+                    val sample = formatBannerPreview(buf, passiveRead)
+                    return sample to true
                 }
+
+                // Phase 2: for HTTP-like ports, send HEAD / to identify server
+                if (PortRegistry.isHttpLike(port)) {
+                    runCatching {
+                        sock.getOutputStream().write("HEAD / HTTP/1.0\r\nHost: $ip\r\n\r\n".toByteArray(Charsets.US_ASCII))
+                        sock.getOutputStream().flush()
+                    }
+                    val httpRead = try {
+                        inp.read(buf)
+                    } catch (_: SocketTimeoutException) {
+                        0
+                    } catch (_: IOException) {
+                        0
+                    }
+                    if (httpRead > 0) {
+                        return formatBannerPreview(buf, httpRead) to false
+                    }
+                }
+                "" to false
             }
         } catch (_: Exception) {
             null
         }
     }
+
+    private fun formatBannerPreview(buf: ByteArray, count: Int): String {
+        val slice = buf.copyOf(count)
+        val ascii = HexCodec.bytesToAscii(slice, 120)
+            .lineSequence()
+            .map { it.trim() }
+            .firstOrNull { it.isNotEmpty() }
+            .orEmpty()
+        val printableRatio = if (slice.isEmpty()) 0f else {
+            slice.count { (it.toInt() and 0xFF) in 0x20..0x7E || it == '\r'.code.toByte() || it == '\n'.code.toByte() }
+                .toFloat() / slice.size.toFloat()
+        }
+        return if (printableRatio >= 0.6f && ascii.isNotEmpty()) {
+            ascii
+        } else {
+            "HEX: ${HexCodec.bytesToHex(slice, 20)}"
+        }
+    }
 }
 
 /**
- * Passive UDP (unicast + broadcast) or TCP Server listener to identify incoming source IP:port and payload.
+ * Simultaneous Multi-Port UDP Sniffer (broadcast + multicast + custom ports) so users don't have to
+ * know port numbers beforehand — any active UDP port dynamically appears as soon as traffic arrives.
+ */
+internal class MultiPortUdpSniffer {
+    @Volatile private var running = false
+    private val sockets = ConcurrentHashMap<Int, DatagramSocket>()
+
+    fun isRunning(): Boolean = running
+
+    fun activePorts(): List<Int> = sockets.keys.sorted()
+
+    fun start(
+        ports: IntArray,
+        onBound: (boundPorts: List<Int>) -> Unit,
+        onPacket: (CapturedPacket) -> Unit,
+        onStopped: () -> Unit
+    ) {
+        stop()
+        running = true
+        Thread({
+            val bound = ArrayList<Int>()
+            for (port in ports.distinct()) {
+                if (!running) break
+                if (bindSinglePort(port, onPacket)) {
+                    bound.add(port)
+                }
+            }
+            onBound(bound.sorted())
+            if (bound.isEmpty()) {
+                running = false
+                onStopped()
+            }
+        }, "netlab-multi-udp-start").start()
+    }
+
+    fun addPort(port: Int, onPacket: (CapturedPacket) -> Unit): Boolean {
+        if (!running || port !in 1..65535) return false
+        if (sockets.containsKey(port)) return true
+        return bindSinglePort(port, onPacket)
+    }
+
+    private fun bindSinglePort(port: Int, onPacket: (CapturedPacket) -> Unit): Boolean {
+        val sock: DatagramSocket = try {
+            if (port == 1900 || port == 5353) {
+                MulticastSocket(null).apply {
+                    reuseAddress = true
+                    soTimeout = 500
+                    bind(InetSocketAddress(port))
+                    val group = InetAddress.getByName(if (port == 1900) "239.255.255.250" else "224.0.0.251")
+                    runCatching { joinGroup(group) }
+                }
+            } else {
+                DatagramSocket(null).apply {
+                    reuseAddress = true
+                    broadcast = true
+                    soTimeout = 500
+                    bind(InetSocketAddress(port))
+                }
+            }
+        } catch (_: Exception) {
+            return false
+        }
+        sockets[port] = sock
+        Thread({
+            val buf = ByteArray(4096)
+            val pkt = DatagramPacket(buf, buf.size)
+            try {
+                while (running && !sock.isClosed) {
+                    try {
+                        sock.receive(pkt)
+                        val payload = buf.copyOf(pkt.length)
+                        val srcIp = pkt.address?.hostAddress ?: "unknown"
+                        onPacket(
+                            CapturedPacket(
+                                timestampMs = System.currentTimeMillis(),
+                                protocol = "UDP",
+                                sourceIp = srcIp,
+                                sourcePort = pkt.port,
+                                localPort = port,
+                                data = payload
+                            )
+                        )
+                    } catch (_: SocketTimeoutException) {
+                    }
+                }
+            } catch (_: Exception) {
+            } finally {
+                runCatching { sock.close() }
+                sockets.remove(port, sock)
+            }
+        }, "netlab-udp-$port").start()
+        return true
+    }
+
+    fun stop() {
+        running = false
+        val copy = sockets.values.toList()
+        sockets.clear()
+        copy.forEach { runCatching { it.close() } }
+    }
+}
+
+/**
+ * Passive single-port UDP/TCP Server listener (kept for dedicated TCP server listening & unit tests).
  */
 internal class PacketListener {
     @Volatile private var running = false
@@ -358,7 +554,7 @@ internal class PacketListener {
                         sock.receive(packet)
                         val payload = buf.copyOf(packet.length)
                         val srcIp = packet.address?.hostAddress ?: "unknown"
-                        onPacket(CapturedPacket(System.currentTimeMillis(), "UDP", srcIp, packet.port, payload))
+                        onPacket(CapturedPacket(System.currentTimeMillis(), "UDP", srcIp, packet.port, port, payload))
                     } catch (_: SocketTimeoutException) {
                     }
                 }
@@ -411,7 +607,7 @@ internal class PacketListener {
                                     break
                                 }
                                 if (n <= 0) break
-                                onPacket(CapturedPacket(System.currentTimeMillis(), "TCP", srcIp, srcPort, buf.copyOf(n)))
+                                onPacket(CapturedPacket(System.currentTimeMillis(), "TCP", srcIp, srcPort, port, buf.copyOf(n)))
                             }
                         }
                     }, "netlab-tcp-client").start()
@@ -437,7 +633,7 @@ internal class PacketListener {
 }
 
 /**
- * Interactive TCP Client or UDP bidirectional test console for sending control commands and inspecting replies.
+ * Interactive TCP Client or UDP bidirectional test console for live stream tapping and control commands.
  */
 internal class DeviceConsoleClient {
     @Volatile private var connected = false
