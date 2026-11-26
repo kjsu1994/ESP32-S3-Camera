@@ -441,8 +441,8 @@ internal class CameraScreen(
         shell.addView(host, LinearLayout.LayoutParams(-1, 0, 1f))
 
         // --- Bottom Navigation Bar ---
-        shell.addView(View(context).apply { setBackgroundColor(UiStyle.BORDER) },
-            LinearLayout.LayoutParams(-1, UiStyle.dp(context, 1)))
+        val navDivider = View(context).apply { setBackgroundColor(UiStyle.BORDER) }
+        shell.addView(navDivider, LinearLayout.LayoutParams(-1, UiStyle.dp(context, 1)))
         val navBar = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             setBackgroundColor(UiStyle.NAV_BG)
@@ -467,7 +467,14 @@ internal class CameraScreen(
         root.setOnApplyWindowInsetsListener { view, insets ->
             val offsets = if (Build.VERSION.SDK_INT >= 30) {
                 val bars = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
-                intArrayOf(bars.left, bars.top, bars.right, bars.bottom)
+                val ime = insets.getInsets(WindowInsets.Type.ime())
+                val imeVisible = ime.bottom > bars.bottom
+                val navVis = if (imeVisible) View.GONE else View.VISIBLE
+                if (navBar.visibility != navVis) {
+                    navBar.visibility = navVis
+                    navDivider.visibility = navVis
+                }
+                intArrayOf(bars.left, bars.top, bars.right, maxOf(bars.bottom, ime.bottom))
             } else {
                 @Suppress("DEPRECATION")
                 intArrayOf(insets.systemWindowInsetLeft, insets.systemWindowInsetTop,

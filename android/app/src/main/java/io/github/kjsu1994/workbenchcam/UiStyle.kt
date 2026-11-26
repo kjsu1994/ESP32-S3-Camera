@@ -113,10 +113,11 @@ internal object UiStyle {
         typeface = Typeface.DEFAULT_BOLD
         setTextColor(textColor)
         gravity = Gravity.CENTER
+        minimumHeight = dp(context, 36)
         isClickable = true
         isFocusable = true
         background = rippleRounded(context, bgColor, 10, strokeColor)
-        setPadding(dp(context, 10), dp(context, 6), dp(context, 10), dp(context, 6))
+        setPadding(dp(context, 11), dp(context, 6), dp(context, 11), dp(context, 6))
         setOnClickListener { onClick() }
     }
 

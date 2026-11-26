@@ -2,14 +2,22 @@ package io.github.kjsu1994.workbenchcam
 
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.ContentValues
 import android.content.Context
+import android.content.Intent
 import android.graphics.Typeface
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.provider.MediaStore
+import android.text.Editable
 import android.text.InputType
 import android.text.TextUtils
+import android.text.TextWatcher
 import android.view.Gravity
 import android.view.View
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputMethodManager
 import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
@@ -24,9 +32,16 @@ import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 
 internal enum class NetToolSubTab(val label: String) {
-    SCAN("1. 자동 탐색"),
-    MONITOR("2. 실시간 모니터"),
-    CONSOLE("3. 제어 콘솔")
+    SCAN("탐색"),
+    MONITOR("모니터"),
+    PROXY("중계"),
+    CONSOLE("콘솔")
+}
+
+private enum class ProxyDirFilter(val label: String) {
+    ALL("전체"),
+    C2T("→ 요청(C→T)"),
+    T2C("← 응답(T→C)")
 }
 
 private enum class PortPreset(val label: String) {
@@ -136,7 +151,26 @@ internal class NetToolsView(
     private var monitorEventCount = 0
     private var monitorTotalBytes = 0L
 
-    // Sub-Tab 3: Interactive Control Console
+    // Sub-Tab 3: Bidirectional TCP Relay Proxy + Wireshark .pcap Export
+    private val relayProxy = TcpRelayProxy()
+    private val proxyListenPortField: EditText
+    private val proxyTargetIpField: EditText
+    private val proxyTargetPortField: EditText
+    private val proxyRouteLabel: TextView
+    private val proxyToggleBtn: Button
+    private val proxyStatsText: TextView
+    private val proxyPcapBtn: TextView
+    private val proxyLogView: TextView
+    private var proxyDirFilter = ProxyDirFilter.ALL
+    private var proxyFormat = PayloadFormat.BOTH
+    private val proxyPackets = ArrayList<RelayedPacket>()
+    private var proxyC2tCount = 0
+    private var proxyT2cCount = 0
+    private var proxyC2tBytes = 0L
+    private var proxyT2cBytes = 0L
+    private var proxyActiveSessions = 0
+
+    // Sub-Tab 4: Interactive Control Console
     private val consoleClient = DeviceConsoleClient()
     private var consoleTcp = true
     private var consoleHexTx = false
@@ -156,7 +190,7 @@ internal class NetToolsView(
         val wrapper = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
             val p = UiStyle.dp(context, 16)
-            setPadding(p, UiStyle.dp(context, 6), p, UiStyle.dp(context, 24))
+            setPadding(p, UiStyle.dp(context, 6), p, UiStyle.dp(context, 36))
         }
 
         // --- Compact Local Network Info Card ---
@@ -387,7 +421,130 @@ internal class NetToolsView(
         monitorPanel.addView(streamCard, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 12) })
 
         // ============================================================
-        // SUB-TAB 3: 3. 제어 콘솔 (Interactive TCP / UDP Command Tester)
+        // SUB-TAB 3: 중계 (Bidirectional TCP Relay Proxy + Wireshark .pcap)
+        // ============================================================
+        val proxyPanel = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
+        val pxCard = UiStyle.card(context, 14)
+
+        val copyProxyAddrChip = UiStyle.compactChipButton(
+            context, "중계 주소 복사", UiStyle.CYAN_SOFT, UiStyle.CYAN, UiStyle.BORDER
+        ) {
+            val myIp = localNet?.ip ?: "192.168.x.x"
+            val lp = proxyListenPortField.text.toString().trim().ifEmpty { "5000" }
+            copyText("$myIp:$lp")
+        }
+        pxCard.addView(LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(UiStyle.label(context, "TCP 양방향 중계 (Proxy)", 15f, UiStyle.INK, bold = true),
+                LinearLayout.LayoutParams(0, -2, 1f))
+            addView(copyProxyAddrChip)
+        })
+        pxCard.addView(UiStyle.label(
+            context,
+            "PC·장비의 접속 대상 IP를 아래 [내 폰 주소]로 지정하면 실제 통신을 유지한 채 양방향 모든 TCP 데이터를 포착해 Wireshark(.pcap)로 저장할 수 있습니다.",
+            12f,
+            UiStyle.SECONDARY
+        ).apply { setPadding(0, UiStyle.dp(context, 4), 0, UiStyle.dp(context, 10)) })
+
+        proxyRouteLabel = UiStyle.label(context, "", 11.5f, UiStyle.ACCENT, bold = true).apply {
+            typeface = Typeface.MONOSPACE
+            gravity = Gravity.CENTER
+            background = UiStyle.rounded(context, UiStyle.BG, 10, UiStyle.ACCENT)
+            setPadding(UiStyle.dp(context, 10), UiStyle.dp(context, 8), UiStyle.dp(context, 10), UiStyle.dp(context, 8))
+        }
+        pxCard.addView(proxyRouteLabel, LinearLayout.LayoutParams(-1, -2))
+
+        val routeWatcher = object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+            override fun afterTextChanged(s: Editable?) { updateProxyRoutePreview() }
+        }
+        proxyListenPortField = styledInput("폰 리슨 포트 (1024~65535)", "5000", numeric = true).apply {
+            addTextChangedListener(routeWatcher)
+        }
+        proxyTargetIpField = styledInput("원래 대상 장비 IP", "", numeric = false).apply {
+            addTextChangedListener(routeWatcher)
+        }
+        proxyTargetPortField = styledInput("대상 포트", "5000", numeric = true).apply {
+            addTextChangedListener(routeWatcher)
+        }
+
+        pxCard.addView(UiStyle.label(context, "내 폰 수신 포트 (PC가 접속할 포트)", 11.5f, UiStyle.MUTED, bold = true).apply {
+            setPadding(0, UiStyle.dp(context, 10), 0, UiStyle.dp(context, 4))
+        })
+        pxCard.addView(proxyListenPortField, LinearLayout.LayoutParams(-1, -2))
+
+        pxCard.addView(UiStyle.label(context, "전달할 원래 대상 장비 (IP : 포트)", 11.5f, UiStyle.MUTED, bold = true).apply {
+            setPadding(0, UiStyle.dp(context, 8), 0, UiStyle.dp(context, 4))
+        })
+        pxCard.addView(LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(proxyTargetIpField, LinearLayout.LayoutParams(0, -2, 1.55f).apply { marginEnd = UiStyle.dp(context, 8) })
+            addView(proxyTargetPortField, LinearLayout.LayoutParams(0, -2, 0.85f))
+        }, LinearLayout.LayoutParams(-1, -2))
+
+        proxyToggleBtn = UiStyle.primaryButton(context, "TCP 양방향 중계 시작") { toggleTcpProxy() }
+        pxCard.addView(proxyToggleBtn, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 10) })
+
+        proxyStatsText = UiStyle.label(context, "대기 중 · 중계 시작 후 PC/클라이언트를 위 폰 주소로 연결하세요", 11.5f, UiStyle.CYAN).apply {
+            typeface = Typeface.MONOSPACE
+            setPadding(0, UiStyle.dp(context, 10), 0, UiStyle.dp(context, 8))
+        }
+        pxCard.addView(proxyStatsText)
+
+        val (pxDirChips, _) = UiStyle.segmentedChips(
+            context,
+            ProxyDirFilter.entries.map { it to it.label },
+            proxyDirFilter
+        ) {
+            proxyDirFilter = it
+            refreshProxyLogDisplay()
+        }
+        pxCard.addView(pxDirChips, LinearLayout.LayoutParams(-1, -2))
+
+        val (pxFmtChips, _) = UiStyle.segmentedChips(
+            context,
+            PayloadFormat.entries.map { it to it.label },
+            proxyFormat
+        ) {
+            proxyFormat = it
+            refreshProxyLogDisplay()
+        }
+        pxCard.addView(pxFmtChips, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 6) })
+
+        proxyPcapBtn = UiStyle.compactChipButton(
+            context, "Wireshark .pcap 저장", UiStyle.ACCENT_SOFT, UiStyle.ACCENT, UiStyle.ACCENT
+        ) { exportProxyPcap() }
+        val pxCopyBtn = UiStyle.compactChipButton(context, "로그 복사", UiStyle.SURFACE_ALT, UiStyle.INK, UiStyle.BORDER) {
+            copyText(proxyLogView.text.toString())
+        }
+        val pxClearBtn = UiStyle.compactChipButton(context, "지우기", UiStyle.SURFACE_ALT, UiStyle.SECONDARY, UiStyle.BORDER) {
+            clearProxyLog()
+        }
+        pxCard.addView(
+            HorizontalScrollView(context).apply {
+                isHorizontalScrollBarEnabled = false
+                addView(LinearLayout(context).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    val gap = UiStyle.dp(context, 6)
+                    addView(proxyPcapBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
+                    addView(pxCopyBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
+                    addView(pxClearBtn)
+                })
+            },
+            LinearLayout.LayoutParams(-1, -2).apply {
+                topMargin = UiStyle.dp(context, 8)
+                bottomMargin = UiStyle.dp(context, 8)
+            }
+        )
+
+        proxyLogView = buildTerminalTextView("중계 시작 후 클라이언트→대상(C→T) 및 대상→클라이언트(T→C)\n양방향 모든 TCP 데이터가 여기에 실시간으로 기록됩니다.")
+        pxCard.addView(proxyLogView, LinearLayout.LayoutParams(-1, -2))
+        proxyPanel.addView(pxCard, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 12) })
+
+        // ============================================================
+        // SUB-TAB 4: 콘솔 (Interactive TCP / UDP Command Tester)
         // ============================================================
         val consolePanel = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
         val conCard = UiStyle.card(context, 14)
@@ -492,7 +649,15 @@ internal class NetToolsView(
         }
         conCard.addView(consoleEndingRow, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 6) })
 
-        consoleInputField = styledInput("전송할 명령어 입력", "", numeric = false)
+        consoleInputField = styledInput("전송할 명령어 입력", "", numeric = false).apply {
+            imeOptions = EditorInfo.IME_ACTION_SEND
+            setOnEditorActionListener { _, actionId, _ ->
+                if (actionId == EditorInfo.IME_ACTION_SEND || actionId == EditorInfo.IME_ACTION_DONE) {
+                    sendConsoleCommand()
+                    true
+                } else false
+            }
+        }
         val sendBtn = UiStyle.primaryButton(context, "전송") { sendConsoleCommand() }
         conCard.addView(LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -505,6 +670,7 @@ internal class NetToolsView(
 
         subPanels[NetToolSubTab.SCAN] = scanPanel
         subPanels[NetToolSubTab.MONITOR] = monitorPanel
+        subPanels[NetToolSubTab.PROXY] = proxyPanel
         subPanels[NetToolSubTab.CONSOLE] = consolePanel
         subPanels.values.forEach { panelHost.addView(it, FrameLayout.LayoutParams(-1, -2)) }
         wrapper.addView(panelHost, LinearLayout.LayoutParams(-1, -2))
@@ -514,11 +680,13 @@ internal class NetToolsView(
             addView(wrapper, FrameLayout.LayoutParams(-1, -2))
         }
 
+        updateProxyRoutePreview()
         selectSubTab(NetToolSubTab.SCAN)
         refreshNetworkInfo()
     }
 
     fun selectSubTab(tab: NetToolSubTab) {
+        hideKeyboard()
         activeSubTab = tab
         renderSubTab(tab)
         subPanels.forEach { (key, view) ->
@@ -527,6 +695,12 @@ internal class NetToolsView(
         if (tab == NetToolSubTab.MONITOR) {
             renderDynamicMonitorChips()
         }
+        root.scrollTo(0, 0)
+    }
+
+    private fun hideKeyboard() {
+        val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager ?: return
+        imm.hideSoftInputFromWindow(root.windowToken, 0)
     }
 
     fun refreshNetworkInfo() {
@@ -550,6 +724,10 @@ internal class NetToolsView(
                         val fallbackIp = getConnectedBoardIp() ?: "${info.subnetPrefix}.1"
                         targetIpField.setText(fallbackIp)
                     }
+                    if (proxyTargetIpField.text.isEmpty()) {
+                        proxyTargetIpField.setText(getConnectedBoardIp() ?: "${info.subnetPrefix}.1")
+                    }
+                    updateProxyRoutePreview()
                 }
             }
         }, "netlab-detect").start()
@@ -560,6 +738,7 @@ internal class NetToolsView(
         portScanCancel?.set(true)
         udpSniffer.stop()
         tcpServerSniffer.stop()
+        relayProxy.stop()
         stopAllTcpTaps()
         consoleClient.disconnect()
     }
@@ -627,6 +806,8 @@ internal class NetToolsView(
         selectedDeviceIp = ip
         targetIpField.setText(ip)
         consoleIpField.setText(ip)
+        proxyTargetIpField.setText(ip)
+        updateProxyRoutePreview()
         selectedDeviceBanner.text = "선택된 장비: $ip"
         renderDiscoveredHosts()
         startPortScanFor(ip)
@@ -816,19 +997,30 @@ internal class NetToolsView(
                     })
                 }
 
-                // Direct 1-tap handoff actions
-                addView(LinearLayout(context).apply {
+                // Direct 1-tap handoff actions (horizontally scrollable on narrow screens so nothing clips)
+                val portActions = LinearLayout(context).apply {
                     orientation = LinearLayout.HORIZONTAL
-                    gravity = Gravity.END
-                    setPadding(0, UiStyle.dp(context, 8), 0, 0)
+                    gravity = Gravity.END or Gravity.CENTER_VERTICAL
                     val gap = UiStyle.dp(context, 6)
                     addView(UiStyle.compactChipButton(
-                        context, "실시간 데이터 보기 ▶", UiStyle.ACCENT_SOFT, UiStyle.ACCENT, UiStyle.ACCENT
+                        context, "데이터 보기 ▶", UiStyle.ACCENT_SOFT, UiStyle.ACCENT, UiStyle.ACCENT
                     ) { openPortInLiveMonitor(ip, res.port) }, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
                     addView(UiStyle.compactChipButton(
-                        context, "제어 콘솔 ▶", UiStyle.SURFACE_ALT, UiStyle.INK, UiStyle.BORDER
+                        context, "중계 ▶", UiStyle.CYAN_SOFT, UiStyle.CYAN, UiStyle.BORDER
+                    ) { openPortInProxy(ip, res.port) }, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
+                    addView(UiStyle.compactChipButton(
+                        context, "콘솔 ▶", UiStyle.SURFACE_ALT, UiStyle.INK, UiStyle.BORDER
                     ) { openInConsole(tcp = true, ip = ip, port = res.port, autoConnect = true) })
-                })
+                }
+                addView(
+                    HorizontalScrollView(context).apply {
+                        isHorizontalScrollBarEnabled = false
+                        isFillViewport = true
+                        setPadding(0, UiStyle.dp(context, 8), 0, 0)
+                        addView(portActions, FrameLayout.LayoutParams(-1, -2))
+                    },
+                    LinearLayout.LayoutParams(-1, -2)
+                )
 
                 setOnClickListener { openPortInLiveMonitor(ip, res.port) }
             }
@@ -1292,7 +1484,210 @@ internal class NetToolsView(
     }
 
     // =========================================================================
-    // Flow Step 3: Interactive Control Console (Auto-Bound + Auto-Connect)
+    // Flow Step 3: Bidirectional TCP Relay Proxy + Wireshark .pcap Export
+    // =========================================================================
+
+    private fun openPortInProxy(targetIp: String, targetPort: Int) {
+        selectedDeviceIp = targetIp
+        proxyTargetIpField.setText(targetIp)
+        proxyTargetPortField.setText(targetPort.toString())
+        val suggestedListen = when {
+            targetPort >= 1024 -> targetPort
+            targetPort == 80 -> 8080
+            else -> targetPort + 5000
+        }
+        proxyListenPortField.setText(suggestedListen.toString())
+        updateProxyRoutePreview()
+        selectSubTab(NetToolSubTab.PROXY)
+        root.smoothScrollTo(0, 0)
+    }
+
+    private fun updateProxyRoutePreview() {
+        val myIp = localNet?.ip ?: "내 폰IP"
+        val lPort = proxyListenPortField.text.toString().trim().ifEmpty { "5000" }
+        val tIp = proxyTargetIpField.text.toString().trim().ifEmpty { "대상IP" }
+        val tPort = proxyTargetPortField.text.toString().trim().ifEmpty { "5000" }
+        proxyRouteLabel.text = "PC ──► $myIp:$lPort ──► $tIp:$tPort"
+    }
+
+    private fun toggleTcpProxy() {
+        hideKeyboard()
+        if (relayProxy.isRunning()) {
+            relayProxy.stop()
+            return
+        }
+        val listenPort = proxyListenPortField.text.toString().trim().toIntOrNull()
+        val targetIp = proxyTargetIpField.text.toString().trim()
+        val targetPort = proxyTargetPortField.text.toString().trim().toIntOrNull()
+        if (listenPort == null || listenPort !in 1024..65535) {
+            Toast.makeText(context, "폰 리슨 포트는 1024~65535 사이로 입력하세요", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (!isValidIpv4(targetIp) || targetPort == null || targetPort !in 1..65535) {
+            Toast.makeText(context, "원래 대상 IP와 포트(1~65535)를 올바르게 입력하세요", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        proxyToggleBtn.text = "TCP 중계 중지"
+        proxyStatsText.text = "중계 포트 :$listenPort 준비 중..."
+        proxyStatsText.setTextColor(UiStyle.AMBER)
+        updateProxyRoutePreview()
+
+        relayProxy.start(
+            listenPort = listenPort,
+            targetHost = targetIp,
+            targetPort = targetPort,
+            onStarted = { actualPort ->
+                handler.post {
+                    val myIp = localNet?.ip ?: "내 폰IP"
+                    proxyStatsText.text = "● 중계 대기 중: PC에서 $myIp:$actualPort 로 접속하세요"
+                    proxyStatsText.setTextColor(UiStyle.ACCENT)
+                }
+            },
+            onSessionChanged = { active, info ->
+                handler.post {
+                    proxyActiveSessions = active
+                    updateProxyStatsLine(info)
+                }
+            },
+            onPacket = { pkt ->
+                handler.post {
+                    synchronized(proxyPackets) {
+                        proxyPackets.add(pkt)
+                        if (proxyPackets.size > 1500) proxyPackets.removeAt(0)
+                    }
+                    if (pkt.direction == RelayDirection.CLIENT_TO_TARGET) {
+                        proxyC2tCount++
+                        proxyC2tBytes += pkt.data.size
+                    } else {
+                        proxyT2cCount++
+                        proxyT2cBytes += pkt.data.size
+                    }
+                    updateProxyStatsLine(null)
+                    refreshProxyLogDisplay()
+                }
+            },
+            onError = { err ->
+                handler.post {
+                    proxyStatsText.text = "오류: $err"
+                    proxyStatsText.setTextColor(UiStyle.DANGER)
+                    Toast.makeText(context, err, Toast.LENGTH_LONG).show()
+                }
+            },
+            onStopped = {
+                handler.post {
+                    proxyToggleBtn.text = "TCP 양방향 중계 시작"
+                    proxyActiveSessions = 0
+                    if (proxyStatsText.currentTextColor != UiStyle.DANGER) {
+                        proxyStatsText.text = "중계 중지됨 · C→T ${proxyC2tCount}건 / T→C ${proxyT2cCount}건 기록됨"
+                        proxyStatsText.setTextColor(UiStyle.MUTED)
+                    }
+                }
+            }
+        )
+    }
+
+    private fun updateProxyStatsLine(eventNote: String?) {
+        val base = "● 연결 ${proxyActiveSessions} · C→T ${proxyC2tCount}건(${UiStyle.formatSize(proxyC2tBytes)}) · T→C ${proxyT2cCount}건(${UiStyle.formatSize(proxyT2cBytes)})"
+        proxyStatsText.text = if (eventNote != null) "$base\n$eventNote" else base
+        proxyStatsText.setTextColor(UiStyle.ACCENT)
+    }
+
+    private fun refreshProxyLogDisplay() {
+        val snapshot = synchronized(proxyPackets) { proxyPackets.toList() }
+        val filtered = snapshot.asReversed().asSequence()
+            .filter { pkt ->
+                when (proxyDirFilter) {
+                    ProxyDirFilter.ALL -> true
+                    ProxyDirFilter.C2T -> pkt.direction == RelayDirection.CLIENT_TO_TARGET
+                    ProxyDirFilter.T2C -> pkt.direction == RelayDirection.TARGET_TO_CLIENT
+                }
+            }
+            .take(50)
+            .map { pkt ->
+                val ts = timeFmt.format(Date(pkt.timestampMs))
+                val dirLabel = if (pkt.direction == RelayDirection.CLIENT_TO_TARGET) {
+                    "C→T  ${pkt.srcIp}:${pkt.srcPort} → ${pkt.dstIp}:${pkt.dstPort} (${pkt.data.size}B)"
+                } else {
+                    "T→C  ${pkt.srcIp}:${pkt.srcPort} → ${pkt.dstIp}:${pkt.dstPort} (${pkt.data.size}B)"
+                }
+                val body = when (proxyFormat) {
+                    PayloadFormat.ASCII -> HexCodec.bytesToAscii(pkt.data, 220)
+                    PayloadFormat.HEX -> HexCodec.bytesToHex(pkt.data, 96)
+                    PayloadFormat.BOTH -> "${HexCodec.bytesToHex(pkt.data, 48)}\n  TXT: ${HexCodec.bytesToAscii(pkt.data, 120)}"
+                }
+                "[$ts] $dirLabel\n  $body"
+            }
+            .toList()
+        proxyLogView.text = if (filtered.isEmpty()) {
+            "기록된 중계 패킷이 없습니다."
+        } else {
+            filtered.joinToString("\n\n")
+        }
+    }
+
+    private fun clearProxyLog() {
+        synchronized(proxyPackets) { proxyPackets.clear() }
+        proxyC2tCount = 0
+        proxyT2cCount = 0
+        proxyC2tBytes = 0L
+        proxyT2cBytes = 0L
+        proxyLogView.text = "중계 로그를 비웠습니다."
+    }
+
+    private fun exportProxyPcap() {
+        val snapshot = synchronized(proxyPackets) { proxyPackets.toList() }
+        if (snapshot.isEmpty()) {
+            Toast.makeText(context, "저장할 중계 패킷이 없습니다", Toast.LENGTH_SHORT).show()
+            return
+        }
+        Thread({
+            val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+            val filename = "DockyCam_Proxy_$stamp.pcap"
+            val values = ContentValues().apply {
+                put(MediaStore.Downloads.DISPLAY_NAME, filename)
+                put(MediaStore.Downloads.MIME_TYPE, "application/vnd.tcpdump.pcap")
+                put(MediaStore.Downloads.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/DockyCam")
+                put(MediaStore.Downloads.IS_PENDING, 1)
+            }
+            val uri = try {
+                val u = checkNotNull(context.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values))
+                try {
+                    checkNotNull(context.contentResolver.openOutputStream(u)).use { out ->
+                        PcapWriter.writePcap(snapshot, out)
+                    }
+                    val ready = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
+                    check(context.contentResolver.update(u, ready, null, null) == 1)
+                } catch (e: Exception) {
+                    context.contentResolver.delete(u, null, null)
+                    throw e
+                }
+                u
+            } catch (_: Exception) {
+                null
+            }
+            handler.post {
+                if (uri != null) {
+                    Toast.makeText(
+                        context,
+                        "Downloads/DockyCam/$filename 저장 완료 (${snapshot.size}개 패킷 · Wireshark 호환)",
+                        Toast.LENGTH_LONG
+                    ).show()
+                    val share = Intent(Intent.ACTION_SEND).apply {
+                        type = "application/vnd.tcpdump.pcap"
+                        putExtra(Intent.EXTRA_STREAM, uri)
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }
+                    runCatching { context.startActivity(Intent.createChooser(share, "Wireshark PCAP 파일 공유")) }
+                } else {
+                    Toast.makeText(context, "PCAP 파일을 저장하지 못했습니다", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }, "netlab-pcap-save").start()
+    }
+
+    // =========================================================================
+    // Flow Step 4: Interactive Control Console (Auto-Bound + Auto-Connect)
     // =========================================================================
 
     private fun openInConsole(tcp: Boolean, ip: String, port: Int, autoConnect: Boolean) {
@@ -1403,8 +1798,8 @@ internal class NetToolsView(
         typeface = Typeface.MONOSPACE
         setTextColor(UiStyle.INK)
         setTextIsSelectable(true)
-        minLines = 7
-        maxLines = 18
+        minLines = 5
+        maxLines = 12
         background = UiStyle.rounded(context, 0xff060908.toInt(), 12, UiStyle.BORDER)
         val p = UiStyle.dp(context, 12)
         setPadding(p, p, p, p)
@@ -1418,10 +1813,11 @@ internal class NetToolsView(
         setTextColor(UiStyle.INK)
         setHintTextColor(UiStyle.MUTED)
         setSingleLine(true)
+        imeOptions = EditorInfo.IME_ACTION_DONE
         inputType = if (numeric) InputType.TYPE_CLASS_NUMBER else InputType.TYPE_CLASS_TEXT
         background = UiStyle.rounded(context, UiStyle.BG, 12, UiStyle.BORDER)
         setPadding(UiStyle.dp(context, 12), UiStyle.dp(context, 10), UiStyle.dp(context, 12), UiStyle.dp(context, 10))
-        minimumHeight = UiStyle.dp(context, 44)
+        minimumHeight = UiStyle.dp(context, 46)
     }
 
     private fun copyText(text: String) {
