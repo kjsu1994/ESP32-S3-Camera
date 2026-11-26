@@ -24,7 +24,7 @@ import android.widget.Switch
 import android.widget.TextView
 import java.util.Locale
 
-internal enum class AppTab { LIVE, RECORD, LIBRARY }
+internal enum class AppTab { LIVE, RECORD, LIBRARY, TOOLS }
 internal enum class LibrarySort(val label: String) {
     LATEST("최신순"),
     NAME("이름순"),
@@ -69,7 +69,8 @@ internal class CameraScreen(
     private val onDownloadFile: (SdFileItem) -> Unit,
     private val onDeleteFile: (SdFileItem) -> Unit,
     private val onDeleteFolder: (dir: String, name: String) -> Unit,
-    private val onBatchDelete: (List<SdDeleteTarget>) -> Unit
+    private val onBatchDelete: (List<SdDeleteTarget>) -> Unit,
+    private val toolsTabView: View? = null
 ) {
     val root = FrameLayout(context)
 
@@ -78,6 +79,12 @@ internal class CameraScreen(
     private val statusDot = View(context)
     private var lastStatusDotColor: Int = 0
     private var pendingShareBanner: TextView? = null
+    private var mp4BannerRoot: LinearLayout? = null
+    private var mp4BannerTitle: TextView? = null
+    private var mp4BannerSub: TextView? = null
+    private var mp4BannerFill: View? = null
+    private var mp4BannerActionBtn: TextView? = null
+    private var mp4BannerCloseBtn: TextView? = null
     private val statusPill = LinearLayout(context).apply {
         orientation = LinearLayout.HORIZONTAL
         gravity = Gravity.CENTER_VERTICAL
@@ -367,17 +374,70 @@ internal class CameraScreen(
             setMargins(UiStyle.dp(context, 16), 0, UiStyle.dp(context, 16), UiStyle.dp(context, 8))
         })
 
+        // Non-blocking background MP4 conversion banner (stays slim while user watches live or browses tabs)
+        val mp4Title = UiStyle.label(context, "", 12.5f, UiStyle.INK, bold = true).apply {
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.MIDDLE
+        }
+        val mp4Sub = UiStyle.label(context, "", 11.5f, UiStyle.SECONDARY).apply {
+            typeface = Typeface.MONOSPACE
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        val mp4Action = UiStyle.compactChipButton(context, "취소", UiStyle.SURFACE, UiStyle.SECONDARY, UiStyle.BORDER) {}
+        val mp4Close = UiStyle.compactChipButton(context, "닫기", UiStyle.SURFACE, UiStyle.MUTED, UiStyle.BORDER) {}.apply {
+            visibility = View.GONE
+        }
+        val mp4Track = FrameLayout(context).apply {
+            background = UiStyle.rounded(context, UiStyle.BG, 99)
+        }
+        val mp4Fill = View(context).apply {
+            background = UiStyle.rounded(context, UiStyle.ACCENT, 99)
+        }
+        mp4Track.addView(mp4Fill, FrameLayout.LayoutParams(0, UiStyle.dp(context, 5)))
+        val mp4Card = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            background = UiStyle.rounded(context, UiStyle.SURFACE_ALT, 14, UiStyle.BORDER)
+            setPadding(UiStyle.dp(context, 12), UiStyle.dp(context, 9), UiStyle.dp(context, 10), UiStyle.dp(context, 9))
+            addView(LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                addView(LinearLayout(context).apply {
+                    orientation = LinearLayout.VERTICAL
+                    addView(mp4Title)
+                    addView(mp4Sub, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 2) })
+                }, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = UiStyle.dp(context, 8) })
+                addView(mp4Action, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = UiStyle.dp(context, 6) })
+                addView(mp4Close)
+            })
+            addView(mp4Track, LinearLayout.LayoutParams(-1, UiStyle.dp(context, 5)).apply { topMargin = UiStyle.dp(context, 7) })
+        }
+        mp4BannerRoot = mp4Card
+        mp4BannerTitle = mp4Title
+        mp4BannerSub = mp4Sub
+        mp4BannerFill = mp4Fill
+        mp4BannerActionBtn = mp4Action
+        mp4BannerCloseBtn = mp4Close
+        shell.addView(mp4Card, LinearLayout.LayoutParams(-1, -2).apply {
+            setMargins(UiStyle.dp(context, 16), 0, UiStyle.dp(context, 16), UiStyle.dp(context, 8))
+        })
+
         // --- Center Tab Host ---
         val host = FrameLayout(context)
         val liveView = buildLiveTab(config)
         val recordView = buildRecordTab()
         val libraryView = buildLibraryTab()
+        val toolsView = toolsTabView ?: View(context)
+        (toolsView.parent as? android.view.ViewGroup)?.removeView(toolsView)
         tabContainers[AppTab.LIVE] = liveView
         tabContainers[AppTab.RECORD] = recordView
         tabContainers[AppTab.LIBRARY] = libraryView
+        tabContainers[AppTab.TOOLS] = toolsView
         host.addView(liveView, FrameLayout.LayoutParams(-1, -1))
         host.addView(recordView, FrameLayout.LayoutParams(-1, -1))
         host.addView(libraryView, FrameLayout.LayoutParams(-1, -1))
+        host.addView(toolsView, FrameLayout.LayoutParams(-1, -1))
         shell.addView(host, LinearLayout.LayoutParams(-1, 0, 1f))
 
         // --- Bottom Navigation Bar ---
@@ -390,6 +450,7 @@ internal class CameraScreen(
             addView(buildNavItem(AppTab.LIVE, R.drawable.ic_tab_live, "실시간"), LinearLayout.LayoutParams(0, -2, 1f))
             addView(buildNavItem(AppTab.RECORD, R.drawable.ic_tab_record, "녹화"), LinearLayout.LayoutParams(0, -2, 1f))
             addView(buildNavItem(AppTab.LIBRARY, R.drawable.ic_tab_library, "보관함"), LinearLayout.LayoutParams(0, -2, 1f))
+            addView(buildNavItem(AppTab.TOOLS, R.drawable.ic_tab_tools, "도구"), LinearLayout.LayoutParams(0, -2, 1f))
         }
         shell.addView(navBar, LinearLayout.LayoutParams(-1, -2))
 
@@ -631,10 +692,10 @@ internal class CameraScreen(
             UiStyle.SECONDARY
         ).apply { setPadding(0, UiStyle.dp(context, 6), 0, UiStyle.dp(context, 12)) })
 
-        bbCard.addView(UiStyle.label(context, "파일 분할 단위", 12.5f, UiStyle.MUTED, bold = true))
+        bbCard.addView(UiStyle.label(context, "파일 분할 단위 (1분 설정 시 다운로드·MP4 변환 3배 빠름)", 12.5f, UiStyle.MUTED, bold = true))
         val (segChips, segRenderer) = UiStyle.segmentedChips(
             context,
-            listOf(180 to "3분", 300 to "5분"),
+            listOf(60 to "1분", 180 to "3분", 300 to "5분"),
             selectedSegmentS
         ) { selectedSegmentS = it }
         renderSegmentChips = segRenderer
@@ -1031,6 +1092,70 @@ internal class CameraScreen(
         }
     }
 
+    fun showMp4Job(
+        state: AviToMp4Converter.JobUiState?,
+        onCancel: () -> Unit,
+        onShare: (AviToMp4Converter.ConversionResult) -> Unit,
+        onDismiss: () -> Unit
+    ) {
+        val rootCard = mp4BannerRoot ?: return
+        if (state == null || (!state.running && !state.error && state.result == null)) {
+            rootCard.visibility = View.GONE
+            return
+        }
+        rootCard.visibility = View.VISIBLE
+        val stroke = when {
+            state.error -> UiStyle.DANGER
+            state.result != null -> UiStyle.ACCENT
+            else -> UiStyle.BORDER
+        }
+        rootCard.background = UiStyle.rounded(context, UiStyle.SURFACE_ALT, 14, stroke)
+        mp4BannerTitle?.text = if (state.result != null) "MP4 변환 완료 · ${state.title}" else "MP4 변환 · ${state.title}"
+        mp4BannerSub?.text = state.message
+        mp4BannerSub?.setTextColor(when {
+            state.error -> UiStyle.DANGER
+            state.result != null -> UiStyle.ACCENT
+            else -> UiStyle.SECONDARY
+        })
+
+        val pVal = state.percent.coerceIn(0, 100)
+        mp4BannerFill?.post {
+            val w = (mp4BannerFill?.parent as? View)?.width ?: return@post
+            val lp = mp4BannerFill?.layoutParams ?: return@post
+            lp.width = (w * pVal / 100).coerceAtLeast(if (pVal > 0) UiStyle.dp(context, 6) else 0)
+            mp4BannerFill?.layoutParams = lp
+            mp4BannerFill?.background = UiStyle.rounded(context, if (state.error) UiStyle.DANGER else UiStyle.ACCENT, 99)
+        }
+
+        val actionBtn = mp4BannerActionBtn ?: return
+        val closeBtn = mp4BannerCloseBtn ?: return
+        when {
+            state.running -> {
+                actionBtn.visibility = View.VISIBLE
+                actionBtn.text = "취소"
+                actionBtn.setTextColor(UiStyle.DANGER)
+                actionBtn.background = UiStyle.rippleRounded(context, UiStyle.DANGER_SOFT, 10, 0xff5A2427.toInt())
+                actionBtn.setOnClickListener { onCancel() }
+                closeBtn.visibility = View.GONE
+            }
+            state.result != null -> {
+                val res = state.result
+                actionBtn.visibility = View.VISIBLE
+                actionBtn.text = "공유"
+                actionBtn.setTextColor(UiStyle.ON_ACCENT)
+                actionBtn.background = UiStyle.rippleRounded(context, UiStyle.ACCENT, 10, null)
+                actionBtn.setOnClickListener { onShare(res) }
+                closeBtn.visibility = View.VISIBLE
+                closeBtn.setOnClickListener { onDismiss() }
+            }
+            else -> {
+                actionBtn.visibility = View.GONE
+                closeBtn.visibility = View.VISIBLE
+                closeBtn.setOnClickListener { onDismiss() }
+            }
+        }
+    }
+
     fun showTelemetry(value: String?) {
         telemetryText.visibility = if (value == null) View.GONE else View.VISIBLE
         if (value != null && telemetryText.text != value) telemetryText.text = value
@@ -1153,7 +1278,11 @@ internal class CameraScreen(
             sdErrorBanner?.visibility = View.GONE
         }
 
-        selectedSegmentS = if (status.segmentSeconds >= 240) 300 else 180
+        selectedSegmentS = when {
+            status.segmentSeconds <= 90 -> 60
+            status.segmentSeconds >= 240 -> 300
+            else -> 180
+        }
         renderSegmentChips?.invoke(selectedSegmentS)
         selectedIntervalS = status.intervalSeconds.takeIf { it in listOf(1, 3, 5, 10, 30) } ?: 5
         renderIntervalChips?.invoke(selectedIntervalS)

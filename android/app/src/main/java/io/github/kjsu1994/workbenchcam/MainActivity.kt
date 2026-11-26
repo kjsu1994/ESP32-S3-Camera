@@ -39,6 +39,7 @@ import android.widget.LinearLayout
 import android.widget.Toast
 import android.window.OnBackInvokedCallback
 import android.window.OnBackInvokedDispatcher
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -49,6 +50,7 @@ class MainActivity : Activity() {
     private var wifiLock: WifiManager.WifiLock? = null
     private lateinit var screen: CameraScreen
     private var settingsScreen: SettingsScreen? = null
+    private var netToolsView: NetToolsView? = null
     private lateinit var secrets: ConnectionSecret
 
     private var password = ""
@@ -98,6 +100,8 @@ class MainActivity : Activity() {
     private var cachedBoardOptions: BoardOptions? = null
     private var pendingShare: PendingShare? = null
     private var otaInProgress = false
+    private var mp4JobState: AviToMp4Converter.JobUiState? = null
+    private var mp4CancelFlag: AtomicBoolean? = null
 
     private sealed class PendingShare {
         data class Text(val title: String, val text: String) : PendingShare()
@@ -270,6 +274,7 @@ class MainActivity : Activity() {
     }
 
     private fun createScreen(config: Configuration) {
+        val toolsView = netToolsView ?: NetToolsView(this) { preferredQrHost() }.also { netToolsView = it }
         screen = CameraScreen(
             context = this,
             config = config,
@@ -310,12 +315,13 @@ class MainActivity : Activity() {
             onCreateFolder = ::promptCreateSharedFolder,
             onRenameEntry = ::promptRenameSdEntry,
             onPlayFile = ::playSdFile,
-            onConvertMp4 = ::convertSdFileToMp4,
+            onConvertMp4 = { convertSdFileToMp4(it) },
             onQrShareFile = ::showQrForSdFile,
             onDownloadFile = ::downloadSdFile,
             onDeleteFile = ::confirmDeleteSdFile,
             onDeleteFolder = ::confirmDeleteSdFolder,
-            onBatchDelete = ::confirmBatchDeleteSd
+            onBatchDelete = ::confirmBatchDeleteSd,
+            toolsTabView = toolsView.root
         )
         setContentView(screen.root)
         screen.root.requestApplyInsets()
@@ -325,6 +331,7 @@ class MainActivity : Activity() {
         preview?.let(::renderLiveHud) ?: screen.showLiveHud(null)
         updateControls()
         screen.showSdStatus(sdStatus)
+        renderMp4Banner()
         if (lastSdListing != null && activeTab == AppTab.LIBRARY) {
             screen.showSdListing(lastSdListing, loading = false)
         }
@@ -343,6 +350,10 @@ class MainActivity : Activity() {
     private fun onTabChanged(tab: AppTab) {
         activeTab = tab
         updateBackCallbackRegistration()
+        if (tab == AppTab.TOOLS) {
+            netToolsView?.refreshNetworkInfo()
+            return
+        }
         val connected = boardTarget ?: return
         when (tab) {
             AppTab.RECORD -> {
@@ -350,7 +361,7 @@ class MainActivity : Activity() {
                 refreshSdStatus(connected, SystemClock.elapsedRealtime() + 2500L)
             }
             AppTab.LIBRARY -> refreshSdFiles()
-            AppTab.LIVE -> {}
+            AppTab.LIVE, AppTab.TOOLS -> {}
         }
     }
 
@@ -735,6 +746,7 @@ class MainActivity : Activity() {
             backCallback?.let { onBackInvokedDispatcher.unregisterOnBackInvokedCallback(it) }
             backCallback = null
         }
+        netToolsView?.stopAll()
         releaseNetwork()
         super.onDestroy()
     }
@@ -1532,7 +1544,9 @@ class MainActivity : Activity() {
             downloadSdFile(item)
             return
         }
-        SdPlayerDialog(this, connected, item, ::downloadSdFile).show()
+        SdPlayerDialog(this, connected, item, ::downloadSdFile) { fileItem, cached, idx ->
+            convertSdFileToMp4(fileItem, cached, idx)
+        }.show()
     }
 
     private fun preferredQrHost(): String? =
@@ -1571,10 +1585,49 @@ class MainActivity : Activity() {
         )
     }
 
-    private fun convertSdFileToMp4(item: SdFileItem) {
+    private fun convertSdFileToMp4(
+        item: SdFileItem,
+        existingCacheFile: File? = null,
+        existingIndex: AviFrameIndex? = null
+    ) {
         val connected = boardTarget ?: return
-        if (preview != null) stopPreview()
-        AviToMp4Converter.showConvertDialog(this, connected, item)
+        if (mp4JobState?.running == true) {
+            Toast.makeText(this, "이미 다른 MP4 변환이 진행 중입니다", Toast.LENGTH_SHORT).show()
+            return
+        }
+        // Only stop preview if we need to download from the board first; encoding itself uses 0% board bandwidth.
+        if (existingCacheFile == null && preview != null) stopPreview()
+        mp4CancelFlag = AviToMp4Converter.startBackgroundConvert(
+            activity = this,
+            target = connected,
+            item = item,
+            existingCacheFile = existingCacheFile,
+            existingIndex = existingIndex
+        ) { nextState ->
+            if (isDestroyed) return@startBackgroundConvert
+            mp4JobState = if (!nextState.running && !nextState.error && nextState.result == null) null else nextState
+            renderMp4Banner()
+            if (nextState.result != null) {
+                Toast.makeText(this, "MP4 저장 완료 (Movies/DockyCam)", Toast.LENGTH_SHORT).show()
+            }
+        }
+        Toast.makeText(this, "백그라운드 MP4 변환을 시작했습니다 (다운로드 후 실시간 시청 가능)", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun renderMp4Banner() {
+        screen.showMp4Job(
+            state = mp4JobState,
+            onCancel = {
+                mp4CancelFlag?.set(true)
+                mp4JobState = null
+                renderMp4Banner()
+            },
+            onShare = { res -> AviToMp4Converter.shareMp4(this, res) },
+            onDismiss = {
+                mp4JobState = null
+                renderMp4Banner()
+            }
+        )
     }
 
     private fun downloadSdFile(item: SdFileItem) {

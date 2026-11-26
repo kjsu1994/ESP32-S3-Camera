@@ -34,7 +34,8 @@ internal class SdPlayerDialog(
     private val activity: Activity,
     private val target: BoardTarget,
     private val item: SdFileItem,
-    private val onDownload: (SdFileItem) -> Unit
+    private val onDownload: (SdFileItem) -> Unit,
+    private val onConvertMp4: (SdFileItem, File?, AviFrameIndex?) -> Unit
 ) {
     private val handler = Handler(Looper.getMainLooper())
     private var dialog: Dialog? = null
@@ -123,10 +124,8 @@ internal class SdPlayerDialog(
         mp4ConvertBtn = UiStyle.compactChipButton(
             activity, "MP4", UiStyle.AMBER_SOFT, UiStyle.AMBER, 0xff594218.toInt()
         ) {
-            playing = false
-            updatePlayButton()
-            handler.removeCallbacks(playbackTick)
-            AviToMp4Converter.showConvertDialog(activity, target, item, cacheFile, aviIndex)
+            onConvertMp4(item, cacheFile, aviIndex)
+            d.dismiss()
         }.apply {
             visibility = View.GONE
             minimumHeight = UiStyle.dp(activity, 38)

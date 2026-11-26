@@ -49,6 +49,172 @@ internal object AviToMp4Converter {
         val frameCount: Int
     )
 
+    data class JobUiState(
+        val title: String,
+        val message: String,
+        val percent: Int,
+        val running: Boolean,
+        val error: Boolean = false,
+        val result: ConversionResult? = null
+    )
+
+    fun shareMp4(activity: Activity, res: ConversionResult) {
+        val shareIntent = Intent(Intent.ACTION_SEND).apply {
+            type = "video/mp4"
+            putExtra(Intent.EXTRA_STREAM, res.mediaUri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        runCatching {
+            activity.startActivity(Intent.createChooser(shareIntent, "MP4 영상 공유"))
+        }.onFailure {
+            Toast.makeText(activity, "공유할 앱을 열 수 없습니다", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /**
+     * Runs AVI -> H.264 MP4 conversion in the background without blocking the UI.
+     * Once the board download phase completes, the board is immediately free for live viewing
+     * while the phone finishes H.264 encoding in the background.
+     */
+    fun startBackgroundConvert(
+        activity: Activity,
+        target: BoardTarget,
+        item: SdFileItem,
+        existingCacheFile: File? = null,
+        existingIndex: AviFrameIndex? = null,
+        onState: (JobUiState) -> Unit
+    ): AtomicBoolean {
+        val handler = Handler(Looper.getMainLooper())
+        val cancelled = AtomicBoolean(false)
+        val title = UiStyle.formatSdTitle(item.name)
+
+        fun emit(state: JobUiState) {
+            handler.post { onState(state) }
+        }
+
+        // Snapshot existing cache file synchronously so closing SdPlayerDialog cannot delete it mid-encode.
+        val ownedSource: File? = if (existingCacheFile != null && existingCacheFile.exists() && existingIndex != null) {
+            runCatching {
+                val copy = File(activity.cacheDir, "dockycam_bg_src_${SystemClock.elapsedRealtime()}.avi")
+                existingCacheFile.copyTo(copy, overwrite = true)
+                copy
+            }.getOrNull()
+        } else null
+
+        emit(JobUiState(title, "MP4 변환 준비 중...", 2, running = true))
+
+        Thread({
+            var tempAvi: File? = ownedSource
+            val tempMp4 = File(activity.cacheDir, "dockycam_bg_enc_${SystemClock.elapsedRealtime()}.mp4")
+            try {
+                val aviFile: File
+                val index: AviFrameIndex
+                if (ownedSource != null && existingIndex != null) {
+                    aviFile = ownedSource
+                    index = existingIndex
+                } else {
+                    emit(JobUiState(title, "보드에서 영상 내려받는 중...", 3, running = true))
+                    val dlFile = File(activity.cacheDir, "dockycam_bg_dl_${SystemClock.elapsedRealtime()}.avi")
+                    tempAvi = dlFile
+                    val conn = BoardApi(target).openSdFile(item.category, item.name, 25000, item.dir)
+                    try {
+                        if (conn.responseCode != 200) throw IOException("HTTP ${conn.responseCode}")
+                        val total = conn.getHeaderField("X-File-Size")?.toLongOrNull()
+                            ?: item.sizeBytes.takeIf { it > 0L }
+                            ?: conn.contentLengthLong
+                        val buf = ByteArray(16384)
+                        var got = 0L
+                        var lastUi = 0L
+                        conn.inputStream.use { inp ->
+                            FileOutputStream(dlFile).use { out ->
+                                while (!cancelled.get()) {
+                                    val n = inp.read(buf)
+                                    if (n <= 0) break
+                                    out.write(buf, 0, n)
+                                    got += n
+                                    val now = SystemClock.elapsedRealtime()
+                                    if (now - lastUi >= 180L) {
+                                        lastUi = now
+                                        val dlPct = if (total > 0L) ((got * 35L) / total).toInt().coerceIn(3, 35) else 15
+                                        emit(JobUiState(title, "다운로드 중 · ${UiStyle.formatSize(got)}", dlPct, running = true))
+                                    }
+                                }
+                            }
+                        }
+                    } finally {
+                        conn.disconnect()
+                    }
+                    if (cancelled.get()) throw IOException("변환이 취소되었습니다")
+                    emit(JobUiState(title, "다운로드 완료 · 프레임 분석 중 (실시간 시청 가능)", 38, running = true))
+                    aviFile = dlFile
+                    index = AviMjpegIndexer.indexFile(aviFile)
+                }
+
+                val basePct = if (ownedSource == null) 40 else 5
+                val spanPct = 95 - basePct
+                val frameCount = convertFileToMp4(aviFile, index, tempMp4, cancelled) { done, total ->
+                    val pct = basePct + ((done.toLong() * spanPct) / total.coerceAtLeast(1)).toInt()
+                    emit(JobUiState(title, "H.264 변환 중 · $done/$total ($pct%) · 실시간 시청 가능", pct, running = true))
+                }
+
+                emit(JobUiState(title, "갤러리(Movies/DockyCam) 저장 중...", 97, running = true))
+                val mp4Name = item.name.replace(Regex("\\.avi$", RegexOption.IGNORE_CASE), "") + ".mp4"
+                val values = ContentValues().apply {
+                    put(MediaStore.Video.Media.DISPLAY_NAME, mp4Name)
+                    put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                    put(MediaStore.Video.Media.RELATIVE_PATH, "${Environment.DIRECTORY_MOVIES}/DockyCam")
+                    put(MediaStore.Video.Media.IS_PENDING, 1)
+                }
+                val uri = checkNotNull(
+                    activity.contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+                )
+                try {
+                    checkNotNull(activity.contentResolver.openOutputStream(uri)).use { out ->
+                        tempMp4.inputStream().use { inp -> inp.copyTo(out, 16384) }
+                    }
+                    val ready = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
+                    check(activity.contentResolver.update(uri, ready, null, null) == 1)
+                } catch (e: Exception) {
+                    activity.contentResolver.delete(uri, null, null)
+                    throw e
+                }
+
+                val mp4Size = tempMp4.length()
+                val aviSize = aviFile.length()
+                val ratioPct = if (aviSize > 0L) (100 - (mp4Size * 100 / aviSize)).coerceAtLeast(0) else 0
+                val res = ConversionResult(uri, mp4Name, mp4Size, aviSize, frameCount)
+                emit(
+                    JobUiState(
+                        title = mp4Name,
+                        message = "MP4 저장 완료 · ${UiStyle.formatSize(aviSize)} → ${UiStyle.formatSize(mp4Size)} (${ratioPct}% 절감)",
+                        percent = 100,
+                        running = false,
+                        error = false,
+                        result = res
+                    )
+                )
+            } catch (err: Exception) {
+                if (cancelled.get()) {
+                    emit(JobUiState(title, "", 0, running = false, error = false, result = null))
+                } else {
+                    emit(
+                        JobUiState(
+                            title = title,
+                            message = "MP4 변환 실패: ${err.message ?: "오류"}",
+                            percent = 0,
+                            running = false,
+                            error = true
+                        )
+                    )
+                }
+            } finally {
+                runCatching { tempAvi?.delete() }
+                runCatching { tempMp4.delete() }
+            }
+        }, "avi-to-mp4-bg").start()
+        return cancelled
+    }
+
     fun convertFileToMp4(
         aviFile: File,
         index: AviFrameIndex,
