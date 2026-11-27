@@ -41,7 +41,8 @@ internal enum class LogDisplayDensity(val label: String) {
 internal enum class DetailViewMode(val label: String) {
     TEXT("TEXT"),
     HEX_DUMP("HEX 덤프"),
-    JSON("JSON 정렬")
+    JSON("JSON"),
+    DISSECT("자동 해독")
 }
 
 internal data class LogEntry(
@@ -55,7 +56,13 @@ internal data class LogEntry(
     val truncatedExtraBytes: Int = 0,
     val dedupKey: String = "",
     val firstSeq: Int = seq,
-    val repeatCount: Int = 1
+    val repeatCount: Int = 1,
+    val isUdp: Boolean = false,
+    val srcPort: Int = 0,
+    val dstPort: Int = 0,
+    val replayIp: String = "",
+    val replayPort: Int = 0,
+    val highlighted: Boolean = false
 ) {
     fun displayIndexLabel(): String = if (repeatCount > 1) "#$firstSeq~$seq (×$repeatCount)" else "#$seq"
 
@@ -272,6 +279,25 @@ internal object LogFilter {
         }
     }
 
+    fun parseWatchKeywords(csv: String): List<String> =
+        csv.split(',', '\n', ';')
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+
+    fun matchesAnyWatchKeyword(
+        header: String,
+        body: String,
+        fullText: String,
+        keywords: List<String>
+    ): Boolean {
+        if (keywords.isEmpty()) return false
+        return keywords.any { kw ->
+            header.contains(kw, ignoreCase = true) ||
+                body.contains(kw, ignoreCase = true) ||
+                (fullText.isNotEmpty() && fullText.contains(kw, ignoreCase = true))
+        }
+    }
+
     /**
      * Collapses consecutive entries with identical `dedupKey` into a single `×N` grouped row
      * without discarding the underlying raw packets (so `.pcap` export remains 100% intact).
@@ -383,16 +409,19 @@ private class LogEntryAdapter(
         val vPad = UiStyle.dp(context, if (compact) 4 else 6)
         val hPad = UiStyle.dp(context, 10)
         holder.root.setPadding(hPad, vPad, hPad, vPad)
+        holder.root.setBackgroundColor(if (entry.highlighted) 0x554B181C else 0x00000000)
+        val alertPrefix = if (entry.highlighted) "⚠ " else ""
+        val headerColor = if (entry.highlighted) UiStyle.DANGER else entry.accentColor
 
         if (compact) {
             val preview = entry.compactPreview.ifEmpty { entry.body.replace('\n', ' ') }
             val line = if (preview.isNotEmpty()) {
-                "${entry.displayIndexLabel()} ${entry.header}  |  $preview"
+                "$alertPrefix${entry.displayIndexLabel()} ${entry.header}  |  $preview"
             } else {
-                "${entry.displayIndexLabel()} ${entry.header}"
+                "$alertPrefix${entry.displayIndexLabel()} ${entry.header}"
             }
             holder.headerView.text = line
-            holder.headerView.setTextColor(entry.accentColor)
+            holder.headerView.setTextColor(headerColor)
             holder.headerView.textSize = (bodyFontSp - 0.5f).coerceAtLeast(9f)
             holder.headerView.maxLines = 1
             holder.headerView.ellipsize = TextUtils.TruncateAt.END
@@ -403,8 +432,8 @@ private class LogEntryAdapter(
 
         holder.headerView.maxLines = 3
         holder.headerView.ellipsize = null
-        holder.headerView.text = "${entry.displayIndexLabel()} ${entry.header}"
-        holder.headerView.setTextColor(entry.accentColor)
+        holder.headerView.text = "$alertPrefix${entry.displayIndexLabel()} ${entry.header}"
+        holder.headerView.setTextColor(headerColor)
         holder.headerView.textSize = (bodyFontSp - 0.5f).coerceAtLeast(9f)
 
         if (entry.body.isEmpty()) {
@@ -649,7 +678,8 @@ internal class LiveLogPanel(
 internal class PacketDetailDialog(
     private val context: Context,
     private val entries: List<LogEntry>,
-    startIndex: Int
+    startIndex: Int,
+    private val onReplay: ((LogEntry) -> Unit)? = null
 ) {
     private val dialog = Dialog(context, android.R.style.Theme_Black_NoTitleBar)
     private var index = startIndex.coerceIn(0, (entries.size - 1).coerceAtLeast(0))
@@ -662,6 +692,7 @@ internal class PacketDetailDialog(
     private val prevBtn: TextView
     private val posLabel: TextView
     private val nextBtn: TextView
+    private val replayBtn: TextView
     private val copyBtn: TextView
     private val renderModeChips: (DetailViewMode) -> Unit
 
@@ -746,6 +777,11 @@ internal class PacketDetailDialog(
                 renderCurrent()
             }
         }
+        replayBtn = UiStyle.compactChipButton(context, "▶ 재전송", UiStyle.CYAN_SOFT, UiStyle.CYAN, UiStyle.CYAN) {
+            val cur = entries.getOrNull(index) ?: return@compactChipButton
+            dismiss()
+            onReplay?.invoke(cur)
+        }
         copyBtn = UiStyle.compactChipButton(context, "전체 복사", UiStyle.ACCENT_SOFT, UiStyle.ACCENT, UiStyle.ACCENT) {
             copyCurrentFullPayload()
         }
@@ -754,11 +790,12 @@ internal class PacketDetailDialog(
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setBackgroundColor(UiStyle.SURFACE)
-            setPadding(UiStyle.dp(context, 12), UiStyle.dp(context, 8), UiStyle.dp(context, 12), UiStyle.dp(context, 8))
-            val gap = UiStyle.dp(context, 8)
+            setPadding(UiStyle.dp(context, 10), UiStyle.dp(context, 8), UiStyle.dp(context, 10), UiStyle.dp(context, 8))
+            val gap = UiStyle.dp(context, 6)
             addView(prevBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
             addView(posLabel, LinearLayout.LayoutParams(0, -2, 1f))
             addView(nextBtn, LinearLayout.LayoutParams(-2, -2).apply { marginStart = gap; marginEnd = gap })
+            addView(replayBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
             addView(copyBtn)
         }
 
@@ -807,6 +844,8 @@ internal class PacketDetailDialog(
         prevBtn.alpha = if (index > 0) 1f else 0.4f
         nextBtn.isEnabled = index < entries.lastIndex
         nextBtn.alpha = if (index < entries.lastIndex) 1f else 0.4f
+        val canReplay = onReplay != null && ((entry.rawBytes?.isNotEmpty() == true) || entry.fullText.isNotEmpty())
+        replayBtn.visibility = if (canReplay) View.VISIBLE else View.GONE
         renderModeChips(mode)
     }
 
@@ -825,6 +864,11 @@ internal class PacketDetailDialog(
                 LogFormatter.tryPrettyJson(src)
                     ?: "(JSON 형식이 아닌 패킷입니다 · TEXT 또는 HEX 덤프 탭을 확인하세요)\n\n$src"
             }
+            DetailViewMode.DISSECT -> {
+                val bytes = raw ?: entry.fullText.toByteArray(Charsets.UTF_8)
+                val res = ProtocolDissector.dissect(bytes, entry.srcPort, entry.dstPort, entry.isUdp)
+                "■ [${res.protocol}] ${res.summary}\n\n${res.details}"
+            }
         }
     }
 
@@ -839,6 +883,11 @@ internal class PacketDetailDialog(
             DetailViewMode.JSON -> {
                 val src = entry.rawBytes?.let { LogFormatter.formatReadableText(it, maxBytes = Int.MAX_VALUE) } ?: entry.fullText
                 LogFormatter.tryPrettyJson(src) ?: src
+            }
+            DetailViewMode.DISSECT -> {
+                val bytes = entry.rawBytes ?: entry.fullText.toByteArray(Charsets.UTF_8)
+                val res = ProtocolDissector.dissect(bytes, entry.srcPort, entry.dstPort, entry.isUdp)
+                "[${res.protocol}] ${res.summary}\n${res.details}"
             }
         }
         val textToCopy = "${entry.displayIndexLabel()} ${entry.header}\n$full"
@@ -864,6 +913,7 @@ internal data class FullscreenLogActions(
     val onCycleFormat: (() -> Unit)? = null,
     val onCycleDensity: (() -> Unit)? = null,
     val onToggleDedup: (() -> Unit)? = null,
+    val onEditWatch: (() -> Unit)? = null,
     val onExportPcap: (() -> Unit)? = null,
     val onCopyAll: () -> Unit,
     val onClear: () -> Unit,
@@ -893,6 +943,7 @@ internal class FullscreenLogDialog(
     private val formatChip: TextView?
     private val densityChip: TextView?
     private val dedupChip: TextView?
+    private val watchChip: TextView?
     private val followChip: TextView
     private val searchToggleChip: TextView
     private val searchBar: LinearLayout
@@ -972,6 +1023,11 @@ internal class FullscreenLogDialog(
 
         dedupChip = actions.onToggleDedup?.let { cb ->
             UiStyle.compactChipButton(context, "×N 묶기", UiStyle.SURFACE_ALT, UiStyle.SECONDARY, UiStyle.BORDER) { cb() }
+                .also { controlsRow.addView(it, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap }) }
+        }
+
+        watchChip = actions.onEditWatch?.let { cb ->
+            UiStyle.compactChipButton(context, "알림", UiStyle.SURFACE_ALT, UiStyle.SECONDARY, UiStyle.BORDER) { cb() }
                 .also { controlsRow.addView(it, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap }) }
         }
 
@@ -1202,7 +1258,8 @@ internal class FullscreenLogDialog(
         filterLabel: String? = null,
         formatLabel: String? = null,
         density: LogDisplayDensity? = null,
-        dedupEnabled: Boolean? = null
+        dedupEnabled: Boolean? = null,
+        watchCount: Int? = null
     ) {
         statsView.text = statusText
         statsView.setTextColor(statusColor)
@@ -1243,6 +1300,17 @@ internal class FullscreenLogDialog(
                 if (dedupEnabled) UiStyle.AMBER else UiStyle.SURFACE_ALT,
                 10,
                 if (dedupEnabled) null else UiStyle.BORDER
+            )
+        }
+        if (watchChip != null && watchCount != null) {
+            val active = watchCount > 0
+            watchChip.text = if (active) "⚠ 알림($watchCount)" else "알림"
+            watchChip.setTextColor(if (active) UiStyle.DANGER else UiStyle.SECONDARY)
+            watchChip.background = UiStyle.rippleRounded(
+                context,
+                if (active) UiStyle.DANGER_SOFT else UiStyle.SURFACE_ALT,
+                10,
+                if (active) UiStyle.DANGER else UiStyle.BORDER
             )
         }
     }

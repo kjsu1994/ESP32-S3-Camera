@@ -545,4 +545,142 @@ class NetLabEngineTest {
             serverThread.join(1000)
         }
     }
+
+    @Test fun udpRelayProxyForwardsBidirectionalDatagramsAndExportsValidUdpPcap() {
+        val targetSock = DatagramSocket(0).apply { soTimeout = 3000 }
+        val targetPort = targetSock.localPort
+        val targetThread = Thread {
+            runCatching {
+                val buf = ByteArray(256)
+                val req = DatagramPacket(buf, buf.size)
+                targetSock.receive(req)
+                val msg = String(req.data, req.offset, req.length, Charsets.US_ASCII)
+                val reply = "UDP_ACK:$msg".toByteArray(Charsets.US_ASCII)
+                targetSock.send(DatagramPacket(reply, reply.size, req.address, req.port))
+            }
+        }
+        targetThread.start()
+
+        val proxy = UdpRelayProxy()
+        val started = CountDownLatch(1)
+        val bothDirs = CountDownLatch(2)
+        val captured = CopyOnWriteArrayList<RelayedPacket>()
+        var proxyPort = 0
+
+        try {
+            proxy.start(
+                listenPort = 0,
+                targetHost = "127.0.0.1",
+                targetPort = targetPort,
+                onStarted = { p -> proxyPort = p; started.countDown() },
+                onSessionChanged = { _, _ -> },
+                onPacket = { pkt -> captured.add(pkt); bothDirs.countDown() },
+                onError = {},
+                onStopped = {}
+            )
+            assertTrue("UDP relay failed to start", started.await(2, TimeUnit.SECONDS))
+
+            DatagramSocket().use { client ->
+                client.soTimeout = 2000
+                val payload = "TELEM_PING".toByteArray(Charsets.US_ASCII)
+                client.send(DatagramPacket(payload, payload.size, InetAddress.getByName("127.0.0.1"), proxyPort))
+                val respBuf = ByteArray(256)
+                val resp = DatagramPacket(respBuf, respBuf.size)
+                client.receive(resp)
+                assertEquals("UDP_ACK:TELEM_PING", String(resp.data, resp.offset, resp.length, Charsets.US_ASCII))
+            }
+
+            assertTrue("Expected both UDP C->T and T->C packets", bothDirs.await(2, TimeUnit.SECONDS))
+            assertTrue(captured.all { it.isUdp })
+
+            // Verify PcapWriter writes IPv4 protocol 17 (UDP) with valid IPv4 header checksum
+            val out = ByteArrayOutputStream()
+            PcapWriter.writePcap(captured, out)
+            val raw = out.toByteArray()
+            val ipOff = 24 + 16 + 14
+            assertEquals(17, raw[ipOff + 9].toInt() and 0xFF) // IPv4 proto = UDP (17)
+            var sum = 0L
+            for (i in 0 until 20 step 2) {
+                sum += ((raw[ipOff + i].toInt() and 0xFF) shl 8) or (raw[ipOff + i + 1].toInt() and 0xFF)
+            }
+            while ((sum ushr 16) != 0L) sum = (sum and 0xFFFFL) + (sum ushr 16)
+            assertEquals(0xFFFFL, sum)
+        } finally {
+            proxy.stop()
+            targetSock.close()
+            targetThread.join(1000)
+        }
+    }
+
+    @Test fun protocolDissectorDecodesHttpModbusTlsSniMqttAndWatchKeywords() {
+        // 1. HTTP Request
+        val http = ProtocolDissector.dissect(
+            "GET /api/temp HTTP/1.1\r\nHost: dockycam.local\r\nContent-Type: application/json\r\n\r\n{\"a\":1}".toByteArray(),
+            dstPort = 80
+        )
+        assertEquals("HTTP", http.protocol)
+        assertTrue(http.details.contains("메서드: GET"))
+        assertTrue(http.details.contains("Host: dockycam.local"))
+
+        // 2. Modbus TCP Read Holding Registers (Unit 1, FC 03, Addr 100, Qty 2)
+        val modbusReq = byteArrayOf(0x00, 0x05, 0x00, 0x00, 0x00, 0x06, 0x01, 0x03, 0x00, 0x64, 0x00, 0x02)
+        val modbus = ProtocolDissector.dissect(modbusReq, dstPort = 502)
+        assertEquals("Modbus TCP", modbus.protocol)
+        assertTrue(modbus.details.contains("03 Read Holding Registers"))
+        assertTrue(modbus.details.contains("시작 주소: 100"))
+        assertTrue(modbus.details.contains("읽기 개수: 2"))
+
+        // 3. Synthetic TLS ClientHello with SNI "www.naver.com" + ALPN "h2" + TLS 1.3 supported_versions
+        val sniHost = "www.naver.com".toByteArray(Charsets.US_ASCII)
+        val sniExt = ByteArrayOutputStream().apply {
+            write(0x00); write(0x00) // ext type SNI
+            val innerLen = 2 + 1 + 2 + sniHost.size
+            write(innerLen ushr 8); write(innerLen and 0xFF)
+            val listLen = 1 + 2 + sniHost.size
+            write(listLen ushr 8); write(listLen and 0xFF)
+            write(0x00) // host_name
+            write(sniHost.size ushr 8); write(sniHost.size and 0xFF)
+            write(sniHost)
+        }.toByteArray()
+        val verExt = byteArrayOf(0x00, 0x2B, 0x00, 0x03, 0x02, 0x03, 0x04) // TLS 1.3
+        val exts = sniExt + verExt
+        val hsBody = ByteArrayOutputStream().apply {
+            write(0x03); write(0x03) // client_version TLS 1.2
+            write(ByteArray(32)) // random
+            write(0x00) // session_id len 0
+            write(0x00); write(0x02); write(0x13); write(0x01) // cipher suite
+            write(0x01); write(0x00) // compression
+            write(exts.size ushr 8); write(exts.size and 0xFF)
+            write(exts)
+        }.toByteArray()
+        val tlsRecord = ByteArrayOutputStream().apply {
+            val hsLen = hsBody.size
+            val recLen = 4 + hsLen
+            write(22); write(0x03); write(0x01) // Handshake record
+            write(recLen ushr 8); write(recLen and 0xFF)
+            write(1) // ClientHello
+            write((hsLen ushr 16) and 0xFF); write((hsLen ushr 8) and 0xFF); write(hsLen and 0xFF)
+            write(hsBody)
+        }.toByteArray()
+        val tls = ProtocolDissector.dissect(tlsRecord, dstPort = 443)
+        assertEquals("TLS", tls.protocol)
+        assertTrue("Expected SNI www.naver.com, got:\n${tls.details}", tls.details.contains("SNI 도메인: www.naver.com"))
+        assertTrue("Expected TLS 1.3, got:\n${tls.details}", tls.details.contains("TLS 1.3"))
+
+        // 4. MQTT PUBLISH ("sensor/temp" -> "42.5")
+        val topic = "sensor/temp".toByteArray(Charsets.UTF_8)
+        val payload = "42.5".toByteArray(Charsets.UTF_8)
+        val mqttRem = 2 + topic.size + payload.size
+        val mqttPkt = byteArrayOf(0x30, mqttRem.toByte(), 0x00, topic.size.toByte()) + topic + payload
+        val mqtt = ProtocolDissector.dissect(mqttPkt, dstPort = 1883)
+        assertEquals("MQTT", mqtt.protocol)
+        assertTrue(mqtt.details.contains("토픽: sensor/temp"))
+        assertTrue(mqtt.details.contains("42.5"))
+
+        // 5. Watch keywords
+        val kws = LogFilter.parseWatchKeywords("ERROR, fail ; ALARM")
+        assertEquals(listOf("ERROR", "fail", "ALARM"), kws)
+        assertTrue(LogFilter.matchesAnyWatchKeyword("T→C", "status=FAIL", "", kws))
+        assertFalse(LogFilter.matchesAnyWatchKeyword("T→C", "status=OK", "normal", kws))
+    }
 }

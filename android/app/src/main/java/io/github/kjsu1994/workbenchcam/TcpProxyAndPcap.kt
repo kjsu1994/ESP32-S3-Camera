@@ -4,6 +4,8 @@ import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
+import java.net.DatagramPacket
+import java.net.DatagramSocket
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
@@ -29,7 +31,8 @@ internal data class RelayedPacket(
     val dstIp: String,
     val dstPort: Int,
     val data: ByteArray,
-    val targetLabel: String = ""
+    val targetLabel: String = "",
+    val isUdp: Boolean = false
 )
 
 /**
@@ -597,7 +600,177 @@ internal class HttpWebProxy {
 }
 
 /**
- * Generates standard libpcap (`.pcap`, LinkType=1 Ethernet + IPv4 + TCP) files readable directly by Wireshark.
+ * Bidirectional UDP Relay Proxy (`Client -> [Phone:listenPort] -> Target:targetPort`).
+ * Maintains per-client NAT upstream sockets so responses from the target are routed back
+ * to the exact originating client IP:port while capturing every datagram in both directions.
+ */
+internal class UdpRelayProxy {
+    @Volatile private var running = false
+    private var frontSocket: DatagramSocket? = null
+    private val clientSessions = ConcurrentHashMap<String, UdpClientSession>()
+
+    private class UdpClientSession(
+        val clientAddr: InetAddress,
+        val clientPort: Int,
+        val upstream: DatagramSocket,
+        @Volatile var lastActiveMs: Long = System.currentTimeMillis()
+    )
+
+    fun isRunning(): Boolean = running
+
+    fun start(
+        listenPort: Int,
+        targetHost: String,
+        targetPort: Int,
+        onStarted: (actualListenPort: Int) -> Unit,
+        onSessionChanged: (activeSessions: Int, info: String) -> Unit,
+        onPacket: (RelayedPacket) -> Unit,
+        onError: (String) -> Unit,
+        onStopped: () -> Unit
+    ) {
+        stop()
+        running = true
+        Thread({
+            try {
+                val targetAddr = InetAddress.getByName(targetHost)
+                val targetIp = targetAddr.hostAddress ?: targetHost
+                val front = DatagramSocket(null).apply {
+                    reuseAddress = true
+                    soTimeout = 500
+                    bind(InetSocketAddress(listenPort))
+                }
+                frontSocket = front
+                onStarted(front.localPort)
+
+                val buf = ByteArray(65507)
+                var lastSweepMs = System.currentTimeMillis()
+
+                while (running && !front.isClosed) {
+                    val pkt = DatagramPacket(buf, buf.size)
+                    try {
+                        front.receive(pkt)
+                    } catch (_: SocketTimeoutException) {
+                        val now = System.currentTimeMillis()
+                        if (now - lastSweepMs > 10_000L) {
+                            lastSweepMs = now
+                            sweepIdleSessions(now, onSessionChanged)
+                        }
+                        continue
+                    }
+
+                    val payload = pkt.data.copyOfRange(pkt.offset, pkt.offset + pkt.length)
+                    val clientAddr = pkt.address
+                    val clientIp = clientAddr.hostAddress ?: "0.0.0.0"
+                    val clientPort = pkt.port
+                    val key = "$clientIp:$clientPort"
+
+                    val session = clientSessions.computeIfAbsent(key) {
+                        val up = DatagramSocket().apply { soTimeout = 1000 }
+                        val s = UdpClientSession(clientAddr, clientPort, up)
+                        startUpstreamReader(key, s, front, targetIp, targetPort, onSessionChanged, onPacket)
+                        onSessionChanged(clientSessions.size + 1, "UDP 세션: $clientIp:$clientPort ⇄ $targetIp:$targetPort")
+                        s
+                    }
+                    session.lastActiveMs = System.currentTimeMillis()
+
+                    session.upstream.send(DatagramPacket(payload, payload.size, targetAddr, targetPort))
+                    onPacket(
+                        RelayedPacket(
+                            timestampMs = System.currentTimeMillis(),
+                            direction = RelayDirection.CLIENT_TO_TARGET,
+                            srcIp = clientIp,
+                            srcPort = clientPort,
+                            dstIp = targetIp,
+                            dstPort = targetPort,
+                            data = payload,
+                            isUdp = true
+                        )
+                    )
+                }
+            } catch (e: Exception) {
+                if (running) onError(e.message ?: "UDP 중계 포트 $listenPort 열기 실패")
+            } finally {
+                running = false
+                closeAll()
+                onStopped()
+            }
+        }, "netlab-udp-relay").start()
+    }
+
+    private fun startUpstreamReader(
+        key: String,
+        session: UdpClientSession,
+        front: DatagramSocket,
+        targetIp: String,
+        targetPort: Int,
+        onSessionChanged: (activeSessions: Int, info: String) -> Unit,
+        onPacket: (RelayedPacket) -> Unit
+    ) {
+        val clientIp = session.clientAddr.hostAddress ?: "0.0.0.0"
+        Thread({
+            val buf = ByteArray(65507)
+            try {
+                while (running && !session.upstream.isClosed && !front.isClosed) {
+                    val resp = DatagramPacket(buf, buf.size)
+                    try {
+                        session.upstream.receive(resp)
+                    } catch (_: SocketTimeoutException) {
+                        continue
+                    }
+                    session.lastActiveMs = System.currentTimeMillis()
+                    val data = resp.data.copyOfRange(resp.offset, resp.offset + resp.length)
+                    front.send(DatagramPacket(data, data.size, session.clientAddr, session.clientPort))
+                    onPacket(
+                        RelayedPacket(
+                            timestampMs = System.currentTimeMillis(),
+                            direction = RelayDirection.TARGET_TO_CLIENT,
+                            srcIp = resp.address?.hostAddress ?: targetIp,
+                            srcPort = resp.port,
+                            dstIp = clientIp,
+                            dstPort = session.clientPort,
+                            data = data,
+                            isUdp = true
+                        )
+                    )
+                }
+            } catch (_: IOException) {
+            } finally {
+                if (clientSessions.remove(key, session)) {
+                    runCatching { session.upstream.close() }
+                    if (running) {
+                        onSessionChanged(clientSessions.size, "UDP 종료: $clientIp:${session.clientPort}")
+                    }
+                }
+            }
+        }, "netlab-udp-up-$key").start()
+    }
+
+    private fun sweepIdleSessions(nowMs: Long, onSessionChanged: (Int, String) -> Unit) {
+        val expired = clientSessions.entries.filter { nowMs - it.value.lastActiveMs > 60_000L }
+        for ((key, session) in expired) {
+            if (clientSessions.remove(key, session)) {
+                runCatching { session.upstream.close() }
+                onSessionChanged(clientSessions.size, "UDP 유휴 종료: $key")
+            }
+        }
+    }
+
+    private fun closeAll() {
+        runCatching { frontSocket?.close() }
+        frontSocket = null
+        val list = clientSessions.values.toList()
+        clientSessions.clear()
+        list.forEach { runCatching { it.upstream.close() } }
+    }
+
+    fun stop() {
+        running = false
+        closeAll()
+    }
+}
+
+/**
+ * Generates standard libpcap (`.pcap`, LinkType=1 Ethernet + IPv4 + TCP/UDP) files readable directly by Wireshark.
  */
 internal object PcapWriter {
     fun writePcap(packets: List<RelayedPacket>, out: OutputStream) {
@@ -614,25 +787,37 @@ internal object PcapWriter {
 
         // Track synthetic TCP sequence numbers per flow so Wireshark reconstructs streams cleanly
         val seqMap = HashMap<String, Long>()
+        var ipIdCounter = 1
 
         for (pkt in packets) {
             val srcAddr = ipv4Bytes(pkt.srcIp)
             val dstAddr = ipv4Bytes(pkt.dstIp)
-            val fwdKey = "${pkt.srcIp}:${pkt.srcPort}->${pkt.dstIp}:${pkt.dstPort}"
-            val revKey = "${pkt.dstIp}:${pkt.dstPort}->${pkt.srcIp}:${pkt.srcPort}"
-            val seq = seqMap.getOrDefault(fwdKey, 1L)
-            val ack = seqMap.getOrDefault(revKey, 1L)
-            seqMap[fwdKey] = (seq + pkt.data.size.toLong()) and 0xFFFFFFFFL
+            val frame = if (pkt.isUdp) {
+                buildEthernetIpv4UdpFrame(
+                    srcIp = srcAddr,
+                    srcPort = pkt.srcPort,
+                    dstIp = dstAddr,
+                    dstPort = pkt.dstPort,
+                    ipId = ipIdCounter++,
+                    payload = pkt.data
+                )
+            } else {
+                val fwdKey = "${pkt.srcIp}:${pkt.srcPort}->${pkt.dstIp}:${pkt.dstPort}"
+                val revKey = "${pkt.dstIp}:${pkt.dstPort}->${pkt.srcIp}:${pkt.srcPort}"
+                val seq = seqMap.getOrDefault(fwdKey, 1L)
+                val ack = seqMap.getOrDefault(revKey, 1L)
+                seqMap[fwdKey] = (seq + pkt.data.size.toLong()) and 0xFFFFFFFFL
 
-            val frame = buildEthernetIpv4TcpFrame(
-                srcIp = srcAddr,
-                srcPort = pkt.srcPort,
-                dstIp = dstAddr,
-                dstPort = pkt.dstPort,
-                seq = seq,
-                ack = ack,
-                payload = pkt.data
-            )
+                buildEthernetIpv4TcpFrame(
+                    srcIp = srcAddr,
+                    srcPort = pkt.srcPort,
+                    dstIp = dstAddr,
+                    dstPort = pkt.dstPort,
+                    seq = seq,
+                    ack = ack,
+                    payload = pkt.data
+                )
+            }
             val tsSec = (pkt.timestampMs / 1000L).toInt()
             val tsUsec = ((pkt.timestampMs % 1000L) * 1000L).toInt()
 
@@ -645,6 +830,43 @@ internal object PcapWriter {
             out.write(frame)
         }
         out.flush()
+    }
+
+    private fun buildEthernetIpv4UdpFrame(
+        srcIp: ByteArray,
+        srcPort: Int,
+        dstIp: ByteArray,
+        dstPort: Int,
+        ipId: Int,
+        payload: ByteArray
+    ): ByteArray {
+        val udpLen = 8 + payload.size
+        val ipLen = 20 + udpLen
+        val frame = ByteArray(14 + ipLen)
+
+        frame[0] = 0x02; frame[5] = 0x02
+        frame[6] = 0x02; frame[11] = 0x01
+        frame[12] = 0x08; frame[13] = 0x00
+
+        val ip = 14
+        frame[ip] = 0x45
+        frame[ip + 1] = 0x00
+        putBe16(frame, ip + 2, ipLen)
+        putBe16(frame, ip + 4, ipId and 0xFFFF)
+        putBe16(frame, ip + 6, 0x4000)
+        frame[ip + 8] = 64
+        frame[ip + 9] = 17 // UDP
+        System.arraycopy(srcIp, 0, frame, ip + 12, 4)
+        System.arraycopy(dstIp, 0, frame, ip + 16, 4)
+        putBe16(frame, ip + 10, onesComplementChecksum(frame, ip, 20))
+
+        val udp = 34
+        putBe16(frame, udp, srcPort and 0xFFFF)
+        putBe16(frame, udp + 2, dstPort and 0xFFFF)
+        putBe16(frame, udp + 4, udpLen and 0xFFFF)
+        putBe16(frame, udp + 6, 0) // UDP checksum optional in IPv4 (0x0000 = valid)
+        System.arraycopy(payload, 0, frame, udp + 8, payload.size)
+        return frame
     }
 
     private fun buildEthernetIpv4TcpFrame(
