@@ -37,6 +37,82 @@ internal object UiStyle {
     const val CYAN = 0xff38BDF8.toInt()
     const val CYAN_SOFT = 0xff122B3A.toInt()
     const val OVERLAY = 0xcc090E0C.toInt()
+    const val GLASS = 0x66090D0C.toInt()
+    const val GLASS_DOCK = 0x990A0F0E.toInt()
+    const val GLASS_STROKE = 0x2EFFFFFF.toInt()
+
+    fun scrimGradient(topToBottom: Boolean): GradientDrawable = GradientDrawable(
+        if (topToBottom) GradientDrawable.Orientation.TOP_BOTTOM else GradientDrawable.Orientation.BOTTOM_TOP,
+        intArrayOf(0xD4000000.toInt(), 0x66000000.toInt(), 0x00000000)
+    )
+
+    fun glassCircleButton(
+        context: Context,
+        iconRes: Int,
+        contentDesc: String,
+        sizeDp: Int = 42,
+        iconDp: Int = 20,
+        bgColor: Int = GLASS,
+        tint: Int = INK,
+        strokeColor: Int? = GLASS_STROKE,
+        onClick: () -> Unit
+    ): Pair<FrameLayout, ImageView> {
+        val size = dp(context, sizeDp)
+        val icon = ImageView(context).apply {
+            setImageResource(iconRes)
+            imageTintList = ColorStateList.valueOf(tint)
+            scaleType = ImageView.ScaleType.FIT_CENTER
+        }
+        val iconPx = dp(context, iconDp)
+        val btn = FrameLayout(context).apply {
+            contentDescription = contentDesc
+            isClickable = true
+            isFocusable = true
+            background = rippleRounded(context, bgColor, 99, strokeColor, 0x38FFFFFF)
+            layoutParams = LinearLayout.LayoutParams(size, size)
+            addView(icon, FrameLayout.LayoutParams(iconPx, iconPx, Gravity.CENTER))
+            setOnClickListener { onClick() }
+        }
+        return btn to icon
+    }
+
+    fun glassPillButton(
+        context: Context,
+        iconRes: Int?,
+        labelText: String,
+        bgColor: Int = GLASS,
+        textColor: Int = INK,
+        strokeColor: Int? = GLASS_STROKE,
+        onClick: () -> Unit
+    ): Triple<LinearLayout, ImageView?, TextView> {
+        val icon = iconRes?.let { res ->
+            ImageView(context).apply {
+                setImageResource(res)
+                imageTintList = ColorStateList.valueOf(textColor)
+                scaleType = ImageView.ScaleType.FIT_CENTER
+            }
+        }
+        val label = label(context, labelText, 12.5f, textColor, bold = true).apply {
+            maxLines = 1
+        }
+        val pill = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            isClickable = true
+            isFocusable = true
+            minimumHeight = dp(context, 38)
+            background = rippleRounded(context, bgColor, 99, strokeColor, 0x38FFFFFF)
+            setPadding(dp(context, 13), dp(context, 7), dp(context, 13), dp(context, 7))
+            if (icon != null) {
+                addView(icon, LinearLayout.LayoutParams(dp(context, 16), dp(context, 16)).apply {
+                    marginEnd = dp(context, 6)
+                })
+            }
+            addView(label)
+            setOnClickListener { onClick() }
+        }
+        return Triple(pill, icon, label)
+    }
 
     fun dp(context: Context, value: Int): Int = (value * context.resources.displayMetrics.density).toInt()
 

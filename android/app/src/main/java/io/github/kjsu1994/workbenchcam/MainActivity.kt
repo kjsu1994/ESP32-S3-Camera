@@ -120,6 +120,11 @@ class MainActivity : Activity() {
             screen.showFullscreenOverlay(false)
         }
     }
+    private val hideUnlockPill = Runnable {
+        if (fullscreen && screen.isFullscreenLocked()) {
+            screen.flashUnlockPill(false)
+        }
+    }
     private val retryPreview = Runnable {
         if (visible && preview == null && !stoppingPreview) {
             boardTarget?.let(::startPreview)
@@ -785,6 +790,7 @@ class MainActivity : Activity() {
     private fun exitFullscreen() {
         if (!fullscreen) return
         handler.removeCallbacks(hideFullscreenOverlay)
+        handler.removeCallbacks(hideUnlockPill)
         fullscreen = false
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
         createScreen(resources.configuration)
@@ -792,6 +798,12 @@ class MainActivity : Activity() {
 
     private fun toggleFullscreenOverlay() {
         if (!fullscreen) return
+        if (screen.isFullscreenLocked()) {
+            screen.flashUnlockPill(true)
+            handler.removeCallbacks(hideUnlockPill)
+            handler.postDelayed(hideUnlockPill, 2500)
+            return
+        }
         fullscreenOverlayVisible = !fullscreenOverlayVisible
         screen.showFullscreenOverlay(fullscreenOverlayVisible)
         if (fullscreenOverlayVisible) scheduleOverlayAutoHide() else handler.removeCallbacks(hideFullscreenOverlay)
@@ -799,7 +811,7 @@ class MainActivity : Activity() {
 
     private fun scheduleOverlayAutoHide() {
         handler.removeCallbacks(hideFullscreenOverlay)
-        if (fullscreen && fullscreenOverlayVisible && preview != null) {
+        if (fullscreen && fullscreenOverlayVisible && preview != null && !screen.isFullscreenLocked()) {
             handler.postDelayed(hideFullscreenOverlay, 3000)
         }
     }
@@ -859,6 +871,7 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         handler.removeCallbacks(hideFullscreenOverlay)
+        handler.removeCallbacks(hideUnlockPill)
         handler.removeCallbacks(pauseInBackground)
         handler.removeCallbacks(retryPreview)
         handler.removeCallbacks(renderFrame)
@@ -1752,7 +1765,7 @@ class MainActivity : Activity() {
                 Toast.makeText(this, "MP4 저장 완료 (Movies/DockyCam)", Toast.LENGTH_SHORT).show()
             }
         }
-        Toast.makeText(this, "백그라운드 MP4 변환을 시작했습니다 (다운로드 후 실시간 시청 가능)", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, "MP4로 자동 변환해 갤러리(Movies/DockyCam)에 저장합니다", Toast.LENGTH_SHORT).show()
     }
 
     private fun renderMp4Banner() {

@@ -136,9 +136,13 @@ internal class CameraScreen(
         visibility = View.GONE
     }
     private var liveHudToggleBtn: TextView? = null
-    private var fsHudBtn: Button? = null
+    private var fsHudBtn: FrameLayout? = null
+    private var fsHudIcon: ImageView? = null
     private var lastLiveHudText: String? = null
     private var fsOverlayShown = true
+    private var fsLocked = false
+    private var fsUnlockBar: LinearLayout? = null
+    private var fsLockBtn: FrameLayout? = null
     private val telemetryText = UiStyle.label(context, "", 12.5f, UiStyle.SECONDARY).apply {
         visibility = View.GONE
         background = UiStyle.rounded(context, UiStyle.SURFACE, 12, UiStyle.BORDER)
@@ -174,16 +178,25 @@ internal class CameraScreen(
     private var torchPillLabel: TextView? = null
     private var videoFullscreenBtn: FrameLayout? = null
 
-    // Fullscreen HUD Controls
+    // Fullscreen HUD Controls (One UI Cinema Style)
     private var hudOverlay: FrameLayout? = null
-    private var fsStartBtn: Button? = null
-    private var fsStopBtn: Button? = null
-    private var fsFreezeBtn: Button? = null
-    private var fsPhotoBtn: Button? = null
-    private var fsGridBtn: Button? = null
-    private var fsScaleBtn: Button? = null
-    private var fsNightBtn: TextView? = null
-    private var fsTorchBtn: TextView? = null
+    private var fsStartBtn: LinearLayout? = null
+    private var fsStartLabel: TextView? = null
+    private var fsStopBtn: LinearLayout? = null
+    private var fsFreezeBtn: FrameLayout? = null
+    private var fsFreezeIcon: ImageView? = null
+    private var fsPhotoBtn: FrameLayout? = null
+    private var fsGridBtn: FrameLayout? = null
+    private var fsGridIcon: ImageView? = null
+    private var fsScaleBtn: LinearLayout? = null
+    private var fsScaleIcon: ImageView? = null
+    private var fsScaleLabel: TextView? = null
+    private var fsZoomResetBtn: LinearLayout? = null
+    private var fsZoomResetLabel: TextView? = null
+    private var fsNightBtn: FrameLayout? = null
+    private var fsNightIcon: ImageView? = null
+    private var fsTorchBtn: FrameLayout? = null
+    private var fsTorchIcon: ImageView? = null
 
     // Main Shell & Tabs
     private var mainShell: LinearLayout? = null
@@ -267,38 +280,60 @@ internal class CameraScreen(
 
         telemetryText.background = null
         telemetryText.setPadding(0, UiStyle.dp(context, 2), 0, 0)
-        telemetryText.textSize = 11.5f
+        telemetryText.textSize = 11f
+        telemetryText.setTextColor(0xccFFFFFF.toInt())
 
-        val nBtn = UiStyle.compactChipButton(context, "야간 흑백", UiStyle.SURFACE_ALT, UiStyle.INK, UiStyle.BORDER, toggleNightMode)
-        val tBtn = UiStyle.compactChipButton(context, "화이트 LED", UiStyle.SURFACE_ALT, UiStyle.INK, UiStyle.BORDER, toggleTorch)
-        val hBtn = UiStyle.secondaryButton(context, if (hudEnabled) "HUD 끄기" else "HUD", toggleHud)
-        val gBtn = UiStyle.secondaryButton(context, if (gridEnabled) "그리드 끄기" else "그리드", toggleGrid)
-        val exitBtn = UiStyle.secondaryButton(context, "나가기", toggleFullscreen)
-        fsNightBtn = nBtn
-        fsTorchBtn = tBtn
-        fsHudBtn = hBtn
-        fsGridBtn = gBtn
+        // Sleek One UI translucent status pill
+        statusPill.background = UiStyle.rounded(context, UiStyle.GLASS, 99, UiStyle.GLASS_STROKE)
+        zoomBadge.setOnClickListener {
+            image.resetZoom()
+        }
+
+        // Top Bar (One UI Cinema: soft vertical scrim + circular glass icons)
+        val (exitBtn, _) = UiStyle.glassCircleButton(context, R.drawable.ic_back, "나가기", 42, 20) {
+            toggleFullscreen()
+        }
+        val (nBtn, nIcon) = UiStyle.glassCircleButton(context, R.drawable.ic_night, "야간 흑백", 40, 19) {
+            toggleNightMode()
+        }
+        val (tBtn, tIcon) = UiStyle.glassCircleButton(context, R.drawable.ic_torch, "화이트 LED", 40, 19) {
+            toggleTorch()
+        }
+        val (gBtn, gIcon) = UiStyle.glassCircleButton(context, R.drawable.ic_grid, "그리드", 40, 19) {
+            toggleGrid()
+        }
+        val (hBtn, hIcon) = UiStyle.glassCircleButton(context, R.drawable.ic_hud, "HUD", 40, 19) {
+            toggleHud()
+        }
+        val (lBtn, _) = UiStyle.glassCircleButton(context, R.drawable.ic_lock, "화면 잠금", 40, 18) {
+            setFullscreenLocked(true)
+        }
+        fsNightBtn = nBtn; fsNightIcon = nIcon
+        fsTorchBtn = tBtn; fsTorchIcon = tIcon
+        fsGridBtn = gBtn; fsGridIcon = gIcon
+        fsHudBtn = hBtn; fsHudIcon = hIcon
+        fsLockBtn = lBtn
         styleNightTorchButtons(connected = true)
+        styleFsGridHudIcons()
 
-        val topActionRow = LinearLayout(context).apply {
+        val topIcons = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            addView(nBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = UiStyle.dp(context, 6) })
-            addView(tBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = UiStyle.dp(context, 8) })
-            addView(hBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = UiStyle.dp(context, 6) })
-            addView(gBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = UiStyle.dp(context, 6) })
-            addView(exitBtn)
-        }
-        val topActionScroll = HorizontalScrollView(context).apply {
-            isHorizontalScrollBarEnabled = false
-            addView(topActionRow)
+            val gap = UiStyle.dp(context, 7)
+            addView(nBtn, LinearLayout.LayoutParams(UiStyle.dp(context, 40), UiStyle.dp(context, 40)).apply { marginEnd = gap })
+            addView(tBtn, LinearLayout.LayoutParams(UiStyle.dp(context, 40), UiStyle.dp(context, 40)).apply { marginEnd = gap })
+            addView(gBtn, LinearLayout.LayoutParams(UiStyle.dp(context, 40), UiStyle.dp(context, 40)).apply { marginEnd = gap })
+            addView(hBtn, LinearLayout.LayoutParams(UiStyle.dp(context, 40), UiStyle.dp(context, 40)).apply { marginEnd = gap })
+            addView(lBtn, LinearLayout.LayoutParams(UiStyle.dp(context, 40), UiStyle.dp(context, 40)))
         }
 
         val topBar = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            background = UiStyle.rounded(context, UiStyle.OVERLAY, 16, UiStyle.BORDER)
-            setPadding(UiStyle.dp(context, 12), UiStyle.dp(context, 8), UiStyle.dp(context, 10), UiStyle.dp(context, 8))
+            background = UiStyle.scrimGradient(topToBottom = true)
+            addView(exitBtn, LinearLayout.LayoutParams(UiStyle.dp(context, 42), UiStyle.dp(context, 42)).apply {
+                marginEnd = UiStyle.dp(context, 10)
+            })
             addView(LinearLayout(context).apply {
                 orientation = LinearLayout.VERTICAL
                 addView(LinearLayout(context).apply {
@@ -311,44 +346,139 @@ internal class CameraScreen(
                 addView(fsTopHudText)
                 addView(telemetryText)
             }, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = UiStyle.dp(context, 10) })
-            addView(topActionScroll, LinearLayout.LayoutParams(-2, -2))
+            addView(topIcons, LinearLayout.LayoutParams(-2, -2))
         }
 
-        val sBtn = UiStyle.primaryButton(context, "다시 보기", start)
-        val frBtn = UiStyle.secondaryButton(context, "정지화면", toggleFreeze)
-        val scBtn = UiStyle.secondaryButton(context, if (fillVideo) "원본 비율" else "화면 채우기") {
+        // Right-side Pro Camera Shutter + Freeze rail (One UI Camera thumb ergonomics)
+        val shutterIcon = ImageView(context).apply {
+            setImageResource(R.drawable.ic_camera)
+            imageTintList = ColorStateList.valueOf(0xff0A0F0E.toInt())
+            scaleType = ImageView.ScaleType.FIT_CENTER
+        }
+        val shutterInner = FrameLayout(context).apply {
+            background = UiStyle.rippleRounded(context, 0xF0FFFFFF.toInt(), 99, null, 0x4434D399)
+            addView(shutterIcon, FrameLayout.LayoutParams(UiStyle.dp(context, 24), UiStyle.dp(context, 24), Gravity.CENTER))
+        }
+        val shutterRing = FrameLayout(context).apply {
+            contentDescription = "사진 저장"
+            isClickable = true
+            isFocusable = true
+            background = UiStyle.rounded(context, 0x33000000, 99, 0xEEFFFFFF.toInt(), strokeDp = 2)
+            val pad = UiStyle.dp(context, 4)
+            setPadding(pad, pad, pad, pad)
+            addView(shutterInner, FrameLayout.LayoutParams(-1, -1))
+            setOnClickListener { view ->
+                view.animate().scaleX(0.88f).scaleY(0.88f).setDuration(80).withEndAction {
+                    view.animate().scaleX(1f).scaleY(1f).setDuration(110).start()
+                }.start()
+                save()
+            }
+        }
+        val (frBtn, frIcon) = UiStyle.glassCircleButton(context, R.drawable.ic_pause, "정지화면", 46, 20) {
+            toggleFreeze()
+        }
+        fsPhotoBtn = shutterRing
+        fsFreezeBtn = frBtn
+        fsFreezeIcon = frIcon
+
+        val rightRail = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            addView(shutterRing, LinearLayout.LayoutParams(UiStyle.dp(context, 60), UiStyle.dp(context, 60)))
+            addView(frBtn, LinearLayout.LayoutParams(UiStyle.dp(context, 46), UiStyle.dp(context, 46)).apply {
+                topMargin = UiStyle.dp(context, 14)
+            })
+        }
+
+        // Bottom Centered Floating Capsule Dock (One UI translucent pill, never spans full width)
+        val (scBtn, scIcon, scLbl) = UiStyle.glassPillButton(
+            context,
+            if (fillVideo) R.drawable.ic_aspect_fit else R.drawable.ic_aspect_fill,
+            if (fillVideo) "원본 비율" else "화면 채우기",
+            bgColor = 0x00000000,
+            textColor = UiStyle.INK,
+            strokeColor = null
+        ) {
             fillVideo = !fillVideo
             image.setFillCrop(fillVideo)
             onToggleFill(fillVideo)
-            fsScaleBtn?.text = if (fillVideo) "원본 비율" else "화면 채우기"
+            fsScaleLabel?.text = if (fillVideo) "원본 비율" else "화면 채우기"
+            fsScaleIcon?.setImageResource(if (fillVideo) R.drawable.ic_aspect_fit else R.drawable.ic_aspect_fill)
         }
-        val phBtn = UiStyle.secondaryButton(context, "사진 저장", save)
-        val stBtn = UiStyle.dangerButton(context, "정지", stop)
-        fsStartBtn = sBtn
-        fsFreezeBtn = frBtn
-        fsScaleBtn = scBtn
-        fsPhotoBtn = phBtn
+        val (zResetBtn, _, zResetLbl) = UiStyle.glassPillButton(
+            context,
+            null,
+            "1.0×",
+            bgColor = UiStyle.ACCENT_SOFT,
+            textColor = UiStyle.ACCENT,
+            strokeColor = UiStyle.ACCENT
+        ) {
+            image.resetZoom()
+        }
+        zResetBtn.visibility = View.GONE
+        val (sBtn, _, sLbl) = UiStyle.glassPillButton(
+            context,
+            R.drawable.ic_play,
+            "다시 보기",
+            bgColor = UiStyle.ACCENT,
+            textColor = UiStyle.ON_ACCENT,
+            strokeColor = null,
+            onClick = start
+        )
+        val (stBtn, _, _) = UiStyle.glassPillButton(
+            context,
+            R.drawable.ic_stop,
+            "정지",
+            bgColor = UiStyle.DANGER_SOFT,
+            textColor = UiStyle.DANGER,
+            strokeColor = 0x66F87171,
+            onClick = stop
+        )
+        fsScaleBtn = scBtn; fsScaleIcon = scIcon; fsScaleLabel = scLbl
+        fsZoomResetBtn = zResetBtn; fsZoomResetLabel = zResetLbl
+        fsStartBtn = sBtn; fsStartLabel = sLbl
         fsStopBtn = stBtn
 
-        val bottomBar = LinearLayout(context).apply {
+        val dockPill = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            background = UiStyle.rounded(context, UiStyle.OVERLAY, 16, UiStyle.BORDER)
-            setPadding(UiStyle.dp(context, 10), UiStyle.dp(context, 8), UiStyle.dp(context, 10), UiStyle.dp(context, 8))
-            val gap = UiStyle.dp(context, 8)
-            addView(sBtn, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = gap })
-            addView(frBtn, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = gap })
-            addView(scBtn, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = gap })
-            addView(phBtn, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = gap })
-            addView(stBtn, LinearLayout.LayoutParams(0, -2, 1f))
+            background = UiStyle.rounded(context, UiStyle.GLASS_DOCK, 99, UiStyle.GLASS_STROKE)
+            setPadding(UiStyle.dp(context, 8), UiStyle.dp(context, 5), UiStyle.dp(context, 8), UiStyle.dp(context, 5))
+            val gap = UiStyle.dp(context, 6)
+            addView(scBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
+            addView(zResetBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
+            addView(sBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
+            addView(stBtn, LinearLayout.LayoutParams(-2, -2))
+        }
+
+        val bottomScrim = FrameLayout(context).apply {
+            background = UiStyle.scrimGradient(topToBottom = false)
+            addView(dockPill, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL))
         }
 
         val overlay = FrameLayout(context).apply {
             addView(topBar, FrameLayout.LayoutParams(-1, -2, Gravity.TOP))
-            addView(bottomBar, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
+            addView(rightRail, FrameLayout.LayoutParams(-2, -2, Gravity.END or Gravity.CENTER_VERTICAL))
+            addView(bottomScrim, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
         }
         hudOverlay = overlay
         root.addView(overlay, FrameLayout.LayoutParams(-1, -1))
+
+        // Touch-Lock floating unlock pill (One UI Video Player lock UX)
+        val (unlockPill, _, _) = UiStyle.glassPillButton(
+            context,
+            R.drawable.ic_unlock,
+            "잠금 해제",
+            bgColor = UiStyle.GLASS_DOCK,
+            textColor = UiStyle.ACCENT,
+            strokeColor = UiStyle.ACCENT
+        ) {
+            setFullscreenLocked(false)
+        }
+        unlockPill.visibility = View.GONE
+        fsUnlockBar = unlockPill
+        root.addView(unlockPill, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START))
+
         root.setOnApplyWindowInsetsListener { _, insets ->
             val offsets = if (Build.VERSION.SDK_INT >= 30) {
                 val cutout = insets.getInsets(WindowInsets.Type.displayCutout())
@@ -358,20 +488,68 @@ internal class CameraScreen(
                 intArrayOf(cutout?.safeInsetLeft ?: 0, cutout?.safeInsetTop ?: 0,
                     cutout?.safeInsetRight ?: 0, cutout?.safeInsetBottom ?: 0)
             }
-            overlay.setPadding(
-                offsets[0] + UiStyle.dp(context, 16),
-                offsets[1] + UiStyle.dp(context, 12),
-                offsets[2] + UiStyle.dp(context, 16),
-                offsets[3] + UiStyle.dp(context, 12)
-            )
-            fsHudPin.setPadding(
-                offsets[0] + UiStyle.dp(context, 16),
-                offsets[1] + UiStyle.dp(context, 12),
-                offsets[2] + UiStyle.dp(context, 16),
-                offsets[3] + UiStyle.dp(context, 12)
-            )
+            val hPad = UiStyle.dp(context, 16)
+            val vTop = UiStyle.dp(context, 12)
+            val vBot = UiStyle.dp(context, 16)
+            topBar.setPadding(offsets[0] + hPad, offsets[1] + vTop, offsets[2] + hPad, UiStyle.dp(context, 22))
+            bottomScrim.setPadding(offsets[0] + hPad, UiStyle.dp(context, 26), offsets[2] + hPad, offsets[3] + vBot)
+            (rightRail.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
+                lp.marginEnd = offsets[2] + UiStyle.dp(context, 18)
+                rightRail.layoutParams = lp
+            }
+            (unlockPill.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
+                lp.setMargins(offsets[0] + hPad, offsets[1] + vTop, 0, 0)
+                unlockPill.layoutParams = lp
+            }
+            fsHudPin.setPadding(offsets[0] + hPad, offsets[1] + vTop, offsets[2] + hPad, offsets[3] + vBot)
             insets
         }
+    }
+
+    fun isFullscreenLocked(): Boolean = fsLocked
+
+    fun setFullscreenLocked(locked: Boolean) {
+        fsLocked = locked
+        if (locked) {
+            showFullscreenOverlay(false)
+            flashUnlockPill(true)
+        } else {
+            flashUnlockPill(false)
+            showFullscreenOverlay(true)
+        }
+    }
+
+    fun flashUnlockPill(visible: Boolean) {
+        val pill = fsUnlockBar ?: return
+        pill.animate().cancel()
+        if (visible && fsLocked) {
+            pill.visibility = View.VISIBLE
+            pill.animate().alpha(1f).setDuration(160).start()
+        } else {
+            pill.animate().alpha(0f).setDuration(160).withEndAction {
+                pill.visibility = View.GONE
+            }.start()
+        }
+    }
+
+    private fun styleFsGridHudIcons() {
+        fsGridBtn?.background = UiStyle.rippleRounded(
+            context,
+            if (gridEnabled) UiStyle.ACCENT_SOFT else UiStyle.GLASS,
+            99,
+            if (gridEnabled) UiStyle.ACCENT else UiStyle.GLASS_STROKE,
+            0x38FFFFFF
+        )
+        fsGridIcon?.imageTintList = ColorStateList.valueOf(if (gridEnabled) UiStyle.ACCENT else UiStyle.INK)
+
+        fsHudBtn?.background = UiStyle.rippleRounded(
+            context,
+            if (hudEnabled) UiStyle.ACCENT_SOFT else UiStyle.GLASS,
+            99,
+            if (hudEnabled) UiStyle.ACCENT else UiStyle.GLASS_STROKE,
+            0x38FFFFFF
+        )
+        fsHudIcon?.imageTintList = ColorStateList.valueOf(if (hudEnabled) UiStyle.ACCENT else UiStyle.INK)
     }
 
     private fun buildAppShell(config: Configuration) {
@@ -1269,7 +1447,7 @@ internal class CameraScreen(
         gridEnabled = enabled
         image.setShowGrid(enabled)
         tileGrid?.setState(true, active = enabled)
-        fsGridBtn?.text = if (enabled) "그리드 끄기" else "그리드"
+        styleFsGridHudIcons()
     }
 
     fun showNightMode(enabled: Boolean) {
@@ -1321,33 +1499,34 @@ internal class CameraScreen(
         fsNightBtn?.let { btn ->
             btn.isEnabled = connected
             btn.alpha = if (connected) 1f else 0.45f
-            btn.text = if (nightModeEnabled) "야간 ON" else "야간 흑백"
-            btn.setTextColor(if (nightModeEnabled) UiStyle.CYAN else UiStyle.INK)
             btn.background = UiStyle.rippleRounded(
                 context,
-                if (nightModeEnabled) UiStyle.CYAN_SOFT else UiStyle.SURFACE_ALT,
-                10,
-                if (nightModeEnabled) UiStyle.CYAN else UiStyle.BORDER
+                if (nightModeEnabled) UiStyle.CYAN_SOFT else UiStyle.GLASS,
+                99,
+                if (nightModeEnabled) UiStyle.CYAN else UiStyle.GLASS_STROKE,
+                0x38FFFFFF
             )
         }
+        fsNightIcon?.imageTintList = ColorStateList.valueOf(if (nightModeEnabled) UiStyle.CYAN else UiStyle.INK)
+
         fsTorchBtn?.let { btn ->
             btn.isEnabled = connected
             btn.alpha = if (connected) 1f else 0.45f
-            btn.text = if (torchEnabled) "조명 ON" else "화이트 LED"
-            btn.setTextColor(if (torchEnabled) UiStyle.AMBER else UiStyle.INK)
             btn.background = UiStyle.rippleRounded(
                 context,
-                if (torchEnabled) UiStyle.AMBER_SOFT else UiStyle.SURFACE_ALT,
-                10,
-                if (torchEnabled) UiStyle.AMBER else UiStyle.BORDER
+                if (torchEnabled) UiStyle.AMBER_SOFT else UiStyle.GLASS,
+                99,
+                if (torchEnabled) UiStyle.AMBER else UiStyle.GLASS_STROKE,
+                0x38FFFFFF
             )
         }
+        fsTorchIcon?.imageTintList = ColorStateList.valueOf(if (torchEnabled) UiStyle.AMBER else UiStyle.INK)
     }
 
     fun showHudEnabled(enabled: Boolean) {
         hudEnabled = enabled
         styleLiveHudToggle()
-        fsHudBtn?.text = if (enabled) "HUD 끄기" else "HUD"
+        styleFsGridHudIcons()
         refreshLiveHudVisibility()
     }
 
@@ -1387,14 +1566,27 @@ internal class CameraScreen(
     fun showControls(connected: Boolean, canStart: Boolean, playing: Boolean, hasFrame: Boolean, frozen: Boolean) {
         styleNightTorchButtons(connected)
         if (fullscreen) {
-            fsStartBtn?.text = if (connected) "다시 보기" else "연결 및 보기"
+            fsStartLabel?.text = if (connected) "다시 보기" else "연결 및 보기"
             fsStartBtn?.isEnabled = canStart
+            fsStartBtn?.alpha = if (canStart) 1f else 0.45f
             fsStartBtn?.visibility = if (playing) View.GONE else View.VISIBLE
             fsStopBtn?.isEnabled = playing
+            fsStopBtn?.alpha = if (playing) 1f else 0.45f
             fsStopBtn?.visibility = if (playing) View.VISIBLE else View.GONE
             fsPhotoBtn?.isEnabled = hasFrame
-            fsFreezeBtn?.text = if (frozen) "실시간 복귀" else "정지화면"
-            fsFreezeBtn?.isEnabled = (playing && hasFrame) || frozen
+            fsPhotoBtn?.alpha = if (hasFrame) 1f else 0.35f
+            val canFreeze = (playing && hasFrame) || frozen
+            fsFreezeBtn?.isEnabled = canFreeze
+            fsFreezeBtn?.alpha = if (canFreeze) 1f else 0.35f
+            fsFreezeIcon?.setImageResource(if (frozen) R.drawable.ic_play else R.drawable.ic_pause)
+            fsFreezeIcon?.imageTintList = ColorStateList.valueOf(if (frozen) UiStyle.AMBER else UiStyle.INK)
+            fsFreezeBtn?.background = UiStyle.rippleRounded(
+                context,
+                if (frozen) UiStyle.AMBER_SOFT else UiStyle.GLASS,
+                99,
+                if (frozen) UiStyle.AMBER else UiStyle.GLASS_STROKE,
+                0x38FFFFFF
+            )
             return
         }
         primaryCtaBtn.text = if (connected) "다시 보기" else "연결 및 보기"
@@ -1880,15 +2072,16 @@ internal class CameraScreen(
                     }
                     if (isAvi) {
                         addView(UiStyle.compactChipButton(
-                            context, "MP4", UiStyle.AMBER_SOFT, UiStyle.AMBER, 0xff594218.toInt()
+                            context, "MP4 저장", UiStyle.AMBER_SOFT, UiStyle.AMBER, 0xff594218.toInt()
                         ) { onConvertMp4(item) }, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
+                    } else {
+                        addView(UiStyle.compactChipButton(
+                            context, "저장", UiStyle.SURFACE_ALT, UiStyle.INK, UiStyle.BORDER
+                        ) { onDownloadFile(item) }, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
                     }
                     addView(UiStyle.compactChipButton(
                         context, "QR", UiStyle.CYAN_SOFT, UiStyle.CYAN, UiStyle.BORDER
                     ) { onQrShareFile(item) }, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
-                    addView(UiStyle.compactChipButton(
-                        context, "저장", UiStyle.SURFACE_ALT, UiStyle.INK, UiStyle.BORDER
-                    ) { onDownloadFile(item) }, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
                     addView(UiStyle.compactChipButton(
                         context, "이름변경", UiStyle.SURFACE_ALT, UiStyle.SECONDARY, UiStyle.BORDER
                     ) { onRenameEntry(item.category, item.dir, item.name, false) },
@@ -1944,17 +2137,35 @@ internal class CameraScreen(
 
     fun showFullscreenOverlay(visible: Boolean) {
         fsOverlayShown = visible
-        hudOverlay?.visibility = if (visible) View.VISIBLE else View.GONE
-        nightModeBadge.visibility = if (nightModeEnabled && (!fullscreen || !visible)) View.VISIBLE else View.GONE
+        val ov = hudOverlay
+        if (ov != null) {
+            ov.animate().cancel()
+            if (visible && !fsLocked) {
+                if (ov.visibility != View.VISIBLE) {
+                    ov.alpha = 0f
+                    ov.visibility = View.VISIBLE
+                }
+                ov.animate().alpha(1f).setDuration(180).start()
+            } else {
+                ov.animate().alpha(0f).setDuration(180).withEndAction {
+                    if (!fsOverlayShown || fsLocked) ov.visibility = View.GONE
+                }.start()
+            }
+        }
+        nightModeBadge.visibility = if (nightModeEnabled && (!fullscreen || !visible || fsLocked)) View.VISIBLE else View.GONE
         refreshLiveHudVisibility()
     }
 
     private fun updateZoomBadge(zoom: Float) {
         if (zoom > 1.02f) {
-            zoomBadge.text = String.format(Locale.US, "%.1f×", zoom)
+            val zStr = String.format(Locale.US, "%.1f×", zoom)
+            zoomBadge.text = zStr
             zoomBadge.visibility = View.VISIBLE
+            fsZoomResetLabel?.text = "$zStr ↺"
+            fsZoomResetBtn?.visibility = View.VISIBLE
         } else {
             zoomBadge.visibility = View.GONE
+            fsZoomResetBtn?.visibility = View.GONE
         }
     }
 

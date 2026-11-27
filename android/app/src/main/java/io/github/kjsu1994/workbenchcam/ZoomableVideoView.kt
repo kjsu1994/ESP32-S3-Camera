@@ -130,7 +130,8 @@ internal class ZoomState(
 internal class ZoomableVideoView(
     context: Context,
     private val onSingleTap: (() -> Unit)? = null,
-    private val onZoomChanged: ((Float) -> Unit)? = null
+    private val onZoomChanged: ((Float) -> Unit)? = null,
+    private val onDoubleTapRegion: ((Float) -> Boolean)? = null
 ) : ImageView(context) {
 
     private val zoomState = ZoomState()
@@ -185,6 +186,9 @@ internal class ZoomableVideoView(
             }
 
             override fun onDoubleTap(e: MotionEvent): Boolean {
+                if (width > 0 && onDoubleTapRegion?.invoke(e.x / width.toFloat()) == true) {
+                    return true
+                }
                 if (bitmapWidth <= 0 || bitmapHeight <= 0) return false
                 zoomState.toggleDoubleTap(
                     e.x,
