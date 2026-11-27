@@ -683,4 +683,129 @@ class NetLabEngineTest {
         assertTrue(LogFilter.matchesAnyWatchKeyword("T→C", "status=FAIL", "", kws))
         assertFalse(LogFilter.matchesAnyWatchKeyword("T→C", "status=OK", "normal", kws))
     }
+
+    @Test fun pcapReaderRoundTripsTcpAndUdpCapturesWithSummary() {
+        val packets = listOf(
+            RelayedPacket(
+                timestampMs = 1764140000100L,
+                direction = RelayDirection.CLIENT_TO_TARGET,
+                srcIp = "192.168.0.10",
+                srcPort = 51000,
+                dstIp = "192.168.0.50",
+                dstPort = 80,
+                data = "GET /status HTTP/1.1\r\nHost: dockycam.local\r\n\r\n".toByteArray(Charsets.US_ASCII)
+            ),
+            RelayedPacket(
+                timestampMs = 1764140001600L,
+                direction = RelayDirection.CLIENT_TO_TARGET,
+                srcIp = "192.168.0.10",
+                srcPort = 52000,
+                dstIp = "192.168.0.60",
+                dstPort = 5000,
+                data = "UDP_HEARTBEAT".toByteArray(Charsets.US_ASCII),
+                isUdp = true
+            )
+        )
+        val rawOut = ByteArrayOutputStream()
+        PcapWriter.writePcap(packets, rawOut)
+
+        val parsed = PcapReader.parse(rawOut.toByteArray(), "sample.pcap")
+        assertEquals(2, parsed.entries.size)
+        assertEquals(1500L, parsed.summary.durationMs)
+        assertEquals(1, parsed.summary.protocolCounts["HTTP"])
+        assertEquals(1, parsed.summary.protocolCounts["UDP"])
+        assertTrue(parsed.summary.topDomains.any { it.first == "dockycam.local" })
+        assertTrue(parsed.entries[1].isUdp)
+    }
+
+    @Test fun webCaptureReaderParsesHarAndFiddlerSazCaptures() {
+        val harJson = """
+            {
+              "log": {
+                "entries": [
+                  {
+                    "startedDateTime": "2026-11-27T10:00:00.123Z",
+                    "time": 45,
+                    "request": {
+                      "method": "POST",
+                      "url": "https://api.example.com/v1/login",
+                      "headers": [{"name": "Content-Type", "value": "application/json"}],
+                      "postData": {"text": "{\"user\":\"admin\"}"}
+                    },
+                    "response": {
+                      "status": 200,
+                      "statusText": "OK",
+                      "headers": [{"name": "Content-Type", "value": "application/json"}],
+                      "content": {"text": "{\"token\":\"ok\"}"}
+                    }
+                  }
+                ]
+              }
+            }
+        """.trimIndent()
+        val harRes = WebCaptureReader.parseHar(harJson, "chrome.har")
+        assertEquals(2, harRes.entries.size)
+        assertTrue(harRes.summary.topDomains.any { it.first == "api.example.com" })
+        assertTrue(harRes.entries[0].fullText.contains("\"user\":\"admin\""))
+        assertTrue(harRes.entries[1].fullText.contains("\"token\":\"ok\""))
+
+        // Build synthetic Fiddler .saz ZIP in memory
+        val sazBytes = ByteArrayOutputStream().apply {
+            java.util.zip.ZipOutputStream(this).use { zos ->
+                zos.putNextEntry(java.util.zip.ZipEntry("raw/01_c.txt"))
+                zos.write("GET /health HTTP/1.1\r\nHost: sensor.local\r\n\r\n".toByteArray())
+                zos.closeEntry()
+                zos.putNextEntry(java.util.zip.ZipEntry("raw/01_s.txt"))
+                zos.write("HTTP/1.1 200 OK\r\n\r\nOK".toByteArray())
+                zos.closeEntry()
+            }
+        }.toByteArray()
+        val sazRes = WebCaptureReader.parseSaz(sazBytes.inputStream(), "trace.saz")
+        assertEquals(2, sazRes.entries.size)
+        assertTrue(sazRes.summary.topDomains.any { it.first == "sensor.local" })
+    }
+
+    @Test fun securityAuditorDiffEngineAndStaticScannerDetectExpectedFindings() {
+        val fakeJwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3OCJ9.signature123"
+        val entries = listOf(
+            LogEntry(
+                seq = 1,
+                header = "[10:00:00] C→T HTTP",
+                body = "",
+                accentColor = 0,
+                rawBytes = "POST /login HTTP/1.1\r\nAuthorization: Bearer $fakeJwt\r\nCookie: sid=abc\r\n\r\nuser=a&password=secret123".toByteArray()
+            ),
+            LogEntry(
+                seq = 2,
+                header = "[10:00:01] T→C HTTP",
+                body = "",
+                accentColor = 0,
+                rawBytes = "HTTP/1.1 200 OK\r\nSet-Cookie: sid=abc\r\n\r\nOK".toByteArray()
+            )
+        )
+        val audit = TrafficSecurityAuditor.audit(entries)
+        assertTrue("Expected Authorization finding", audit.findings.any { it.title.contains("Authorization") })
+        assertTrue("Expected JWT finding", audit.findings.any { it.title.contains("JWT") })
+        assertTrue("Expected password finding", audit.findings.any { it.title.contains("password") })
+        assertTrue("Expected HSTS missing finding", audit.findings.any { it.title.contains("HSTS") })
+        assertTrue("Expected Set-Cookie attribute finding", audit.findings.any { it.title.contains("Set-Cookie") })
+
+        // Capture Diff
+        val before = CaptureSnapshot(1000L, 10, 1000L, 2000L, setOf("a.com"), setOf("192.168.0.1:80"))
+        val after = CaptureSnapshot(2000L, 25, 3500L, 9000L, setOf("a.com", "b.com"), setOf("192.168.0.1:80", "192.168.0.50:502"))
+        val diff = CaptureDiffEngine.diff(before, after)
+        assertEquals(15, diff.deltaPackets)
+        assertEquals(listOf("b.com"), diff.newDomains)
+        assertEquals(listOf("192.168.0.50:502"), diff.newEndpoints)
+
+        // Static Artifact Scanner on synthetic ESP32 firmware image (0xE9 magic + embedded URL/IP/secret)
+        val fakeBin = byteArrayOf(0xE9.toByte(), 0x02, 0x00, 0x00) +
+            "hello https://update.dockycam.test/fw 192.168.40.50 api_key=MY_TEST_KEY_9999\u0000".toByteArray(Charsets.US_ASCII)
+        val scan = ArtifactStaticScanner.scan(fakeBin, "firmware.bin")
+        assertEquals("ESP32 펌웨어 이미지 (0xE9)", scan.fileType)
+        assertEquals(64, scan.sha256.length)
+        assertTrue(scan.urls.contains("https://update.dockycam.test/fw"))
+        assertTrue(scan.ips.contains("192.168.40.50"))
+        assertTrue(scan.suspiciousSecrets.any { it.contains("api_key=MY_TEST_KEY_9999") })
+    }
 }

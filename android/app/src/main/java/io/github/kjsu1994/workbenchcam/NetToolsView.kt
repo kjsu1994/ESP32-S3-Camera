@@ -7,6 +7,7 @@ import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.graphics.Typeface
+import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.os.Handler
@@ -15,6 +16,7 @@ import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
 import android.provider.MediaStore
+import android.provider.OpenableColumns
 import android.text.Editable
 import android.text.InputType
 import android.text.TextUtils
@@ -42,7 +44,8 @@ internal enum class NetToolSubTab(val label: String) {
     SCAN("탐색"),
     MONITOR("모니터"),
     PROXY("중계"),
-    CONSOLE("콘솔")
+    CONSOLE("콘솔"),
+    AUDIT("분석")
 }
 
 private enum class ProxyDirFilter(val label: String) {
@@ -147,7 +150,8 @@ private enum class FullscreenLogSource { MONITOR, PROXY, CONSOLE }
  */
 internal class NetToolsView(
     private val context: Context,
-    private val getConnectedBoardIp: () -> String?
+    private val getConnectedBoardIp: () -> String?,
+    private val onPickLocalFile: (((Uri) -> Unit) -> Unit)? = null
 ) {
     private val handler = Handler(Looper.getMainLooper())
     private val timeFmt = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
@@ -246,7 +250,9 @@ internal class NetToolsView(
     private val proxyDensityBtn: TextView
     private val proxyDedupBtn: TextView
     private val proxyWatchBtn: TextView
+    private val proxyDiffBtn: TextView
     private val proxyPcapBtn: TextView
+    private var proxyDiffSnapshot: CaptureSnapshot? = null
     private val proxyDomainScroll: HorizontalScrollView
     private val proxyDomainRow: LinearLayout
     private val renderProxyDir: (ProxyDirFilter) -> Unit
@@ -320,10 +326,17 @@ internal class NetToolsView(
         }
     }
 
-    // Shared Fullscreen Live Log Viewer & Packet Detail Inspector Dialogs
+    // Sub-Tab 5: Offline File / Security Audit / SQLite / TLS Inspector
+    private val auditTlsHostField: EditText
+    private val auditTlsPortField: EditText
+    private val auditStatusLabel: TextView
+
+    // Shared Fullscreen Live Log Viewer, Packet Detail & Offline Inspector Dialogs
     private var fullscreenDialog: FullscreenLogDialog? = null
     private var fullscreenSource: FullscreenLogSource? = null
     private var detailDialog: PacketDetailDialog? = null
+    private var offlineCaptureDialog: OfflineCaptureDialog? = null
+    private var sqliteViewerDialog: SqliteViewerDialog? = null
 
     init {
         val wrapper = LinearLayout(context).apply {
@@ -538,6 +551,9 @@ internal class NetToolsView(
         monitorWatchBtn = UiStyle.compactChipButton(
             context, "알림", UiStyle.SURFACE_ALT, UiStyle.SECONDARY, UiStyle.BORDER
         ) { showWatchKeywordsDialog() }
+        val monAuditBtn = UiStyle.compactChipButton(
+            context, "보안 점검", UiStyle.DANGER_SOFT, UiStyle.DANGER, UiStyle.BORDER
+        ) { runMonitorSecurityAudit() }
         monitorDeviceFilterBtn = UiStyle.compactChipButton(
             context, "전체 장비", UiStyle.SURFACE_ALT, UiStyle.SECONDARY, UiStyle.BORDER
         ) { toggleDeviceOnlyFilter() }.apply { visibility = View.GONE }
@@ -561,6 +577,7 @@ internal class NetToolsView(
             addView(monitorDensityBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
             addView(monitorDedupBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
             addView(monitorWatchBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
+            addView(monAuditBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
             addView(monitorDeviceFilterBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
             addView(monitorProbeBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
             addView(monitorToConsoleBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
@@ -708,6 +725,12 @@ internal class NetToolsView(
         proxyWatchBtn = UiStyle.compactChipButton(
             context, "알림", UiStyle.SURFACE_ALT, UiStyle.SECONDARY, UiStyle.BORDER
         ) { showWatchKeywordsDialog() }
+        val pxAuditBtn = UiStyle.compactChipButton(
+            context, "보안 점검", UiStyle.DANGER_SOFT, UiStyle.DANGER, UiStyle.BORDER
+        ) { runProxySecurityAudit() }
+        proxyDiffBtn = UiStyle.compactChipButton(
+            context, "비교(Diff)", UiStyle.SURFACE_ALT, UiStyle.INK, UiStyle.BORDER
+        ) { handleProxyDiffClick() }
         proxyPcapBtn = UiStyle.compactChipButton(
             context, "Wireshark .pcap 저장", UiStyle.ACCENT_SOFT, UiStyle.ACCENT, UiStyle.ACCENT
         ) { exportProxyPcap() }
@@ -727,6 +750,8 @@ internal class NetToolsView(
                     addView(proxyDensityBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
                     addView(proxyDedupBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
                     addView(proxyWatchBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
+                    addView(pxAuditBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
+                    addView(proxyDiffBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
                     addView(proxyPcapBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
                     addView(pxCopyBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
                     addView(pxClearBtn)
@@ -903,10 +928,92 @@ internal class NetToolsView(
 
         consolePanel.addView(conCard, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 12) })
 
+        // ============================================================
+        // SUB-TAB 5: 분석 (Offline PCAP/HAR/SAZ + Static Scan + SQLite + TLS Cert)
+        // ============================================================
+        val auditPanel = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
+
+        auditStatusLabel = UiStyle.label(context, "", 12f, UiStyle.CYAN).apply {
+            typeface = Typeface.MONOSPACE
+            visibility = View.GONE
+            setPadding(UiStyle.dp(context, 4), UiStyle.dp(context, 10), UiStyle.dp(context, 4), 0)
+        }
+        auditPanel.addView(auditStatusLabel)
+
+        // Card 1: Offline Capture Analyzer (.pcap / .har / .saz)
+        val capCard = UiStyle.card(context, 14)
+        capCard.addView(UiStyle.label(context, "오프라인 캡처 파일 분석 (.pcap · .har · .saz)", 15f, UiStyle.INK, bold = true))
+        capCard.addView(UiStyle.label(
+            context,
+            "Wireshark(.pcap), 크롬 개발자도구(.har — HTTPS 평문 포함), Fiddler(.saz) 파일을 열어 도메인·프로토콜 요약, 검색, 자동 해독, 보안 점검을 수행합니다.",
+            12f,
+            UiStyle.SECONDARY
+        ).apply { setPadding(0, UiStyle.dp(context, 4), 0, UiStyle.dp(context, 10)) })
+        capCard.addView(
+            UiStyle.primaryButton(context, "캡처 파일 열기 (.pcap / .har / .saz)") { pickAndOpenOfflineCapture() },
+            LinearLayout.LayoutParams(-1, -2)
+        )
+        auditPanel.addView(capCard, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 12) })
+
+        // Card 2: Static Security Scan (.bin / .apk / .zip) + SQLite Viewer (.db)
+        val fileCard = UiStyle.card(context, 14)
+        fileCard.addView(UiStyle.label(context, "파일 정적 보안 스캔 & SQLite DB 뷰어", 15f, UiStyle.INK, bold = true))
+        fileCard.addView(UiStyle.label(
+            context,
+            "펌웨어(.bin)·APK·ZIP의 SHA-256 해시, 내부 파일 목록, 하드코딩된 URL·IP·비밀키 의심 문자열을 스캔하거나 .db/.sqlite 테이블을 읽기 전용으로 조회합니다.",
+            12f,
+            UiStyle.SECONDARY
+        ).apply { setPadding(0, UiStyle.dp(context, 4), 0, UiStyle.dp(context, 10)) })
+        fileCard.addView(LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            val gap = UiStyle.dp(context, 8)
+            addView(
+                UiStyle.secondaryButton(context, "파일 정적 스캔") { pickAndRunStaticScan() },
+                LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = gap }
+            )
+            addView(
+                UiStyle.secondaryButton(context, "SQLite DB 열기") { pickAndOpenSqliteDb() },
+                LinearLayout.LayoutParams(0, -2, 1f)
+            )
+        }, LinearLayout.LayoutParams(-1, -2))
+        auditPanel.addView(fileCard, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 12) })
+
+        // Card 3: Remote HTTPS/TLS Server Certificate Inspector
+        val tlsCard = UiStyle.card(context, 14)
+        tlsCard.addView(UiStyle.label(context, "HTTPS · TLS 서버 인증서 점검", 15f, UiStyle.INK, bold = true))
+        tlsCard.addView(UiStyle.label(
+            context,
+            "도메인 또는 장비 IP의 TLS 버전, 암호 스위트, 발급자(CA), 만료 D-Day, 자체 서명(Self-Signed) 여부를 점검합니다.",
+            12f,
+            UiStyle.SECONDARY
+        ).apply { setPadding(0, UiStyle.dp(context, 4), 0, UiStyle.dp(context, 10)) })
+        auditTlsHostField = styledInput("도메인 또는 IP (예: www.naver.com)", "www.naver.com", numeric = false)
+        auditTlsPortField = styledInput("포트", "443", numeric = true)
+        tlsCard.addView(LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(auditTlsHostField, LinearLayout.LayoutParams(0, -2, 1.6f).apply { marginEnd = UiStyle.dp(context, 8) })
+            addView(auditTlsPortField, LinearLayout.LayoutParams(0, -2, 0.7f))
+        }, LinearLayout.LayoutParams(-1, -2))
+        tlsCard.addView(
+            UiStyle.secondaryButton(context, "TLS 인증서 점검 실행") {
+                hideKeyboard()
+                val h = auditTlsHostField.text.toString().trim()
+                val p = auditTlsPortField.text.toString().trim().toIntOrNull() ?: 443
+                if (h.isEmpty() || p !in 1..65535) {
+                    Toast.makeText(context, "도메인 또는 IP와 포트를 올바르게 입력하세요", Toast.LENGTH_SHORT).show()
+                } else {
+                    runTlsCertCheck(h, p)
+                }
+            },
+            LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 8) }
+        )
+        auditPanel.addView(tlsCard, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 12) })
+
         subPanels[NetToolSubTab.SCAN] = scanPanel
         subPanels[NetToolSubTab.MONITOR] = monitorPanel
         subPanels[NetToolSubTab.PROXY] = proxyPanel
         subPanels[NetToolSubTab.CONSOLE] = consolePanel
+        subPanels[NetToolSubTab.AUDIT] = auditPanel
         subPanels.values.forEach { panelHost.addView(it, FrameLayout.LayoutParams(-1, -2)) }
         wrapper.addView(panelHost, LinearLayout.LayoutParams(-1, -2))
 
@@ -978,6 +1085,10 @@ internal class NetToolsView(
         consoleRepeatInterval = RepeatInterval.OFF
         detailDialog?.dismiss()
         detailDialog = null
+        offlineCaptureDialog?.dismiss()
+        offlineCaptureDialog = null
+        sqliteViewerDialog?.dismiss()
+        sqliteViewerDialog = null
         fullscreenDialog?.dismiss()
         fullscreenDialog = null
         fullscreenSource = null
@@ -1257,6 +1368,11 @@ internal class NetToolsView(
                     addView(UiStyle.compactChipButton(
                         context, "중계 ▶", UiStyle.CYAN_SOFT, UiStyle.CYAN, UiStyle.BORDER
                     ) { openPortInProxy(ip, res.port) }, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
+                    if (res.port in setOf(443, 8443, 8883, 993, 995, 465, 636, 990)) {
+                        addView(UiStyle.compactChipButton(
+                            context, "인증서 ▶", UiStyle.AMBER_SOFT, UiStyle.AMBER, 0xff594218.toInt()
+                        ) { runTlsCertCheck(ip, res.port) }, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = gap })
+                    }
                     addView(UiStyle.compactChipButton(
                         context, "콘솔 ▶", UiStyle.SURFACE_ALT, UiStyle.INK, UiStyle.BORDER
                     ) { openInConsole(tcp = true, ip = ip, port = res.port, autoConnect = true) })
@@ -2403,6 +2519,8 @@ internal class NetToolsView(
         proxyObservedDomains.clear()
         proxyDomainStats.clear()
         selectedProxyDomain = null
+        proxyDiffSnapshot = null
+        styleProxyDiffChip()
         renderProxyDomainChips()
         proxySeq = 0
         proxyC2tCount = 0
@@ -3053,6 +3171,245 @@ internal class NetToolsView(
                 syncFullscreenConsoleHeader()
             }
         }
+    }
+
+    // =========================================================================
+    // Flow Step 5: Offline Capture, Static Scan, SQLite, TLS Cert, Diff & Audit
+    // =========================================================================
+
+    private fun runMonitorSecurityAudit() {
+        val entries = buildMonitorLogEntries()
+        if (entries.isEmpty()) {
+            Toast.makeText(context, "점검할 모니터 패킷이 없습니다", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val report = TrafficSecurityAuditor.audit(entries)
+        showTextReportDialog(context, "모니터 실시간 보안 점검", report.toDisplayText())
+    }
+
+    private fun runProxySecurityAudit() {
+        val entries = buildProxyLogEntries()
+        if (entries.isEmpty()) {
+            Toast.makeText(context, "점검할 중계 패킷이 없습니다", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val report = TrafficSecurityAuditor.audit(entries)
+        showTextReportDialog(context, "중계 · 프록시 보안 점검", report.toDisplayText())
+    }
+
+    private fun buildCurrentProxySnapshot(): CaptureSnapshot {
+        val snapshot = synchronized(proxyPackets) { proxyPackets.map { it.pkt } }
+        val endpoints = LinkedHashSet<String>()
+        snapshot.forEach { pkt ->
+            val ep = if (pkt.direction == RelayDirection.CLIENT_TO_TARGET) "${pkt.dstIp}:${pkt.dstPort}" else "${pkt.srcIp}:${pkt.srcPort}"
+            endpoints.add(ep)
+        }
+        return CaptureSnapshot(
+            capturedAtMs = System.currentTimeMillis(),
+            packetCount = proxyC2tCount + proxyT2cCount,
+            c2tBytes = proxyC2tBytes,
+            t2cBytes = proxyT2cBytes,
+            domains = proxyObservedDomains.toSet(),
+            endpoints = endpoints
+        )
+    }
+
+    private fun styleProxyDiffChip() {
+        val hasBase = proxyDiffSnapshot != null
+        proxyDiffBtn.text = if (hasBase) "● 비교 보기" else "비교(Diff)"
+        proxyDiffBtn.setTextColor(if (hasBase) UiStyle.ON_ACCENT else UiStyle.INK)
+        proxyDiffBtn.background = UiStyle.rippleRounded(
+            context,
+            if (hasBase) UiStyle.AMBER else UiStyle.SURFACE_ALT,
+            10,
+            if (hasBase) null else UiStyle.BORDER
+        )
+    }
+
+    private fun handleProxyDiffClick() {
+        val before = proxyDiffSnapshot
+        if (before == null) {
+            proxyDiffSnapshot = buildCurrentProxySnapshot()
+            styleProxyDiffChip()
+            Toast.makeText(
+                context,
+                "기준점 저장됨 (${proxyDiffSnapshot?.packetCount ?: 0}건) · 동작 후 [● 비교 보기]를 누르세요",
+                Toast.LENGTH_LONG
+            ).show()
+            return
+        }
+        val after = buildCurrentProxySnapshot()
+        val diff = CaptureDiffEngine.diff(before, after)
+        val reportText = diff.toDisplayText()
+        val tv = TextView(context).apply {
+            text = reportText
+            textSize = 11.5f
+            typeface = Typeface.MONOSPACE
+            setTextColor(UiStyle.INK)
+            setTextIsSelectable(true)
+            val p = UiStyle.dp(context, 14)
+            setPadding(p, p, p, p)
+        }
+        val scroll = ScrollView(context).apply {
+            setBackgroundColor(0xff060908.toInt())
+            addView(tv, FrameLayout.LayoutParams(-1, -2))
+        }
+        AlertDialog.Builder(context)
+            .setTitle("캡처 전/후 변화 비교 (Diff)")
+            .setView(scroll)
+            .setPositiveButton("복사") { _, _ -> copyToClipboard(context, reportText) }
+            .setNeutralButton("새 기준점") { _, _ ->
+                proxyDiffSnapshot = buildCurrentProxySnapshot()
+                styleProxyDiffChip()
+                Toast.makeText(context, "새 기준점으로 갱신했습니다", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("초기화") { _, _ ->
+                proxyDiffSnapshot = null
+                styleProxyDiffChip()
+            }
+            .show()
+    }
+
+    private fun runTlsCertCheck(host: String, port: Int) {
+        Toast.makeText(context, "$host:$port TLS 인증서 조회 중...", Toast.LENGTH_SHORT).show()
+        Thread({
+            val result = runCatching { TlsCertInspector.inspect(host, port) }
+            handler.post {
+                result.onSuccess { report ->
+                    showTextReportDialog(context, "TLS 인증서 점검 · $host:$port", report.toDisplayText())
+                }.onFailure { err ->
+                    Toast.makeText(context, "TLS 점검 실패: ${err.message ?: "연결 오류"}", Toast.LENGTH_LONG).show()
+                }
+            }
+        }, "netlab-tls-cert").start()
+    }
+
+    private fun pickAndOpenOfflineCapture() {
+        val picker = onPickLocalFile
+        if (picker == null) {
+            Toast.makeText(context, "파일 선택기를 사용할 수 없습니다", Toast.LENGTH_SHORT).show()
+            return
+        }
+        picker { uri ->
+            val name = resolveDisplayName(uri)
+            auditStatusLabel.visibility = View.VISIBLE
+            auditStatusLabel.text = "'$name' 분석 중..."
+            Thread({
+                val res = runCatching {
+                    val lower = name.lowercase(Locale.US)
+                    val bytes = readUriBytesBounded(uri, maxBytes = 16 * 1024 * 1024)
+                    when {
+                        lower.endsWith(".har") || (bytes.isNotEmpty() && bytes[0] == '{'.code.toByte()) -> {
+                            WebCaptureReader.parseHar(String(bytes, Charsets.UTF_8), name)
+                        }
+                        lower.endsWith(".saz") || (bytes.size >= 4 && bytes[0] == 0x50.toByte() && bytes[1] == 0x4B.toByte()) -> {
+                            WebCaptureReader.parseSaz(bytes.inputStream(), name)
+                        }
+                        else -> PcapReader.parse(bytes, name)
+                    }
+                }
+                handler.post {
+                    auditStatusLabel.visibility = View.GONE
+                    res.onSuccess { parsed ->
+                        offlineCaptureDialog?.dismiss()
+                        offlineCaptureDialog = OfflineCaptureDialog(
+                            context = context,
+                            parsed = parsed,
+                            onReplayEntry = { entry -> replayEntryInConsole(entry) }
+                        ).also { it.show() }
+                    }.onFailure { err ->
+                        Toast.makeText(context, "캡처 파일 열기 실패: ${err.message}", Toast.LENGTH_LONG).show()
+                    }
+                }
+            }, "netlab-offline-cap").start()
+        }
+    }
+
+    private fun pickAndRunStaticScan() {
+        val picker = onPickLocalFile
+        if (picker == null) {
+            Toast.makeText(context, "파일 선택기를 사용할 수 없습니다", Toast.LENGTH_SHORT).show()
+            return
+        }
+        picker { uri ->
+            val name = resolveDisplayName(uri)
+            auditStatusLabel.visibility = View.VISIBLE
+            auditStatusLabel.text = "'$name' 정적 보안 스캔 중..."
+            Thread({
+                val res = runCatching {
+                    val bytes = readUriBytesBounded(uri, maxBytes = 24 * 1024 * 1024)
+                    ArtifactStaticScanner.scan(bytes, name)
+                }
+                handler.post {
+                    auditStatusLabel.visibility = View.GONE
+                    res.onSuccess { report ->
+                        showTextReportDialog(context, "정적 보안 스캔 · $name", report.toDisplayText())
+                    }.onFailure { err ->
+                        Toast.makeText(context, "스캔 실패: ${err.message}", Toast.LENGTH_LONG).show()
+                    }
+                }
+            }, "netlab-static-scan").start()
+        }
+    }
+
+    private fun pickAndOpenSqliteDb() {
+        val picker = onPickLocalFile
+        if (picker == null) {
+            Toast.makeText(context, "파일 선택기를 사용할 수 없습니다", Toast.LENGTH_SHORT).show()
+            return
+        }
+        picker { uri ->
+            val name = resolveDisplayName(uri)
+            auditStatusLabel.visibility = View.VISIBLE
+            auditStatusLabel.text = "'$name' SQLite 불러오는 중..."
+            Thread({
+                val res = runCatching { copyUriToTempFile(context, uri, "docky_sqlite_") }
+                handler.post {
+                    auditStatusLabel.visibility = View.GONE
+                    res.onSuccess { tmp ->
+                        sqliteViewerDialog?.dismiss()
+                        sqliteViewerDialog = SqliteViewerDialog(
+                            context = context,
+                            dbFile = tmp,
+                            displayName = name,
+                            deleteOnDismiss = true
+                        ).also { it.show() }
+                    }.onFailure { err ->
+                        Toast.makeText(context, "DB 열기 실패: ${err.message}", Toast.LENGTH_LONG).show()
+                    }
+                }
+            }, "netlab-sqlite-open").start()
+        }
+    }
+
+    private fun readUriBytesBounded(uri: Uri, maxBytes: Int): ByteArray {
+        val out = java.io.ByteArrayOutputStream()
+        context.contentResolver.openInputStream(uri)?.use { inp ->
+            val buf = ByteArray(16_384)
+            var total = 0
+            while (total < maxBytes) {
+                val n = inp.read(buf, 0, minOf(buf.size, maxBytes - total))
+                if (n <= 0) break
+                out.write(buf, 0, n)
+                total += n
+            }
+        } ?: throw IllegalStateException("파일 스트림을 열 수 없습니다")
+        return out.toByteArray()
+    }
+
+    private fun resolveDisplayName(uri: Uri): String {
+        runCatching {
+            context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cur ->
+                if (cur.moveToFirst()) {
+                    val idx = cur.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (idx >= 0) {
+                        val s = cur.getString(idx)
+                        if (!s.isNullOrBlank()) return s
+                    }
+                }
+            }
+        }
+        return uri.lastPathSegment?.substringAfterLast('/') ?: "selected_file"
     }
 
     private fun copySingleEntry(entry: LogEntry) {

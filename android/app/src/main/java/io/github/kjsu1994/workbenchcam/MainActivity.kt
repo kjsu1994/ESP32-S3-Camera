@@ -274,7 +274,11 @@ class MainActivity : Activity() {
     }
 
     private fun createScreen(config: Configuration) {
-        val toolsView = netToolsView ?: NetToolsView(this) { preferredQrHost() }.also { netToolsView = it }
+        val toolsView = netToolsView ?: NetToolsView(
+            context = this,
+            getConnectedBoardIp = { preferredQrHost() },
+            onPickLocalFile = ::pickFileForAnalysis
+        ).also { netToolsView = it }
         screen = CameraScreen(
             context = this,
             config = config,
@@ -1200,7 +1204,28 @@ class MainActivity : Activity() {
             REQ_PICK_OTA_FILE -> {
                 data.data?.let(::confirmAndUploadOta)
             }
+            REQ_PICK_ANALYZE_FILE -> {
+                val cb = pendingAnalyzePick
+                pendingAnalyzePick = null
+                data.data?.let { uri -> cb?.invoke(uri) }
+            }
         }
+    }
+
+    private var pendingAnalyzePick: ((Uri) -> Unit)? = null
+
+    @Suppress("DEPRECATION")
+    private fun pickFileForAnalysis(onPicked: (Uri) -> Unit) {
+        pendingAnalyzePick = onPicked
+        val pick = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+        }
+        runCatching { startActivityForResult(pick, REQ_PICK_ANALYZE_FILE) }
+            .onFailure {
+                pendingAnalyzePick = null
+                Toast.makeText(this, "파일 선택기를 열 수 없습니다", Toast.LENGTH_SHORT).show()
+            }
     }
 
     @Suppress("DEPRECATION")
@@ -2046,5 +2071,6 @@ class MainActivity : Activity() {
     companion object {
         private const val REQ_PICK_UPLOAD_FILE = 41
         private const val REQ_PICK_OTA_FILE = 42
+        private const val REQ_PICK_ANALYZE_FILE = 43
     }
 }
