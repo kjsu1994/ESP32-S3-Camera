@@ -44,6 +44,11 @@ private enum class ProxyDirFilter(val label: String) {
     T2C("← 응답(T→C)")
 }
 
+private enum class ProxyMode(val label: String) {
+    TCP_RELAY("1:1 TCP 중계"),
+    WEB_PROXY("웹 프록시 (PC 전체)")
+}
+
 private enum class PortPreset(val label: String) {
     CONTROL("주요 36개"),
     WELL_KNOWN("1~1024"),
@@ -185,8 +190,16 @@ internal class NetToolsView(
         refreshMonitorLogDisplay(delta)
     }
 
-    // Sub-Tab 3: Bidirectional TCP Relay Proxy + Wireshark .pcap Export
+    // Sub-Tab 3: Bidirectional TCP Relay Proxy + Explicit Web Proxy (HTTP/HTTPS CONNECT) + Wireshark .pcap Export
     private val relayProxy = TcpRelayProxy()
+    private val webProxy = HttpWebProxy()
+    private var proxyMode = ProxyMode.TCP_RELAY
+    private var savedTcpListenPort = "5000"
+    private var savedWebListenPort = "8888"
+    private val renderProxyMode: (ProxyMode) -> Unit
+    private val proxyModeDescLabel: TextView
+    private val proxyListenLabel: TextView
+    private val proxyTargetSection: LinearLayout
     private val proxyListenPortField: EditText
     private val proxyTargetIpField: EditText
     private val proxyTargetPortField: EditText
@@ -204,6 +217,7 @@ internal class NetToolsView(
     private var proxyDensity = LogDisplayDensity.SUMMARY
     private var proxyDedup = false
     private val proxyPackets = ArrayList<ProxyPacketRecord>()
+    private val proxyObservedDomains = LinkedHashSet<String>()
     private var proxySeq = 0
     private var proxyC2tCount = 0
     private var proxyT2cCount = 0
@@ -510,25 +524,36 @@ internal class NetToolsView(
         val pxCard = UiStyle.card(context, 14)
 
         val copyProxyAddrChip = UiStyle.compactChipButton(
-            context, "중계 주소 복사", UiStyle.CYAN_SOFT, UiStyle.CYAN, UiStyle.BORDER
+            context, "프록시 주소 복사", UiStyle.CYAN_SOFT, UiStyle.CYAN, UiStyle.BORDER
         ) {
             val myIp = localNet?.ip ?: "192.168.x.x"
-            val lp = proxyListenPortField.text.toString().trim().ifEmpty { "5000" }
+            val defaultPort = if (proxyMode == ProxyMode.WEB_PROXY) "8888" else "5000"
+            val lp = proxyListenPortField.text.toString().trim().ifEmpty { defaultPort }
             copyText("$myIp:$lp")
         }
         pxCard.addView(LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            addView(UiStyle.label(context, "TCP 양방향 중계 (Proxy)", 15f, UiStyle.INK, bold = true),
+            addView(UiStyle.label(context, "TCP 중계 · 웹 프록시", 15f, UiStyle.INK, bold = true),
                 LinearLayout.LayoutParams(0, -2, 1f))
             addView(copyProxyAddrChip)
         })
-        pxCard.addView(UiStyle.label(
+
+        val (pxModeChips, pxModeRenderer) = UiStyle.segmentedChips(
+            context,
+            ProxyMode.entries.map { it to it.label },
+            proxyMode
+        ) { switchProxyMode(it) }
+        renderProxyMode = pxModeRenderer
+        pxCard.addView(pxModeChips, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 10) })
+
+        proxyModeDescLabel = UiStyle.label(
             context,
             "PC·장비의 접속 대상 IP를 아래 [내 폰 주소]로 지정하면 실제 통신을 유지한 채 양방향 모든 TCP 데이터를 포착해 Wireshark(.pcap)로 저장할 수 있습니다.",
             12f,
             UiStyle.SECONDARY
-        ).apply { setPadding(0, UiStyle.dp(context, 4), 0, UiStyle.dp(context, 10)) })
+        ).apply { setPadding(0, UiStyle.dp(context, 8), 0, UiStyle.dp(context, 10)) }
+        pxCard.addView(proxyModeDescLabel)
 
         proxyRouteLabel = UiStyle.label(context, "", 11.5f, UiStyle.ACCENT, bold = true).apply {
             typeface = Typeface.MONOSPACE
@@ -553,19 +578,24 @@ internal class NetToolsView(
             addTextChangedListener(routeWatcher)
         }
 
-        pxCard.addView(UiStyle.label(context, "내 폰 수신 포트 (PC가 접속할 포트)", 11.5f, UiStyle.MUTED, bold = true).apply {
+        proxyListenLabel = UiStyle.label(context, "내 폰 수신 포트 (PC가 접속할 포트)", 11.5f, UiStyle.MUTED, bold = true).apply {
             setPadding(0, UiStyle.dp(context, 10), 0, UiStyle.dp(context, 4))
-        })
+        }
+        pxCard.addView(proxyListenLabel)
         pxCard.addView(proxyListenPortField, LinearLayout.LayoutParams(-1, -2))
 
-        pxCard.addView(UiStyle.label(context, "전달할 원래 대상 장비 (IP : 포트)", 11.5f, UiStyle.MUTED, bold = true).apply {
-            setPadding(0, UiStyle.dp(context, 8), 0, UiStyle.dp(context, 4))
-        })
-        pxCard.addView(LinearLayout(context).apply {
-            orientation = LinearLayout.HORIZONTAL
-            addView(proxyTargetIpField, LinearLayout.LayoutParams(0, -2, 1.55f).apply { marginEnd = UiStyle.dp(context, 8) })
-            addView(proxyTargetPortField, LinearLayout.LayoutParams(0, -2, 0.85f))
-        }, LinearLayout.LayoutParams(-1, -2))
+        proxyTargetSection = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(UiStyle.label(context, "전달할 원래 대상 장비 (IP : 포트)", 11.5f, UiStyle.MUTED, bold = true).apply {
+                setPadding(0, UiStyle.dp(context, 8), 0, UiStyle.dp(context, 4))
+            })
+            addView(LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                addView(proxyTargetIpField, LinearLayout.LayoutParams(0, -2, 1.55f).apply { marginEnd = UiStyle.dp(context, 8) })
+                addView(proxyTargetPortField, LinearLayout.LayoutParams(0, -2, 0.85f))
+            }, LinearLayout.LayoutParams(-1, -2))
+        }
+        pxCard.addView(proxyTargetSection, LinearLayout.LayoutParams(-1, -2))
 
         proxyToggleBtn = UiStyle.primaryButton(context, "TCP 양방향 중계 시작") { toggleTcpProxy() }
         pxCard.addView(proxyToggleBtn, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 10) })
@@ -875,6 +905,7 @@ internal class NetToolsView(
         udpSniffer.stop()
         tcpServerSniffer.stop()
         relayProxy.stop()
+        webProxy.stop()
         stopAllTcpTaps()
         consoleClient.disconnect()
     }
@@ -1779,11 +1810,51 @@ internal class NetToolsView(
     }
 
     // =========================================================================
-    // Flow Step 3: Bidirectional TCP Relay Proxy + Wireshark .pcap Export
+    // Flow Step 3: Bidirectional TCP Relay Proxy + Explicit Web Proxy + .pcap
     // =========================================================================
+
+    private fun isAnyProxyRunning(): Boolean = relayProxy.isRunning() || webProxy.isRunning()
+
+    private fun switchProxyMode(mode: ProxyMode) {
+        if (proxyMode == mode) return
+        hideKeyboard()
+        if (isAnyProxyRunning()) {
+            relayProxy.stop()
+            webProxy.stop()
+        }
+        val curPort = proxyListenPortField.text.toString().trim()
+        if (proxyMode == ProxyMode.TCP_RELAY && curPort.isNotEmpty()) {
+            savedTcpListenPort = curPort
+        } else if (proxyMode == ProxyMode.WEB_PROXY && curPort.isNotEmpty()) {
+            savedWebListenPort = curPort
+        }
+
+        proxyMode = mode
+        renderProxyMode(mode)
+        if (mode == ProxyMode.WEB_PROXY) {
+            proxyTargetSection.visibility = View.GONE
+            proxyListenPortField.setText(savedWebListenPort)
+            proxyListenLabel.text = "웹 프록시 포트 (Windows 수동 프록시 포트)"
+            proxyModeDescLabel.text = "Windows 설정 → 네트워크 및 인터넷 → 프록시 → 수동 프록시에 아래 [내 폰 주소]를 입력하면 PC 크롬·엣지의 네이버·구글·전체 웹 통신이 폰을 거쳐 실시간 기록됩니다."
+            proxyToggleBtn.text = "웹 프록시 시작 (PC 전체 웹)"
+            proxyStatsText.text = "대기 중 · 시작 후 PC Windows 수동 프록시에 위 IP와 포트를 입력하세요"
+            proxyStatsText.setTextColor(UiStyle.CYAN)
+        } else {
+            proxyTargetSection.visibility = View.VISIBLE
+            proxyListenPortField.setText(savedTcpListenPort)
+            proxyListenLabel.text = "내 폰 수신 포트 (PC가 접속할 포트)"
+            proxyModeDescLabel.text = "PC·장비의 접속 대상 IP를 아래 [내 폰 주소]로 지정하면 실제 통신을 유지한 채 양방향 모든 TCP 데이터를 포착해 Wireshark(.pcap)로 저장할 수 있습니다."
+            proxyToggleBtn.text = "TCP 양방향 중계 시작"
+            proxyStatsText.text = "대기 중 · 중계 시작 후 PC/클라이언트를 위 폰 주소로 연결하세요"
+            proxyStatsText.setTextColor(UiStyle.CYAN)
+        }
+        updateProxyRoutePreview()
+        syncFullscreenProxyHeader()
+    }
 
     private fun openPortInProxy(targetIp: String, targetPort: Int) {
         selectedDeviceIp = targetIp
+        if (proxyMode != ProxyMode.TCP_RELAY) switchProxyMode(ProxyMode.TCP_RELAY)
         proxyTargetIpField.setText(targetIp)
         proxyTargetPortField.setText(targetPort.toString())
         val suggestedListen = when {
@@ -1799,25 +1870,37 @@ internal class NetToolsView(
 
     private fun updateProxyRoutePreview() {
         val myIp = localNet?.ip ?: "내 폰IP"
-        val lPort = proxyListenPortField.text.toString().trim().ifEmpty { "5000" }
-        val tIp = proxyTargetIpField.text.toString().trim().ifEmpty { "대상IP" }
-        val tPort = proxyTargetPortField.text.toString().trim().ifEmpty { "5000" }
-        proxyRouteLabel.text = "PC ──► $myIp:$lPort ──► $tIp:$tPort"
+        val defaultPort = if (proxyMode == ProxyMode.WEB_PROXY) "8888" else "5000"
+        val lPort = proxyListenPortField.text.toString().trim().ifEmpty { defaultPort }
+        if (proxyMode == ProxyMode.WEB_PROXY) {
+            proxyRouteLabel.text = "PC 프록시 ──► $myIp:$lPort ──► 네이버 · 구글 · 전체 웹"
+        } else {
+            val tIp = proxyTargetIpField.text.toString().trim().ifEmpty { "대상IP" }
+            val tPort = proxyTargetPortField.text.toString().trim().ifEmpty { "5000" }
+            proxyRouteLabel.text = "PC ──► $myIp:$lPort ──► $tIp:$tPort"
+        }
     }
 
     private fun toggleTcpProxy() {
         hideKeyboard()
-        if (relayProxy.isRunning()) {
+        if (isAnyProxyRunning()) {
             relayProxy.stop()
+            webProxy.stop()
             return
         }
         val listenPort = proxyListenPortField.text.toString().trim().toIntOrNull()
-        val targetIp = proxyTargetIpField.text.toString().trim()
-        val targetPort = proxyTargetPortField.text.toString().trim().toIntOrNull()
         if (listenPort == null || listenPort !in 1024..65535) {
             Toast.makeText(context, "폰 리슨 포트는 1024~65535 사이로 입력하세요", Toast.LENGTH_SHORT).show()
             return
         }
+
+        if (proxyMode == ProxyMode.WEB_PROXY) {
+            startWebProxy(listenPort)
+            return
+        }
+
+        val targetIp = proxyTargetIpField.text.toString().trim()
+        val targetPort = proxyTargetPortField.text.toString().trim().toIntOrNull()
         if (!isValidIpv4(targetIp) || targetPort == null || targetPort !in 1..65535) {
             Toast.makeText(context, "원래 대상 IP와 포트(1~65535)를 올바르게 입력하세요", Toast.LENGTH_SHORT).show()
             return
@@ -1848,26 +1931,7 @@ internal class NetToolsView(
                     syncFullscreenProxyHeader()
                 }
             },
-            onPacket = { pkt ->
-                handler.post {
-                    val rec = synchronized(proxyPackets) {
-                        proxySeq++
-                        val item = ProxyPacketRecord(proxySeq, pkt)
-                        proxyPackets.add(item)
-                        if (proxyPackets.size > 3000) proxyPackets.removeAt(0)
-                        item
-                    }
-                    if (rec.pkt.direction == RelayDirection.CLIENT_TO_TARGET) {
-                        proxyC2tCount++
-                        proxyC2tBytes += rec.pkt.data.size
-                    } else {
-                        proxyT2cCount++
-                        proxyT2cBytes += rec.pkt.data.size
-                    }
-                    updateProxyStatsLine(null)
-                    scheduleProxyLogRefresh(1)
-                }
-            },
+            onPacket = { pkt -> recordRelayedPacket(pkt) },
             onError = { err ->
                 handler.post {
                     proxyStatsText.text = "오류: $err"
@@ -1878,7 +1942,9 @@ internal class NetToolsView(
             },
             onStopped = {
                 handler.post {
-                    proxyToggleBtn.text = "TCP 양방향 중계 시작"
+                    if (proxyMode == ProxyMode.TCP_RELAY) {
+                        proxyToggleBtn.text = "TCP 양방향 중계 시작"
+                    }
                     proxyActiveSessions = 0
                     if (proxyStatsText.currentTextColor != UiStyle.DANGER) {
                         proxyStatsText.text = "중계 중지됨 · C→T ${proxyC2tCount}건 / T→C ${proxyT2cCount}건 기록됨"
@@ -1890,8 +1956,83 @@ internal class NetToolsView(
         )
     }
 
+    private fun startWebProxy(listenPort: Int) {
+        proxyToggleBtn.text = "웹 프록시 중지"
+        proxyStatsText.text = "웹 프록시 포트 :$listenPort 준비 중..."
+        proxyStatsText.setTextColor(UiStyle.AMBER)
+        updateProxyRoutePreview()
+
+        webProxy.start(
+            listenPort = listenPort,
+            onStarted = { actualPort ->
+                handler.post {
+                    val myIp = localNet?.ip ?: "내 폰IP"
+                    proxyStatsText.text = "● 웹 프록시 대기 중: Windows 수동 프록시에 $myIp:$actualPort 입력"
+                    proxyStatsText.setTextColor(UiStyle.ACCENT)
+                    syncFullscreenProxyHeader()
+                }
+            },
+            onSessionChanged = { active, info, domain ->
+                handler.post {
+                    proxyActiveSessions = active
+                    if (!domain.isNullOrEmpty()) proxyObservedDomains.add(domain)
+                    proxyLastEventNote = info
+                    updateProxyStatsLine(info)
+                    syncFullscreenProxyHeader()
+                }
+            },
+            onPacket = { pkt -> recordRelayedPacket(pkt) },
+            onError = { err ->
+                handler.post {
+                    proxyStatsText.text = "오류: $err"
+                    proxyStatsText.setTextColor(UiStyle.DANGER)
+                    syncFullscreenProxyHeader()
+                    Toast.makeText(context, err, Toast.LENGTH_LONG).show()
+                }
+            },
+            onStopped = {
+                handler.post {
+                    if (proxyMode == ProxyMode.WEB_PROXY) {
+                        proxyToggleBtn.text = "웹 프록시 시작 (PC 전체 웹)"
+                    }
+                    proxyActiveSessions = 0
+                    if (proxyStatsText.currentTextColor != UiStyle.DANGER) {
+                        val dom = if (proxyObservedDomains.isNotEmpty()) " · 도메인 ${proxyObservedDomains.size}개" else ""
+                        proxyStatsText.text = "웹 프록시 중지됨$dom · C→T ${proxyC2tCount}건 / T→C ${proxyT2cCount}건"
+                        proxyStatsText.setTextColor(UiStyle.MUTED)
+                    }
+                    syncFullscreenProxyHeader()
+                }
+            }
+        )
+    }
+
+    private fun recordRelayedPacket(pkt: RelayedPacket) {
+        handler.post {
+            val rec = synchronized(proxyPackets) {
+                proxySeq++
+                val item = ProxyPacketRecord(proxySeq, pkt)
+                proxyPackets.add(item)
+                if (proxyPackets.size > 3000) proxyPackets.removeAt(0)
+                item
+            }
+            if (rec.pkt.direction == RelayDirection.CLIENT_TO_TARGET) {
+                proxyC2tCount++
+                proxyC2tBytes += rec.pkt.data.size
+            } else {
+                proxyT2cCount++
+                proxyT2cBytes += rec.pkt.data.size
+            }
+            updateProxyStatsLine(null)
+            scheduleProxyLogRefresh(1)
+        }
+    }
+
     private fun updateProxyStatsLine(eventNote: String?) {
-        val base = "● 연결 ${proxyActiveSessions} · C→T ${proxyC2tCount}건(${UiStyle.formatSize(proxyC2tBytes)}) · T→C ${proxyT2cCount}건(${UiStyle.formatSize(proxyT2cBytes)})"
+        val domainPart = if (proxyMode == ProxyMode.WEB_PROXY || proxyObservedDomains.isNotEmpty()) {
+            " · 도메인 ${proxyObservedDomains.size}개"
+        } else ""
+        val base = "● 연결 ${proxyActiveSessions}$domainPart · C→T ${proxyC2tCount}건(${UiStyle.formatSize(proxyC2tBytes)}) · T→C ${proxyT2cCount}건(${UiStyle.formatSize(proxyT2cBytes)})"
         proxyStatsText.text = if (eventNote != null) "$base\n$eventNote" else base
         proxyStatsText.setTextColor(UiStyle.ACCENT)
     }
@@ -1918,7 +2059,13 @@ internal class NetToolsView(
                 val pkt = rec.pkt
                 val ts = timeFmt.format(Date(pkt.timestampMs))
                 val isC2t = pkt.direction == RelayDirection.CLIENT_TO_TARGET
-                val dirLabel = if (isC2t) {
+                val dirLabel = if (pkt.targetLabel.isNotEmpty()) {
+                    if (isC2t) {
+                        "C→T  ${pkt.srcIp} → ${pkt.targetLabel} (${pkt.data.size}B)"
+                    } else {
+                        "T→C  ${pkt.targetLabel} → ${pkt.dstIp} (${pkt.data.size}B)"
+                    }
+                } else if (isC2t) {
                     "C→T  ${pkt.srcIp}:${pkt.srcPort} → ${pkt.dstIp}:${pkt.dstPort} (${pkt.data.size}B)"
                 } else {
                     "T→C  ${pkt.srcIp}:${pkt.srcPort} → ${pkt.dstIp}:${pkt.dstPort} (${pkt.data.size}B)"
@@ -1926,7 +2073,7 @@ internal class NetToolsView(
                 val (body, extraBytes) = formatPayloadView(pkt.data, proxyFormat, proxyDensity)
                 val compact = LogFormatter.compactOneLine(pkt.data)
                 val fullText = LogFormatter.formatReadableText(pkt.data, 4096)
-                val dedup = "${pkt.direction.name}|${pkt.srcIp}|${pkt.dstIp}:${pkt.dstPort}|${pkt.data.size}|${pkt.data.contentHashCode()}"
+                val dedup = "${pkt.direction.name}|${pkt.targetLabel}|${pkt.srcIp}|${pkt.dstIp}:${pkt.dstPort}|${pkt.data.size}|${pkt.data.contentHashCode()}"
                 LogEntry(
                     seq = rec.seq,
                     header = "[$ts] $dirLabel",
@@ -1959,18 +2106,26 @@ internal class NetToolsView(
 
     private fun syncFullscreenProxyHeader() {
         if (fullscreenSource != FullscreenLogSource.PROXY) return
-        val running = relayProxy.isRunning()
+        val running = isAnyProxyRunning()
         val note = proxyLastEventNote?.let { " · $it" } ?: ""
+        val domPart = if (proxyMode == ProxyMode.WEB_PROXY || proxyObservedDomains.isNotEmpty()) {
+            " · 도메인 ${proxyObservedDomains.size}개"
+        } else ""
         val status = if (running) {
-            "연결 ${proxyActiveSessions} · C→T ${proxyC2tCount}건(${UiStyle.formatSize(proxyC2tBytes)}) · T→C ${proxyT2cCount}건(${UiStyle.formatSize(proxyT2cBytes)})$note"
+            "연결 ${proxyActiveSessions}$domPart · C→T ${proxyC2tCount}건(${UiStyle.formatSize(proxyC2tBytes)}) · T→C ${proxyT2cCount}건(${UiStyle.formatSize(proxyT2cBytes)})$note"
         } else {
             proxyStatsText.text.toString().replace('\n', ' ')
+        }
+        val runLabel = if (proxyMode == ProxyMode.WEB_PROXY) {
+            if (running) "■ 프록시 중지" else "▶ 프록시 시작"
+        } else {
+            if (running) "■ 중계 중지" else "▶ 중계 시작"
         }
         fullscreenDialog?.updateHeader(
             statusText = status,
             statusColor = proxyStatsText.currentTextColor,
             running = running,
-            runLabel = if (running) "■ 중계 중지" else "▶ 중계 시작",
+            runLabel = runLabel,
             filterLabel = "방향: ${proxyDirFilter.label}",
             formatLabel = "표시: ${proxyFormat.label}",
             density = proxyDensity,
@@ -1980,6 +2135,7 @@ internal class NetToolsView(
 
     private fun clearProxyLog() {
         synchronized(proxyPackets) { proxyPackets.clear() }
+        proxyObservedDomains.clear()
         proxySeq = 0
         proxyC2tCount = 0
         proxyT2cCount = 0
@@ -2254,8 +2410,12 @@ internal class NetToolsView(
         val dlg = when (source) {
             FullscreenLogSource.PROXY -> FullscreenLogDialog(
                 context = context,
-                title = "실시간 TCP 양방향 중계 로그",
-                defaultEmptyText = "기록된 중계 패킷이 없습니다.\n상단 [▶ 중계 시작] 후 PC/클라이언트를 폰 주소로 연결하세요.",
+                title = if (proxyMode == ProxyMode.WEB_PROXY) "실시간 웹 프록시 로그 (PC 전체)" else "실시간 TCP 양방향 중계 로그",
+                defaultEmptyText = if (proxyMode == ProxyMode.WEB_PROXY) {
+                    "기록된 웹 트래픽이 없습니다.\n상단 [▶ 프록시 시작] 후 Windows 수동 프록시에 폰 IP:포트를 입력하세요."
+                } else {
+                    "기록된 중계 패킷이 없습니다.\n상단 [▶ 중계 시작] 후 PC/클라이언트를 폰 주소로 연결하세요."
+                },
                 actions = FullscreenLogActions(
                     onToggleRun = { toggleTcpProxy() },
                     onCycleFilter = {

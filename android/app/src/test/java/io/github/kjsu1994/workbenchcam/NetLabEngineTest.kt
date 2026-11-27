@@ -404,4 +404,145 @@ class NetLabEngineTest {
         assertTrue(pretty.contains("  \"items\": ["))
         assertEquals(null, LogFormatter.tryPrettyJson("PLAIN TEXT ONLY"))
     }
+
+    @Test fun httpWebProxyForwardsPlainHttpAndRewritesAbsoluteUri() {
+        val origin = ServerSocket(0)
+        val originPort = origin.localPort
+        val receivedByOrigin = StringBuilder()
+        val originThread = Thread {
+            runCatching {
+                origin.accept().use { sock ->
+                    val buf = ByteArray(1024)
+                    val n = sock.getInputStream().read(buf)
+                    if (n > 0) {
+                        synchronized(receivedByOrigin) {
+                            receivedByOrigin.append(String(buf, 0, n, Charsets.ISO_8859_1))
+                        }
+                        val body = "{\"ok\":true}"
+                        val resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${body.length}\r\nConnection: close\r\n\r\n$body"
+                        sock.getOutputStream().write(resp.toByteArray(Charsets.ISO_8859_1))
+                        sock.getOutputStream().flush()
+                    }
+                }
+            }
+        }
+        originThread.start()
+
+        val proxy = HttpWebProxy()
+        val started = CountDownLatch(1)
+        val bothDirs = CountDownLatch(2)
+        val captured = CopyOnWriteArrayList<RelayedPacket>()
+        var proxyPort = 0
+
+        try {
+            proxy.start(
+                listenPort = 0,
+                onStarted = { p -> proxyPort = p; started.countDown() },
+                onSessionChanged = { _, _, _ -> },
+                onPacket = { pkt -> captured.add(pkt); bothDirs.countDown() },
+                onError = {},
+                onStopped = {}
+            )
+            assertTrue("Web proxy failed to start", started.await(2, TimeUnit.SECONDS))
+
+            val clientResponse = StringBuilder()
+            Socket("127.0.0.1", proxyPort).use { client ->
+                client.soTimeout = 2000
+                val req = "GET http://127.0.0.1:$originPort/api/ping?v=1 HTTP/1.1\r\n" +
+                    "Host: 127.0.0.1:$originPort\r\n" +
+                    "Proxy-Connection: keep-alive\r\n\r\n"
+                client.getOutputStream().write(req.toByteArray(Charsets.ISO_8859_1))
+                client.getOutputStream().flush()
+                val buf = ByteArray(1024)
+                while (true) {
+                    val n = client.getInputStream().read(buf)
+                    if (n <= 0) break
+                    clientResponse.append(String(buf, 0, n, Charsets.ISO_8859_1))
+                }
+            }
+
+            assertTrue("Expected both C->T and T->C packets", bothDirs.await(2, TimeUnit.SECONDS))
+            val originReq = synchronized(receivedByOrigin) { receivedByOrigin.toString() }
+            assertTrue("Origin should receive origin-form path, got: $originReq", originReq.startsWith("GET /api/ping?v=1 HTTP/1.1\r\n"))
+            assertFalse("Proxy-Connection header should be stripped", originReq.contains("Proxy-Connection:", ignoreCase = true))
+            assertTrue("Client should receive 200 OK JSON body", clientResponse.toString().contains("{\"ok\":true}"))
+            assertTrue(captured.any { it.direction == RelayDirection.CLIENT_TO_TARGET && it.targetLabel == "127.0.0.1:$originPort" })
+            assertTrue(captured.any { it.direction == RelayDirection.TARGET_TO_CLIENT && it.targetLabel == "127.0.0.1:$originPort" })
+        } finally {
+            proxy.stop()
+            origin.close()
+            originThread.join(1000)
+        }
+    }
+
+    @Test fun httpWebProxyEstablishesConnectTunnelAndRelaysBidirectionalBytes() {
+        val tlsEchoServer = ServerSocket(0)
+        val echoPort = tlsEchoServer.localPort
+        val serverThread = Thread {
+            runCatching {
+                tlsEchoServer.accept().use { sock ->
+                    val buf = ByteArray(256)
+                    val n = sock.getInputStream().read(buf)
+                    if (n > 0) {
+                        val reply = ("TUNNEL_ECHO:" + String(buf, 0, n, Charsets.US_ASCII)).toByteArray(Charsets.US_ASCII)
+                        sock.getOutputStream().write(reply)
+                        sock.getOutputStream().flush()
+                        Thread.sleep(100)
+                    }
+                }
+            }
+        }
+        serverThread.start()
+
+        val proxy = HttpWebProxy()
+        val started = CountDownLatch(1)
+        val packetsLatch = CountDownLatch(3) // CONNECT handshake + C->T payload + T->C echo
+        val captured = CopyOnWriteArrayList<RelayedPacket>()
+        var proxyPort = 0
+
+        try {
+            proxy.start(
+                listenPort = 0,
+                onStarted = { p -> proxyPort = p; started.countDown() },
+                onSessionChanged = { _, _, _ -> },
+                onPacket = { pkt -> captured.add(pkt); packetsLatch.countDown() },
+                onError = {},
+                onStopped = {}
+            )
+            assertTrue("Web proxy failed to start", started.await(2, TimeUnit.SECONDS))
+
+            Socket("127.0.0.1", proxyPort).use { client ->
+                client.soTimeout = 2000
+                val out = client.getOutputStream()
+                val inp = client.getInputStream()
+                out.write("CONNECT 127.0.0.1:$echoPort HTTP/1.1\r\nHost: 127.0.0.1:$echoPort\r\n\r\n".toByteArray(Charsets.ISO_8859_1))
+                out.flush()
+
+                val hdrBuf = ByteArray(256)
+                val hdrLen = inp.read(hdrBuf)
+                val hdrStr = String(hdrBuf, 0, hdrLen, Charsets.ISO_8859_1)
+                assertTrue("Expected 200 Connection Established, got: $hdrStr", hdrStr.startsWith("HTTP/1.1 200"))
+
+                out.write("HELLO_TLS_STREAM".toByteArray(Charsets.US_ASCII))
+                out.flush()
+                val replyBuf = ByteArray(256)
+                val replyLen = inp.read(replyBuf)
+                assertEquals("TUNNEL_ECHO:HELLO_TLS_STREAM", String(replyBuf, 0, replyLen, Charsets.US_ASCII))
+            }
+
+            assertTrue("Expected CONNECT + tunnel bidirectional packets", packetsLatch.await(2, TimeUnit.SECONDS))
+            assertTrue(captured.any { it.targetLabel == "127.0.0.1:$echoPort" && String(it.data, Charsets.US_ASCII).startsWith("CONNECT ") })
+            assertTrue(captured.any { it.direction == RelayDirection.CLIENT_TO_TARGET && String(it.data, Charsets.US_ASCII) == "HELLO_TLS_STREAM" })
+            assertTrue(captured.any { it.direction == RelayDirection.TARGET_TO_CLIENT && String(it.data, Charsets.US_ASCII) == "TUNNEL_ECHO:HELLO_TLS_STREAM" })
+
+            // Verify captured web proxy packets also export cleanly to Wireshark .pcap
+            val pcapOut = ByteArrayOutputStream()
+            PcapWriter.writePcap(captured, pcapOut)
+            assertTrue(pcapOut.size() > 24)
+        } finally {
+            proxy.stop()
+            tlsEchoServer.close()
+            serverThread.join(1000)
+        }
+    }
 }
