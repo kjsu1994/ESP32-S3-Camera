@@ -39,7 +39,7 @@
 
 namespace {
 constexpr char apName[] = "DockyCam";
-constexpr char kFirmwareVersion[] = "0.3.4";
+constexpr char kFirmwareVersion[] = "0.3.5";
 constexpr uint8_t lowBandwidth = 1 << 0;
 constexpr uint8_t rotate180 = 1 << 1;
 // Retain the v0.1.0 settings round-trip for installed clients.
@@ -57,7 +57,7 @@ uint8_t resolutionIndex(uint8_t options) {
     const uint8_t index = (options & resolutionMask) >> 3;
     return index < sizeof(resolutionKeys) / sizeof(*resolutionKeys) ? index : 0;
 }
-constexpr int xclkHz = 12000000;
+constexpr int xclkHz = 14000000;
 constexpr size_t maxJpegBytes = 256 * 1024;
 constexpr size_t partHeaderCapacity = 96;
 
@@ -187,7 +187,7 @@ bool startCamera(uint8_t options) {
     config.frame_size = frameSizes[resolution];
     // In STA (router) mode, trim JPEG size slightly so multi-hop router RTT stays well below frame interval.
     config.jpeg_quality = (resolution == static_cast<uint8_t>(Resolution::Hd))
-                              ? (staModeActive ? 20 : 16)
+                              ? (staModeActive ? 20 : 12)
                               : (staModeActive ? 16 : 14);
     config.fb_count = 2;
     config.fb_location = CAMERA_FB_IN_PSRAM;
