@@ -116,6 +116,8 @@ details summary::-webkit-details-marker{display:none}
       </div>
       <div class="row" style="margin-top:9px">
         <button onclick="toggleLive()" id="liveToggle" class="pri">실시간 영상 열기</button>
+        <button id="nightBtn" onclick="toggleNight()">야간 흑백</button>
+        <button id="torchBtn" onclick="toggleTorch()">화이트 조명</button>
         <button id="ledBtn" onclick="toggleLed()">LED 전환</button>
         <button class="red" onclick="rebootBoard()">재부팅</button>
       </div>
@@ -137,6 +139,8 @@ details summary::-webkit-details-marker{display:none}
     <h2>
       <span>실시간 미리보기</span>
       <span class="row">
+        <button class="sm" id="liveNightBtn" onclick="toggleNight()">야간 흑백</button>
+        <button class="sm" id="liveTorchBtn" onclick="toggleTorch()">화이트 조명</button>
         <button class="sm" onclick="captureLivePc()">PC에 사진 저장</button>
         <button class="sm" onclick="fullLive()">전체화면</button>
         <button class="sm red" onclick="toggleLive()">닫기</button>
@@ -341,6 +345,33 @@ async function toggleLed(){
   const next=!(wifiState && wifiState.led_enabled);
   await postJson('/led',{enabled:next});
   await loadStatus();
+}
+function syncNightTorchUi(){
+  const night=!!(wifiState && wifiState.night_mode);
+  const torch=!!(wifiState && wifiState.torch_enabled);
+  ['nightBtn','liveNightBtn'].forEach(id=>{
+    const b=$(id); if(!b) return;
+    b.textContent=night?'야간 흑백 ON':'야간 흑백';
+    b.className=(id==='liveNightBtn'?'sm ':'')+(night?'pri':'');
+  });
+  ['torchBtn','liveTorchBtn'].forEach(id=>{
+    const b=$(id); if(!b) return;
+    b.textContent=torch?'화이트 조명 ON':'화이트 조명';
+    b.style.borderColor=torch?'var(--am)':'';
+    b.style.color=torch?'var(--am)':'';
+  });
+}
+async function toggleNight(){
+  const next=!(wifiState && wifiState.night_mode);
+  const r=await postJson('/night',{enabled:next});
+  if(wifiState) wifiState.night_mode=!!r.night_mode;
+  syncNightTorchUi();
+}
+async function toggleTorch(){
+  const next=!(wifiState && wifiState.torch_enabled);
+  const r=await postJson('/torch',{enabled:next});
+  if(wifiState) wifiState.torch_enabled=!!r.torch_enabled;
+  syncNightTorchUi();
 }
 function updateUpPath(){
   $('upPathTag').textContent='/dockycam/shared'+(curCat==='shared'&&curDir?'/'+curDir:'');
@@ -715,6 +746,7 @@ async function loadStatus(){
     $('netMeta').textContent=`${w.mode==='sta'?'공유기(STA)':'직결 AP'} · ${w.ssid} · ${w.ip} (ch ${w.channel})`;
     $('telMeta').textContent=`칩 온도 ${t.chip_temp_c!=null?t.chip_temp_c.toFixed(1)+' °C':'-'} · 신호 ${w.mode==='sta'?w.rssi+' dBm':'AP'} · LED ${w.led_enabled?'켜짐':'꺼짐(스텔스)'}`;
     $('ledBtn').textContent=w.led_enabled?'LED 끄기 (스텔스)':'LED 켜기';
+    syncNightTorchUi();
     if(!s.mounted){
       $('sdMeta').textContent='SD카드 미인식';
     }else{

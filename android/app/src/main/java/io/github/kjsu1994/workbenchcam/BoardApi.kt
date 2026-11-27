@@ -48,7 +48,8 @@ internal data class BoardTelemetry(val chipTempC: Double?, val powerMw: Int?)
 internal data class BoardOptions(
     val lowBandwidth: Boolean,
     val rotate180: Boolean,
-    val resolution: VideoResolution
+    val resolution: VideoResolution,
+    val nightMode: Boolean = false
 )
 
 internal data class WifiStatus(
@@ -62,7 +63,9 @@ internal data class WifiStatus(
     val staSsid: String,
     val ledEnabled: Boolean,
     val fwVersion: String = "",
-    val uptimeSeconds: Long = 0L
+    val uptimeSeconds: Long = 0L,
+    val torchEnabled: Boolean = false,
+    val nightMode: Boolean = false
 )
 
 internal data class ScannedWifi(
@@ -162,6 +165,7 @@ internal class BoardApi(private val target: BoardTarget) {
             .put("low_bandwidth", options.lowBandwidth)
             .put("rotate_180", options.rotate180)
             .put("resolution", options.resolution.key)
+            .put("night_mode", options.nightMode)
         return optionsRequest(json.toString().toByteArray())
     }
 
@@ -202,7 +206,9 @@ internal class BoardApi(private val target: BoardTarget) {
                 staSsid = json.optString("sta_ssid", ""),
                 ledEnabled = json.optBoolean("led_enabled", true),
                 fwVersion = json.optString("fw_version", ""),
-                uptimeSeconds = json.optLong("uptime_s", 0L)
+                uptimeSeconds = json.optLong("uptime_s", 0L),
+                torchEnabled = json.optBoolean("torch_enabled", false),
+                nightMode = json.optBoolean("night_mode", false)
             )
         } finally {
             connection.disconnect()
@@ -251,6 +257,30 @@ internal class BoardApi(private val target: BoardTarget) {
             connection.post(json.toString().toByteArray())
             if (connection.responseCode != 200) throw IOException("LED update failed")
             return connection.readBoardJson(256).optBoolean("led_enabled", enabled)
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    fun setTorchEnabled(enabled: Boolean): Boolean {
+        val connection = open("/torch", 2500)
+        try {
+            val json = JSONObject().put("enabled", enabled)
+            connection.post(json.toString().toByteArray())
+            if (connection.responseCode != 200) throw IOException("Torch update failed")
+            return connection.readBoardJson(256).optBoolean("torch_enabled", enabled)
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    fun setNightMode(enabled: Boolean): Boolean {
+        val connection = open("/night", 2500)
+        try {
+            val json = JSONObject().put("enabled", enabled)
+            connection.post(json.toString().toByteArray())
+            if (connection.responseCode != 200) throw IOException("Night mode update failed")
+            return connection.readBoardJson(256).optBoolean("night_mode", enabled)
         } finally {
             connection.disconnect()
         }
@@ -594,8 +624,12 @@ internal class BoardApi(private val target: BoardTarget) {
             if (body != null) connection.post(body)
             if (connection.responseCode != 200) throw IOException("Board settings unavailable")
             val json = connection.readBoardJson()
-            return BoardOptions(json.getBoolean("low_bandwidth"), json.getBoolean("rotate_180"),
-                VideoResolution.entries.firstOrNull { it.key == json.optString("resolution") } ?: VideoResolution.VGA)
+            return BoardOptions(
+                lowBandwidth = json.getBoolean("low_bandwidth"),
+                rotate180 = json.getBoolean("rotate_180"),
+                resolution = VideoResolution.entries.firstOrNull { it.key == json.optString("resolution") } ?: VideoResolution.VGA,
+                nightMode = json.optBoolean("night_mode", false)
+            )
         } finally {
             connection.disconnect()
         }

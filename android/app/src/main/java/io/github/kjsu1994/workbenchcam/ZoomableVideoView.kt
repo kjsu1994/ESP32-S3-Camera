@@ -4,6 +4,8 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.view.GestureDetector
@@ -137,6 +139,7 @@ internal class ZoomableVideoView(
     private var bitmapHeight = 0
     private var fillCrop = false
     private var showGrid = false
+    private var nightBoost = false
 
     private val gridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = 0x66ffffff
@@ -233,6 +236,32 @@ internal class ZoomableVideoView(
     fun setShowGrid(enabled: Boolean) {
         if (showGrid == enabled) return
         showGrid = enabled
+        invalidate()
+    }
+
+    fun setNightBoost(enabled: Boolean) {
+        if (nightBoost == enabled) return
+        nightBoost = enabled
+        colorFilter = if (enabled) {
+            // Pure luminance monochrome + gentle dark-shadow boost via GPU ColorMatrix (zero CPU cost)
+            val gain = 1.24f
+            val lift = 10f
+            val lr = 0.299f * gain
+            val lg = 0.587f * gain
+            val lb = 0.114f * gain
+            ColorMatrixColorFilter(
+                ColorMatrix(
+                    floatArrayOf(
+                        lr, lg, lb, 0f, lift,
+                        lr, lg, lb, 0f, lift,
+                        lr, lg, lb, 0f, lift,
+                        0f, 0f, 0f, 1f, 0f
+                    )
+                )
+            )
+        } else {
+            null
+        }
         invalidate()
     }
 

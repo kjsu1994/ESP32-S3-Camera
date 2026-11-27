@@ -39,12 +39,13 @@
 
 namespace {
 constexpr char apName[] = "DockyCam";
-constexpr char kFirmwareVersion[] = "0.3.5";
+constexpr char kFirmwareVersion[] = "0.3.6";
 constexpr uint8_t lowBandwidth = 1 << 0;
 constexpr uint8_t rotate180 = 1 << 1;
 // Retain the v0.1.0 settings round-trip for installed clients.
 constexpr uint8_t legacyDimOled = 1 << 2;
 constexpr uint8_t resolutionMask = 3 << 3;
+constexpr uint8_t nightMode = 1 << 5;
 constexpr uint8_t ina219Address = 0x40;
 static_assert(POWER_SHUNT_MILLIOHMS >= 1 && POWER_SHUNT_MILLIOHMS <= 1000,
               "Set the INA219 shunt resistance in milliohms");
@@ -85,6 +86,7 @@ String staPass;
 int activeWifiChannel = 6;
 String cachedWifiScanJson = "{\"networks\":[]}";
 volatile bool ledEnabled = true;
+volatile bool torchEnabled = false;
 volatile uint32_t rebootAtMs = 0;
 std::atomic<int> activeTransfers{0};
 sdrec::Manager sdManager;
@@ -157,6 +159,38 @@ bool shouldStop() {
 
 void stopCamera();
 
+void applyNightMode(sensor_t* sensor, bool enabled) {
+    if (!sensor) return;
+    if (sensor->set_exposure_ctrl) sensor->set_exposure_ctrl(sensor, 1);
+    if (sensor->set_gain_ctrl) sensor->set_gain_ctrl(sensor, 1);
+    if (enabled) {
+        // OV5640 hardware Night Mode (auto frame-rate drop for longer shutter exposure) + high ISO + B&W.
+        if (sensor->set_aec2) sensor->set_aec2(sensor, 1);
+        if (sensor->set_gainceiling) sensor->set_gainceiling(sensor, GAINCEILING_128X);
+        if (sensor->set_ae_level) {
+            if (sensor->set_ae_level(sensor, 3) != 0) sensor->set_ae_level(sensor, 2);
+        }
+        if (sensor->set_reg) {
+            // Raise OV5640 night-mode max exposure VTS (0x3A02/0x3A03 = 1600 lines) for low-light visibility.
+            sensor->set_reg(sensor, 0x3A02, 0xFF, 0x06);
+            sensor->set_reg(sensor, 0x3A03, 0xFF, 0x40);
+        }
+        if (sensor->set_special_effect) sensor->set_special_effect(sensor, 2); // Monochrome B&W
+        if (sensor->set_brightness) sensor->set_brightness(sensor, 1);
+        if (sensor->set_contrast) sensor->set_contrast(sensor, 1);
+        if (sensor->set_denoise) sensor->set_denoise(sensor, 4);
+    } else {
+        if (sensor->set_aec2) sensor->set_aec2(sensor, 0);
+        if (sensor->set_gainceiling) sensor->set_gainceiling(sensor, GAINCEILING_16X);
+        if (sensor->set_ae_level) sensor->set_ae_level(sensor, 0);
+        if (sensor->set_special_effect) sensor->set_special_effect(sensor, 0);
+        if (sensor->set_brightness) sensor->set_brightness(sensor, 0);
+        if (sensor->set_contrast) sensor->set_contrast(sensor, 0);
+        if (sensor->set_denoise) sensor->set_denoise(sensor, 0);
+    }
+    Serial.printf("[CAM] Night B&W=%s\n", enabled ? "ON" : "OFF");
+}
+
 bool startCamera(uint8_t options) {
     if (!psramFound()) {
         Serial.println("[CAM] PSRAM unavailable");
@@ -216,6 +250,9 @@ bool startCamera(uint8_t options) {
         stopCamera();
         return false;
     }
+    if (options & nightMode) {
+        applyNightMode(sensor, true);
+    }
     return true;
 }
 
@@ -245,10 +282,11 @@ const char* jsonBool(bool value) {
 
 esp_err_t sendOptions(httpd_req_t* request) {
     const uint8_t options = getOptions();
-    char body[112];
-    snprintf(body, sizeof(body), "{\"low_bandwidth\":%s,\"rotate_180\":%s,\"dim_oled\":%s,\"resolution\":\"%s\"}",
+    char body[144];
+    snprintf(body, sizeof(body),
+             "{\"low_bandwidth\":%s,\"rotate_180\":%s,\"dim_oled\":%s,\"resolution\":\"%s\",\"night_mode\":%s}",
              jsonBool(options & lowBandwidth), jsonBool(options & rotate180), jsonBool(options & legacyDimOled),
-             resolutionKeys[resolutionIndex(options)]);
+             resolutionKeys[resolutionIndex(options)], jsonBool(options & nightMode));
     httpd_resp_set_type(request, "application/json");
     httpd_resp_set_hdr(request, "Cache-Control", "no-store");
     return httpd_resp_sendstr(request, body);
@@ -264,7 +302,7 @@ esp_err_t updateOptions(httpd_req_t* request) {
     if (!isJsonRequest(request)) {
         return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Expected application/json");
     }
-    char body[128];
+    char body[160];
     const size_t size = request->content_len;
     if (size == 0 || size >= sizeof(body)) {
         return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid settings length");
@@ -285,6 +323,7 @@ esp_err_t updateOptions(httpd_req_t* request) {
     const cJSON* rotate = cJSON_GetObjectItemCaseSensitive(settings, "rotate_180");
     const cJSON* dim = cJSON_GetObjectItemCaseSensitive(settings, "dim_oled");
     const cJSON* resolution = cJSON_GetObjectItemCaseSensitive(settings, "resolution");
+    const cJSON* night = cJSON_GetObjectItemCaseSensitive(settings, "night_mode");
     const uint8_t current = getOptions();
     int index = resolutionIndex(current);
     if (resolution) {
@@ -296,11 +335,12 @@ esp_err_t updateOptions(httpd_req_t* request) {
         }
     }
     const bool valid = cJSON_IsObject(settings) && cJSON_IsBool(low) && cJSON_IsBool(rotate) &&
-                       (!dim || cJSON_IsBool(dim)) && index >= 0;
+                       (!dim || cJSON_IsBool(dim)) && (!night || cJSON_IsBool(night)) && index >= 0;
     const uint8_t next = (cJSON_IsTrue(low) ? lowBandwidth : 0) |
                          (cJSON_IsTrue(rotate) ? rotate180 : 0) |
                          (dim ? (cJSON_IsTrue(dim) ? legacyDimOled : 0) : (current & legacyDimOled)) |
-                         (index >= 0 ? index << 3 : 0);
+                         (index >= 0 ? index << 3 : 0) |
+                         (night ? (cJSON_IsTrue(night) ? nightMode : 0) : (current & nightMode));
     cJSON_Delete(settings);
     if (!valid) {
         return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid board settings");
@@ -353,6 +393,7 @@ esp_err_t stream(httpd_req_t* request) {
     sdManager.pauseForLive();
     setStatus(State::Streaming, Reason::None);
     const uint8_t options = getOptions();
+    bool appliedNight = (options & nightMode) != 0;
     const uint32_t frameIntervalMs = (options & lowBandwidth) ? 167 : 0;
     if (!startCamera(options)) {
         free(packet);
@@ -396,6 +437,11 @@ esp_err_t stream(httpd_req_t* request) {
     uint64_t winBytes = 0;
 
     while (sent && !shouldStop()) {
+        const bool wantNight = (getOptions() & nightMode) != 0;
+        if (wantNight != appliedNight) {
+            applyNightMode(esp_camera_sensor_get(), wantNight);
+            appliedNight = wantNight;
+        }
         const uint32_t started = millis();
         const uint32_t captureStarted = micros();
         camera_fb_t* frame = esp_camera_fb_get();
@@ -461,7 +507,7 @@ esp_err_t stream(httpd_req_t* request) {
                           staModeActive ? "sta" : "ap",
                           staModeActive ? WiFi.channel() : activeWifiChannel,
                           staModeActive ? WiFi.RSSI() : 0,
-                          static_cast<unsigned>(options));
+                          static_cast<unsigned>(getOptions()));
             winStartMs = winNow;
             winFrames = 0;
             winCapUs = 0;
@@ -1378,6 +1424,8 @@ esp_err_t sendWifiStatus(httpd_req_t* request) {
     cJSON_AddBoolToObject(root, "sta_enabled", staEnabled);
     cJSON_AddStringToObject(root, "sta_ssid", staSsid.c_str());
     cJSON_AddBoolToObject(root, "led_enabled", ledEnabled);
+    cJSON_AddBoolToObject(root, "torch_enabled", torchEnabled);
+    cJSON_AddBoolToObject(root, "night_mode", (getOptions() & nightMode) != 0);
     cJSON_AddStringToObject(root, "fw_version", kFirmwareVersion);
     cJSON_AddNumberToObject(root, "uptime_s", static_cast<double>(millis() / 1000));
     const time_t nowSec = time(nullptr);
@@ -1491,6 +1539,8 @@ esp_err_t updateWifiConfig(httpd_req_t* request) {
     return httpd_resp_sendstr(request, doReboot ? "{\"saved\":true,\"rebooting\":true}" : "{\"saved\":true,\"rebooting\":false}");
 }
 
+void updateStatusLed();
+
 esp_err_t updateLedMode(httpd_req_t* request) {
     char body[64];
     if (!readJsonBody(request, body, sizeof(body))) {
@@ -1504,10 +1554,56 @@ esp_err_t updateLedMode(httpd_req_t* request) {
     if (!valid) return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Missing enabled");
     ledEnabled = next;
     if (netPrefsReady) netPrefs.putBool("led_en", next);
-    if (!next) setLedRgb(0, 0, 0);
+    updateStatusLed();
     httpd_resp_set_type(request, "application/json");
     httpd_resp_set_hdr(request, "Cache-Control", "no-store");
     return httpd_resp_sendstr(request, next ? "{\"led_enabled\":true}" : "{\"led_enabled\":false}");
+}
+
+esp_err_t updateTorchMode(httpd_req_t* request) {
+    char body[64];
+    if (!readJsonBody(request, body, sizeof(body))) {
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid torch request");
+    }
+    cJSON* root = cJSON_ParseWithOpts(body, nullptr, true);
+    const cJSON* enItem = cJSON_GetObjectItemCaseSensitive(root, "enabled");
+    const bool valid = cJSON_IsObject(root) && cJSON_IsBool(enItem);
+    const bool next = valid && cJSON_IsTrue(enItem);
+    cJSON_Delete(root);
+    if (!valid) return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Missing enabled");
+    torchEnabled = next;
+    updateStatusLed();
+    Serial.printf("[LED] White torch=%s\n", next ? "ON" : "OFF");
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_set_hdr(request, "Cache-Control", "no-store");
+    return httpd_resp_sendstr(request, next ? "{\"torch_enabled\":true}" : "{\"torch_enabled\":false}");
+}
+
+esp_err_t updateNightMode(httpd_req_t* request) {
+    char body[64];
+    if (!readJsonBody(request, body, sizeof(body))) {
+        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid night request");
+    }
+    cJSON* root = cJSON_ParseWithOpts(body, nullptr, true);
+    const cJSON* enItem = cJSON_GetObjectItemCaseSensitive(root, "enabled");
+    const bool valid = cJSON_IsObject(root) && cJSON_IsBool(enItem);
+    const bool next = valid && cJSON_IsTrue(enItem);
+    cJSON_Delete(root);
+    if (!valid) return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Missing enabled");
+    const uint8_t current = getOptions();
+    const uint8_t updated = next ? static_cast<uint8_t>(current | nightMode)
+                                 : static_cast<uint8_t>(current & ~nightMode);
+    if (updated != current) {
+        if (!preferencesReady || preferences.putUChar("options", updated) != sizeof(updated)) {
+            return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Could not save night mode");
+        }
+        portENTER_CRITICAL(&statusLock);
+        boardOptions = updated;
+        portEXIT_CRITICAL(&statusLock);
+    }
+    httpd_resp_set_type(request, "application/json");
+    httpd_resp_set_hdr(request, "Cache-Control", "no-store");
+    return httpd_resp_sendstr(request, next ? "{\"night_mode\":true}" : "{\"night_mode\":false}");
 }
 
 esp_err_t triggerReboot(httpd_req_t* request) {
@@ -1520,6 +1616,10 @@ esp_err_t triggerReboot(httpd_req_t* request) {
 }
 
 void updateStatusLed() {
+    if (torchEnabled) {
+        setLedRgb(255, 255, 255); // Full-bright pure white auxiliary illumination LED
+        return;
+    }
     if (!ledEnabled) {
         setLedRgb(0, 0, 0);
         return;
@@ -1706,6 +1806,8 @@ void setup() {
         {"/wifi/scan", HTTP_GET, scanWifiNetworks, nullptr},
         {"/wifi/config", HTTP_POST, updateWifiConfig, nullptr},
         {"/led", HTTP_POST, updateLedMode, nullptr},
+        {"/torch", HTTP_POST, updateTorchMode, nullptr},
+        {"/night", HTTP_POST, updateNightMode, nullptr},
         {"/reboot", HTTP_POST, triggerReboot, nullptr},
         {"/sd/status", HTTP_GET, sendSdStatus, nullptr},
         {"/sd/record", HTTP_POST, updateSdRecord, nullptr},

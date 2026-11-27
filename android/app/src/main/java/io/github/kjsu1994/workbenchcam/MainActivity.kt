@@ -73,6 +73,10 @@ class MainActivity : Activity() {
     private var telemetryEnabled = false
     private var gridEnabled = false
     private var liveHudEnabled = true
+    private var nightModeEnabled = false
+    private var torchEnabled = false
+    private var nightToggleBusy = false
+    private var torchToggleBusy = false
     private var autoConnectEnabled = false
     private var autoConnectAttempted = false
     private var frozen = false
@@ -286,6 +290,8 @@ class MainActivity : Activity() {
             fillVideo = fullscreenFill,
             gridEnabled = gridEnabled,
             hudEnabled = liveHudEnabled,
+            nightModeEnabled = nightModeEnabled,
+            torchEnabled = torchEnabled,
             activeTab = activeTab,
             selectedCategory = selectedLibraryCategory,
             start = ::requestStart,
@@ -296,6 +302,8 @@ class MainActivity : Activity() {
             toggleFreeze = ::toggleFreeze,
             toggleGrid = ::toggleGrid,
             toggleHud = ::toggleHud,
+            toggleNightMode = ::toggleNightMode,
+            toggleTorch = ::toggleTorch,
             onToggleFill = { fill ->
                 fullscreenFill = fill
                 scheduleOverlayAutoHide()
@@ -424,6 +432,8 @@ class MainActivity : Activity() {
             onScanHomeWifi = ::scanNearbyWifiFromBoard,
             onSaveHomeWifi = ::saveHomeWifiToBoard,
             onToggleBoardLed = ::updateBoardLedMode,
+            onToggleNightMode = ::setNightMode,
+            onToggleTorch = ::setTorchMode,
             onShowWebQr = ::showQrForWebDashboard,
             onPickOtaFile = ::pickOtaFirmwareFile,
             onRebootBoard = ::confirmRebootBoard,
@@ -483,6 +493,10 @@ class MainActivity : Activity() {
             runOnUiThread {
                 if (isDestroyed || settingsScreen !== page || boardTarget != connected) return@runOnUiThread
                 cachedBoardOptions = options
+                if (options != null) {
+                    nightModeEnabled = options.nightMode
+                    screen.showNightMode(options.nightMode)
+                }
                 page.showBoardOptions(options)
             }
         }, "board-settings-load").start()
@@ -495,11 +509,16 @@ class MainActivity : Activity() {
                 if (isDestroyed || boardTarget != connected) return@runOnUiThread
                 if (st != null) {
                     wifiStatus = st
+                    nightModeEnabled = st.nightMode
+                    torchEnabled = st.torchEnabled
+                    screen.showNightMode(st.nightMode)
+                    screen.showTorch(st.torchEnabled)
                     if (st.mode == "sta" && isAllowedLocalHost(st.ip)) {
                         lastLanIp = st.ip
                         getPreferences(MODE_PRIVATE).edit().putString("last_lan_ip", lastLanIp).apply()
                     }
                     settingsScreen?.showWifiStatus(st)
+                    preview?.let(::renderLiveHud)
                 }
             }
         }, "board-wifi-status").start()
@@ -584,7 +603,12 @@ class MainActivity : Activity() {
     private fun applyBoardOptionsFromSettings(requested: BoardOptions) {
         val connected = boardTarget ?: return
         val page = settingsScreen ?: return
-        val changed = cachedBoardOptions != null && cachedBoardOptions != requested
+        val prev = cachedBoardOptions
+        val needsRestart = prev != null && (
+            prev.lowBandwidth != requested.lowBandwidth ||
+                prev.rotate180 != requested.rotate180 ||
+                prev.resolution != requested.resolution
+            )
         page.setBoardSaving(true)
         Thread({
             val saved = runCatching { BoardApi(connected).setOptions(requested) }.getOrNull() == requested
@@ -593,7 +617,10 @@ class MainActivity : Activity() {
                 page.setBoardSaving(false)
                 if (saved) {
                     cachedBoardOptions = requested
-                    if (changed && preview != null && boardTarget == connected) {
+                    nightModeEnabled = requested.nightMode
+                    screen.showNightMode(requested.nightMode)
+                    preview?.let(::renderLiveHud)
+                    if (needsRestart && preview != null && boardTarget == connected) {
                         Toast.makeText(this, "보드 설정을 저장하고 영상에 적용합니다", Toast.LENGTH_SHORT).show()
                         restartPreviewForSettings(connected)
                     } else {
@@ -633,6 +660,94 @@ class MainActivity : Activity() {
         scheduleOverlayAutoHide()
     }
 
+    private fun toggleNightMode() {
+        setNightMode(!nightModeEnabled)
+        scheduleOverlayAutoHide()
+    }
+
+    private fun setNightMode(next: Boolean) {
+        val connected = boardTarget ?: run {
+            Toast.makeText(this, "먼저 보드에 연결해 주세요", Toast.LENGTH_SHORT).show()
+            settingsScreen?.showNightMode(nightModeEnabled)
+            return
+        }
+        if (nightToggleBusy) return
+        val prev = nightModeEnabled
+        nightToggleBusy = true
+        nightModeEnabled = next
+        screen.showNightMode(next)
+        settingsScreen?.showNightMode(next)
+        preview?.let(::renderLiveHud)
+        Thread({
+            val result = runCatching { BoardApi(connected).setNightMode(next) }
+            runOnUiThread {
+                nightToggleBusy = false
+                if (isDestroyed || boardTarget != connected) return@runOnUiThread
+                result.onSuccess { confirmed ->
+                    nightModeEnabled = confirmed
+                    cachedBoardOptions = cachedBoardOptions?.copy(nightMode = confirmed)
+                    wifiStatus = wifiStatus?.copy(nightMode = confirmed)
+                    screen.showNightMode(confirmed)
+                    settingsScreen?.showNightMode(confirmed)
+                    preview?.let(::renderLiveHud)
+                    Toast.makeText(
+                        this,
+                        if (confirmed) "야간 흑백 모드 ON (저조도 셔터·고감도)" else "야간 모드 OFF (주간 컬러 복귀)",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }.onFailure {
+                    nightModeEnabled = prev
+                    screen.showNightMode(prev)
+                    settingsScreen?.showNightMode(prev)
+                    preview?.let(::renderLiveHud)
+                    Toast.makeText(this, "야간 모드 전환 실패 · 펌웨어 v0.3.6 이상인지 확인하세요", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }, "board-night-toggle").start()
+    }
+
+    private fun toggleTorch() {
+        setTorchMode(!torchEnabled)
+        scheduleOverlayAutoHide()
+    }
+
+    private fun setTorchMode(next: Boolean) {
+        val connected = boardTarget ?: run {
+            Toast.makeText(this, "먼저 보드에 연결해 주세요", Toast.LENGTH_SHORT).show()
+            settingsScreen?.showTorch(torchEnabled)
+            return
+        }
+        if (torchToggleBusy) return
+        val prev = torchEnabled
+        torchToggleBusy = true
+        torchEnabled = next
+        screen.showTorch(next)
+        settingsScreen?.showTorch(next)
+        Thread({
+            val result = runCatching { BoardApi(connected).setTorchEnabled(next) }
+            runOnUiThread {
+                torchToggleBusy = false
+                if (isDestroyed || boardTarget != connected) return@runOnUiThread
+                result.onSuccess { confirmed ->
+                    torchEnabled = confirmed
+                    wifiStatus = wifiStatus?.copy(torchEnabled = confirmed)
+                    screen.showTorch(confirmed)
+                    settingsScreen?.showTorch(confirmed)
+                    Toast.makeText(
+                        this,
+                        if (confirmed) "화이트 보조 조명 LED ON" else "화이트 보조 조명 LED OFF",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }.onFailure {
+                    torchEnabled = prev
+                    screen.showTorch(prev)
+                    settingsScreen?.showTorch(prev)
+                    Toast.makeText(this, "조명 LED 전환 실패 · 펌웨어 v0.3.6 이상인지 확인하세요", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }, "board-torch-toggle").start()
+    }
+
     private fun renderLiveHud(current: Preview) {
         val st = current.stats
         if (st == null) {
@@ -649,7 +764,8 @@ class MainActivity : Activity() {
                 else -> " · AP"
             }
         } ?: if (boardTarget?.viaLan == true) " · LAN" else " · AP"
-        screen.showLiveHud("$res · $fpsStr$rateStr$netStr")
+        val nightStr = if (nightModeEnabled) " · 야간" else ""
+        screen.showLiveHud("$res · $fpsStr$rateStr$netStr$nightStr")
     }
 
     private fun toggleFullscreen() {
@@ -1952,6 +2068,12 @@ class MainActivity : Activity() {
         currentSharedDir = ""
         lastSdListing = null
         cachedBoardOptions = null
+        nightModeEnabled = false
+        torchEnabled = false
+        nightToggleBusy = false
+        torchToggleBusy = false
+        screen.showNightMode(false)
+        screen.showTorch(false)
         telemetryText = null
         nextTelemetryAt = 0L
         nextSdPollAt = 0L

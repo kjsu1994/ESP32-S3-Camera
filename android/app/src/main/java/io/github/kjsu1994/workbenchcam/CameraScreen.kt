@@ -38,6 +38,8 @@ internal class CameraScreen(
     private var fillVideo: Boolean,
     private var gridEnabled: Boolean,
     private var hudEnabled: Boolean,
+    private var nightModeEnabled: Boolean,
+    private var torchEnabled: Boolean,
     private var activeTab: AppTab,
     private var selectedCategory: String,
     private val start: () -> Unit,
@@ -48,6 +50,8 @@ internal class CameraScreen(
     private val toggleFreeze: () -> Unit,
     private val toggleGrid: () -> Unit,
     private val toggleHud: () -> Unit,
+    private val toggleNightMode: () -> Unit,
+    private val toggleTorch: () -> Unit,
     private val onToggleFill: (Boolean) -> Unit,
     private val onFullscreenVideoTap: () -> Unit,
     private val onTabSelected: (AppTab) -> Unit,
@@ -103,6 +107,15 @@ internal class CameraScreen(
         typeface = Typeface.MONOSPACE
         visibility = View.GONE
     }
+    private val nightModeBadge = TextView(context).apply {
+        text = "야간 흑백"
+        textSize = 10.5f
+        typeface = Typeface.DEFAULT_BOLD
+        setTextColor(UiStyle.CYAN)
+        background = UiStyle.rounded(context, UiStyle.OVERLAY, 99, UiStyle.CYAN)
+        setPadding(UiStyle.dp(context, 9), UiStyle.dp(context, 4), UiStyle.dp(context, 9), UiStyle.dp(context, 4))
+        visibility = if (nightModeEnabled) View.VISIBLE else View.GONE
+    }
     private val liveHudBadge = TextView(context).apply {
         textSize = 10.5f
         typeface = Typeface.MONOSPACE
@@ -140,6 +153,7 @@ internal class CameraScreen(
         visibility = View.INVISIBLE
         setFillCrop(fullscreen && fillVideo)
         setShowGrid(gridEnabled)
+        setNightBoost(nightModeEnabled)
     }
     private val idleText = UiStyle.label(context, "영상 대기 중", 14f, UiStyle.MUTED).apply {
         gravity = Gravity.CENTER
@@ -152,6 +166,12 @@ internal class CameraScreen(
     private var tileFreeze: UiStyle.ActionTile? = null
     private var tileGrid: UiStyle.ActionTile? = null
     private var tileStop: UiStyle.ActionTile? = null
+    private var nightPillRoot: LinearLayout? = null
+    private var nightPillIcon: ImageView? = null
+    private var nightPillLabel: TextView? = null
+    private var torchPillRoot: LinearLayout? = null
+    private var torchPillIcon: ImageView? = null
+    private var torchPillLabel: TextView? = null
     private var videoFullscreenBtn: FrameLayout? = null
 
     // Fullscreen HUD Controls
@@ -162,6 +182,8 @@ internal class CameraScreen(
     private var fsPhotoBtn: Button? = null
     private var fsGridBtn: Button? = null
     private var fsScaleBtn: Button? = null
+    private var fsNightBtn: TextView? = null
+    private var fsTorchBtn: TextView? = null
 
     // Main Shell & Tabs
     private var mainShell: LinearLayout? = null
@@ -238,6 +260,7 @@ internal class CameraScreen(
         val fsHudPin = FrameLayout(context).apply {
             isClickable = false
             isFocusable = false
+            addView(nightModeBadge, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START))
             addView(liveHudBadge, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.END))
         }
         root.addView(fsHudPin, FrameLayout.LayoutParams(-1, -1))
@@ -246,11 +269,30 @@ internal class CameraScreen(
         telemetryText.setPadding(0, UiStyle.dp(context, 2), 0, 0)
         telemetryText.textSize = 11.5f
 
+        val nBtn = UiStyle.compactChipButton(context, "야간 흑백", UiStyle.SURFACE_ALT, UiStyle.INK, UiStyle.BORDER, toggleNightMode)
+        val tBtn = UiStyle.compactChipButton(context, "화이트 LED", UiStyle.SURFACE_ALT, UiStyle.INK, UiStyle.BORDER, toggleTorch)
         val hBtn = UiStyle.secondaryButton(context, if (hudEnabled) "HUD 끄기" else "HUD", toggleHud)
         val gBtn = UiStyle.secondaryButton(context, if (gridEnabled) "그리드 끄기" else "그리드", toggleGrid)
         val exitBtn = UiStyle.secondaryButton(context, "나가기", toggleFullscreen)
+        fsNightBtn = nBtn
+        fsTorchBtn = tBtn
         fsHudBtn = hBtn
         fsGridBtn = gBtn
+        styleNightTorchButtons(connected = true)
+
+        val topActionRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(nBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = UiStyle.dp(context, 6) })
+            addView(tBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = UiStyle.dp(context, 8) })
+            addView(hBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = UiStyle.dp(context, 6) })
+            addView(gBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = UiStyle.dp(context, 6) })
+            addView(exitBtn)
+        }
+        val topActionScroll = HorizontalScrollView(context).apply {
+            isHorizontalScrollBarEnabled = false
+            addView(topActionRow)
+        }
 
         val topBar = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -269,9 +311,7 @@ internal class CameraScreen(
                 addView(fsTopHudText)
                 addView(telemetryText)
             }, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = UiStyle.dp(context, 10) })
-            addView(hBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = UiStyle.dp(context, 8) })
-            addView(gBtn, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = UiStyle.dp(context, 8) })
-            addView(exitBtn)
+            addView(topActionScroll, LinearLayout.LayoutParams(-2, -2))
         }
 
         val sBtn = UiStyle.primaryButton(context, "다시 보기", start)
@@ -542,8 +582,14 @@ internal class CameraScreen(
             addView(image, FrameLayout.LayoutParams(-1, -1))
             addView(idleText, FrameLayout.LayoutParams(-1, -1))
         }
+        val topStartBadges = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(nightModeBadge, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = UiStyle.dp(context, 6) })
+            addView(zoomBadge, LinearLayout.LayoutParams(-2, -2))
+        }
         val hudOverlayLayer = FrameLayout(context).apply {
-            addView(zoomBadge, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START).apply {
+            addView(topStartBadges, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START).apply {
                 setMargins(UiStyle.dp(context, 10), UiStyle.dp(context, 10), 0, 0)
             })
             addView(liveHudBadge, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.END).apply {
@@ -561,6 +607,24 @@ internal class CameraScreen(
             clipToOutline = true
             addView(videoCanvas, FrameLayout.LayoutParams(-1, -1))
             addView(hudOverlayLayer, FrameLayout.LayoutParams(-1, -1))
+        }
+
+        // Instant 1-tap Night B&W & Bright White LED quick bar (zero stream interruption, 1-thumb reachable)
+        val (nPill, nIcon, nLbl) = buildQuickOpticsPill(R.drawable.ic_night, "야간 흑백", toggleNightMode)
+        val (tPill, tIcon, tLbl) = buildQuickOpticsPill(R.drawable.ic_torch, "화이트 LED", toggleTorch)
+        nightPillRoot = nPill
+        nightPillIcon = nIcon
+        nightPillLabel = nLbl
+        torchPillRoot = tPill
+        torchPillIcon = tIcon
+        torchPillLabel = tLbl
+        styleNightTorchButtons(connected = false)
+
+        val quickOpticsBar = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            val gap = UiStyle.dp(context, 8)
+            addView(nPill, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = gap })
+            addView(tPill, LinearLayout.LayoutParams(0, -2, 1f))
         }
 
         primaryCtaBtn = UiStyle.primaryButton(context, "연결 및 보기", start)
@@ -585,7 +649,7 @@ internal class CameraScreen(
 
         val hintStrip = UiStyle.label(
             context,
-            "두 손가락으로 1×~5× 확대 · 더블탭 빠른 확대 · 우하단 버튼으로 가로 풀화면",
+            "두 손가락 1×~5× 확대 · 야간 흑백·화이트 LED는 시청 중 끊김 없이 즉시 전환",
             11.5f,
             UiStyle.MUTED
         ).apply { gravity = Gravity.CENTER }
@@ -595,6 +659,7 @@ internal class CameraScreen(
             val side = LinearLayout(context).apply {
                 orientation = LinearLayout.VERTICAL
                 addView(telemetryText, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = UiStyle.dp(context, 10) })
+                addView(quickOpticsBar, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = UiStyle.dp(context, 10) })
                 addView(primaryCtaBtn, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = UiStyle.dp(context, 10) })
                 addView(actionBar, LinearLayout.LayoutParams(-1, -2))
             }
@@ -613,7 +678,8 @@ internal class CameraScreen(
                 setPadding(p, UiStyle.dp(context, 4), p, UiStyle.dp(context, 16))
                 addView(telemetryText, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = UiStyle.dp(context, 10) })
                 addView(videoStage, LinearLayout.LayoutParams(-1, -2))
-                addView(primaryCtaBtn, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 14) })
+                addView(quickOpticsBar, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 10) })
+                addView(primaryCtaBtn, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 10) })
                 addView(actionBar, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 10) })
                 addView(hintStrip, LinearLayout.LayoutParams(-1, -2).apply { topMargin = UiStyle.dp(context, 12) })
             }
@@ -622,6 +688,35 @@ internal class CameraScreen(
                 addView(stack, FrameLayout.LayoutParams(-1, -2))
             }
         }
+    }
+
+    private fun buildQuickOpticsPill(
+        iconRes: Int,
+        labelText: String,
+        onClick: () -> Unit
+    ): Triple<LinearLayout, ImageView, TextView> {
+        val icon = ImageView(context).apply {
+            setImageResource(iconRes)
+            scaleType = ImageView.ScaleType.FIT_CENTER
+        }
+        val label = UiStyle.label(context, labelText, 13f, UiStyle.SECONDARY, bold = true).apply {
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        val pill = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            isClickable = true
+            isFocusable = true
+            minimumHeight = UiStyle.dp(context, 42)
+            setPadding(UiStyle.dp(context, 12), UiStyle.dp(context, 8), UiStyle.dp(context, 12), UiStyle.dp(context, 8))
+            addView(icon, LinearLayout.LayoutParams(UiStyle.dp(context, 18), UiStyle.dp(context, 18)).apply {
+                marginEnd = UiStyle.dp(context, 7)
+            })
+            addView(label)
+            setOnClickListener { onClick() }
+        }
+        return Triple(pill, icon, label)
     }
 
     private fun buildRecordTab(): View {
@@ -1168,11 +1263,85 @@ internal class CameraScreen(
         if (value != null && telemetryText.text != value) telemetryText.text = value
     }
 
+    private var lastConnectedState = false
+
     fun showGrid(enabled: Boolean) {
         gridEnabled = enabled
         image.setShowGrid(enabled)
         tileGrid?.setState(true, active = enabled)
         fsGridBtn?.text = if (enabled) "그리드 끄기" else "그리드"
+    }
+
+    fun showNightMode(enabled: Boolean) {
+        nightModeEnabled = enabled
+        image.setNightBoost(enabled)
+        nightModeBadge.visibility = if (enabled && (!fullscreen || !fsOverlayShown)) View.VISIBLE else View.GONE
+        styleNightTorchButtons(lastConnectedState)
+    }
+
+    fun showTorch(enabled: Boolean) {
+        torchEnabled = enabled
+        styleNightTorchButtons(lastConnectedState)
+    }
+
+    private fun styleNightTorchButtons(connected: Boolean) {
+        lastConnectedState = connected
+        nightPillRoot?.let { pill ->
+            pill.isEnabled = connected
+            pill.alpha = if (connected) 1f else 0.45f
+            pill.background = UiStyle.rippleRounded(
+                context,
+                if (nightModeEnabled) UiStyle.CYAN_SOFT else UiStyle.SURFACE,
+                14,
+                if (nightModeEnabled) UiStyle.CYAN else UiStyle.BORDER
+            )
+        }
+        nightPillIcon?.imageTintList = ColorStateList.valueOf(if (nightModeEnabled) UiStyle.CYAN else UiStyle.INK)
+        nightPillLabel?.let { lbl ->
+            lbl.text = if (nightModeEnabled) "야간 흑백 ON" else "야간 흑백"
+            lbl.setTextColor(if (nightModeEnabled) UiStyle.CYAN else UiStyle.SECONDARY)
+        }
+
+        torchPillRoot?.let { pill ->
+            pill.isEnabled = connected
+            pill.alpha = if (connected) 1f else 0.45f
+            pill.background = UiStyle.rippleRounded(
+                context,
+                if (torchEnabled) UiStyle.AMBER_SOFT else UiStyle.SURFACE,
+                14,
+                if (torchEnabled) UiStyle.AMBER else UiStyle.BORDER
+            )
+        }
+        torchPillIcon?.imageTintList = ColorStateList.valueOf(if (torchEnabled) UiStyle.AMBER else UiStyle.INK)
+        torchPillLabel?.let { lbl ->
+            lbl.text = if (torchEnabled) "화이트 LED ON" else "화이트 LED"
+            lbl.setTextColor(if (torchEnabled) UiStyle.AMBER else UiStyle.SECONDARY)
+        }
+
+        fsNightBtn?.let { btn ->
+            btn.isEnabled = connected
+            btn.alpha = if (connected) 1f else 0.45f
+            btn.text = if (nightModeEnabled) "야간 ON" else "야간 흑백"
+            btn.setTextColor(if (nightModeEnabled) UiStyle.CYAN else UiStyle.INK)
+            btn.background = UiStyle.rippleRounded(
+                context,
+                if (nightModeEnabled) UiStyle.CYAN_SOFT else UiStyle.SURFACE_ALT,
+                10,
+                if (nightModeEnabled) UiStyle.CYAN else UiStyle.BORDER
+            )
+        }
+        fsTorchBtn?.let { btn ->
+            btn.isEnabled = connected
+            btn.alpha = if (connected) 1f else 0.45f
+            btn.text = if (torchEnabled) "조명 ON" else "화이트 LED"
+            btn.setTextColor(if (torchEnabled) UiStyle.AMBER else UiStyle.INK)
+            btn.background = UiStyle.rippleRounded(
+                context,
+                if (torchEnabled) UiStyle.AMBER_SOFT else UiStyle.SURFACE_ALT,
+                10,
+                if (torchEnabled) UiStyle.AMBER else UiStyle.BORDER
+            )
+        }
     }
 
     fun showHudEnabled(enabled: Boolean) {
@@ -1216,6 +1385,7 @@ internal class CameraScreen(
     }
 
     fun showControls(connected: Boolean, canStart: Boolean, playing: Boolean, hasFrame: Boolean, frozen: Boolean) {
+        styleNightTorchButtons(connected)
         if (fullscreen) {
             fsStartBtn?.text = if (connected) "다시 보기" else "연결 및 보기"
             fsStartBtn?.isEnabled = canStart
@@ -1775,6 +1945,7 @@ internal class CameraScreen(
     fun showFullscreenOverlay(visible: Boolean) {
         fsOverlayShown = visible
         hudOverlay?.visibility = if (visible) View.VISIBLE else View.GONE
+        nightModeBadge.visibility = if (nightModeEnabled && (!fullscreen || !visible)) View.VISIBLE else View.GONE
         refreshLiveHudVisibility()
     }
 

@@ -42,6 +42,8 @@ internal class SettingsScreen(
     private val onScanHomeWifi: () -> Unit,
     private val onSaveHomeWifi: (staEnabled: Boolean, ssid: String, pass: String?) -> Unit,
     private val onToggleBoardLed: (Boolean) -> Unit,
+    private val onToggleNightMode: (Boolean) -> Unit,
+    private val onToggleTorch: (Boolean) -> Unit,
     private val onShowWebQr: () -> Unit,
     private val onPickOtaFile: () -> Unit,
     private val onRebootBoard: () -> Unit,
@@ -82,8 +84,12 @@ internal class SettingsScreen(
     private val boardApplyBtn: Button
     private val lowBandwidthSwitch: Switch
     private val rotateSwitch: Switch
+    private val nightModeSwitch: Switch
+    private val torchSwitch: Switch
     private val boardLedSwitch: Switch
     private var suppressLedCallback = false
+    private var suppressNightCallback = false
+    private var suppressTorchCallback = false
     private val renderResolution: (VideoResolution) -> Unit
     private var selectedResolution: VideoResolution = VideoResolution.VGA
 
@@ -325,7 +331,7 @@ internal class SettingsScreen(
         boardControlsContainer.addView(UiStyle.label(context, "영상 해상도", 13.5f, UiStyle.INK, bold = true))
         boardControlsContainer.addView(UiStyle.label(
             context,
-            "1280×720(HD)은 고화질 16:9이면서 12MHz 기준 가장 부드럽습니다",
+            "1280×720(HD)은 고화질 16:9이면서 14MHz 기준 가장 부드럽습니다",
             12f,
             UiStyle.MUTED
         ).apply { setPadding(0, UiStyle.dp(context, 2), 0, UiStyle.dp(context, 8)) })
@@ -355,6 +361,28 @@ internal class SettingsScreen(
         rotateSwitch = rotSw
         boardControlsContainer.addView(rotRow)
 
+        val (nightRow, nightSw) = UiStyle.switchRow(
+            context,
+            "야간 흑백 모드 (즉시 전환)",
+            "OV5640 자동 저속셔터·고감도·흑백 전환으로 어두운 곳 시야 확보",
+            false
+        ) { checked ->
+            if (!suppressNightCallback) onToggleNightMode(checked)
+        }
+        nightModeSwitch = nightSw
+        boardControlsContainer.addView(nightRow)
+
+        val (torchRow, torchSw) = UiStyle.switchRow(
+            context,
+            "화이트 보조 조명 LED (즉시 전환)",
+            "보드 내장 LED를 최대 밝기 순백색(255)으로 점등해 야간 근거리 시야 보조",
+            false
+        ) { checked ->
+            if (!suppressTorchCallback) onToggleTorch(checked)
+        }
+        torchSwitch = torchSw
+        boardControlsContainer.addView(torchRow)
+
         val (ledRow, ledSw) = UiStyle.switchRow(
             context,
             "보드 상태 RGB LED 표시",
@@ -367,7 +395,14 @@ internal class SettingsScreen(
         boardControlsContainer.addView(ledRow)
 
         boardApplyBtn = UiStyle.primaryButton(context, "카메라 설정 적용") {
-            onSaveBoardOptions(BoardOptions(lowBandwidthSwitch.isChecked, rotateSwitch.isChecked, selectedResolution))
+            onSaveBoardOptions(
+                BoardOptions(
+                    lowBandwidth = lowBandwidthSwitch.isChecked,
+                    rotate180 = rotateSwitch.isChecked,
+                    resolution = selectedResolution,
+                    nightMode = nightModeSwitch.isChecked
+                )
+            )
         }
         boardControlsContainer.addView(UiStyle.label(
             context,
@@ -644,6 +679,9 @@ internal class SettingsScreen(
         boardLedSwitch.isChecked = status.ledEnabled
         suppressLedCallback = false
 
+        showTorch(status.torchEnabled)
+        showNightMode(status.nightMode)
+
         val fwLabel = if (status.fwVersion.isNotEmpty()) "현재 FW v${status.fwVersion}" else "연결됨"
         otaFwBadge.text = fwLabel
         otaFwBadge.background = UiStyle.rounded(context, UiStyle.ACCENT_SOFT, 99)
@@ -767,7 +805,20 @@ internal class SettingsScreen(
         renderResolution(options.resolution)
         lowBandwidthSwitch.isChecked = options.lowBandwidth
         rotateSwitch.isChecked = options.rotate180
+        showNightMode(options.nightMode)
         boardApplyBtn.isEnabled = true
+    }
+
+    fun showNightMode(enabled: Boolean) {
+        suppressNightCallback = true
+        nightModeSwitch.isChecked = enabled
+        suppressNightCallback = false
+    }
+
+    fun showTorch(enabled: Boolean) {
+        suppressTorchCallback = true
+        torchSwitch.isChecked = enabled
+        suppressTorchCallback = false
     }
 
     fun setBoardSaving(saving: Boolean) {
